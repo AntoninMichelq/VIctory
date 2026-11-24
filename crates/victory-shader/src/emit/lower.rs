@@ -8538,6 +8538,22 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            // A first half whose second half interpolates on its own: what
+            // else reads its result (the low half a 16-bit second half
+            // into the same VGPR keeps) reads junk, as on the console.
+            let first = self.x.io.interps.iter().any(|(_, i)| {
+                matches!(i, Interp::Interpolated { first, .. } if first.contains(&site))
+            });
+            let dst = match &inst.fields {
+                Fields::Vintrp { dst, .. } => Some(*dst),
+                Fields::Valu(v) => v.dst,
+                _ => None,
+            };
+            if first && let Some(Operand::Vector { reg, .. }) = dst {
+                let x = self.s.m.i32(0);
+                self.write(inst, Reg::V(reg), x, None);
+                return Ok(());
+            }
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
