@@ -259,6 +259,19 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        // What every list running such a shader brings up to date (and, with stores,
+        // compares on the CPU): the numbered copies.
+        static SAID: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if said.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+            *said = Some(std::time::Instant::now());
+            let bytes: u64 = m.copies.iter().map(|c| c.span().1).sum();
+            tracing::info!(
+                copies = m.copies.len(),
+                mb = bytes >> 20,
+                "title memory by address: numbered copies, each refreshed by every list that runs such a shader"
+            );
+        }
     }
     let numbered = m.copies.len();
     for &address in addresses {
