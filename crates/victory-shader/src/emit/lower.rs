@@ -12253,6 +12253,17 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.i32(0)
                     }
+                    // A lane mask (or one half of one) reaching a join of
+                    // data through registers the program reuses: like a
+                    // dead descriptor dword, junk on that edge, assuming
+                    // the joined value is read only after the data edge.
+                    (Some(Val::Missing(LANE_MASK)) | None, false)
+                        if has_data
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     // An input the program overwrites before any use
                     // (`overwritten_movreld_edge`): its value is not needed.
                     (Some(Val::Missing(_)), false)
@@ -12547,6 +12558,76 @@ mod tests {
     #[test]
     fn code_tables_read_through_an_address_from_the_first_lane_lower() {
         lowers(crate::resource::tests::CODE_TABLE_THROUGH_FIRST_LANE).unwrap();
+    }
+
+    #[test]
+    fn uniform_selects_of_all_ones_moved_to_vgprs_are_numbers() {
+        // A uniform boolean made -1/0 by s_cselect_b32, moved into a VGPR
+        // as data and compared with -1 (a mesh shader's per-instance flag).
+        let words = [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF04_8004, // s_cmp_lt_i32 s4, 0
+            0xBF85_0003, // s_cbranch_scc1 3 (skips the block)
+            0xBF06_8504, // s_cmp_eq_u32 s4, 5
+            0x8502_80C1, // s_cselect_b32 s2, -1, 0
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0x7D84_02C1, // v_cmp_eq_u32 vcc, -1, v1 (after the join)
+            0xBF86_0002, // s_cbranch_vccz 2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lowers(&words).unwrap();
+        lower_wave(&words, vec![], vec![], true).unwrap();
+    }
+
+    #[test]
+    fn scalar_flags_next_to_a_selected_mask_are_numbers() {
+        // wave64: s_cselect_b64 writes a real mask into s[4:5]; then a flag
+        // bit is tested in s6 (ef5409053e14aa82's shape at 0x1a34-0x1a54).
+        let words = [
+            0x7E10_0500, // v_readfirstlane_b32 s8, v0
+            0x7E0E_0501, // v_readfirstlane_b32 s7, v1
+            0x9389_FF08,
+            0x0008_0010, // s_bfe_u32 s9, s8, 0x80010
+            0xBF07_8009, // s_cmp_lg_u32 s9, 0
+            0x8584_807E, // s_cselect_b64 s[4:5], exec, 0
+            0xD501_0002,
+            0x0011_E480, // v_cndmask_b32 v2, 0, 1.0, s[4:5]
+            0x8706_FF07,
+            0x0000_0100, // s_and_b32 s6, s7, 0x100
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0002, // s_cbranch_scc1 2
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lower_wave(&words, vec![], vec![], true).unwrap();
+    }
+
+    #[test]
+    fn scalar_data_joined_with_a_dead_mask_half_is_a_number() {
+        // wave64: on one path s11 is the high half of a saved EXEC, on the
+        // other a loaded flag; after the join only the flag is tested.
+        let words = [
+            0x7E10_0500, // v_readfirstlane_b32 s8, v0
+            0x7E18_0501, // v_readfirstlane_b32 s12, v1
+            0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+            0xBF04_8008, // s_cmp_lt_i32 s8, 0
+            0xBF85_0001, // s_cbranch_scc1 1
+            0x7E16_0501, // v_readfirstlane_b32 s11, v1
+            0x8706_FF0B,
+            0x0000_0100, // s_and_b32 s6, s11, 0x100
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0002, // s_cbranch_scc1 2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lower_wave(&words, vec![], vec![], true).unwrap();
     }
 
     /// Lowers a compute program of constants: whether it translates.
