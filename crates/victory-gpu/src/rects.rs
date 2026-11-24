@@ -232,18 +232,24 @@ pub(crate) fn vertices(
     bytes: u64,
     stride: u32,
     elements: &[(u32, u32)],
-) -> Option<(ID3D12Resource, u64, u32)> {
-    let e = expand()?;
-    if stride == 0 || !stride.is_multiple_of(4) || !from.is_multiple_of(4) || elements.len() > ELEMENTS {
-        return None;
+) -> Result<(ID3D12Resource, u64, u32), &'static str> {
+    let e = expand().ok_or("no expansion shader")?;
+    if stride == 0 || !stride.is_multiple_of(4) {
+        return Err("vertex stride not a multiple of 4");
     }
-    let rects = u32::try_from(bytes / u64::from(stride) / 3).ok()?;
+    if !from.is_multiple_of(4) {
+        return Err("vertex buffer address not a multiple of 4");
+    }
+    if elements.len() > ELEMENTS {
+        return Err("too many vertex elements");
+    }
+    let rects = u32::try_from(bytes / u64::from(stride) / 3).map_err(|_| "too many vertices")?;
     if rects == 0 {
-        return None;
+        return Err("less than one rectangle in the buffer");
     }
     let size = u64::from(rects) * 6 * u64::from(stride);
-    let size32 = u32::try_from(size).ok()?;
-    let (buffer, _) = host.shared_buffer(size)?;
+    let size32 = u32::try_from(size).map_err(|_| "expanded vertices past 4 GB")?;
+    let (buffer, _) = host.shared_buffer(size).ok_or("no expansion buffer")?;
     crate::host::name(&buffer, || format!("rectangles {size:#x}"));
     list.keep(&buffer);
     // SAFETY: a live buffer.
@@ -262,7 +268,7 @@ pub(crate) fn vertices(
             D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
         )]);
     }
-    Some((buffer, to, size32))
+    Ok((buffer, to, size32))
 }
 
 /// Records the rewrite of `records` draw records `stride` bytes apart at
@@ -276,13 +282,16 @@ pub(crate) fn records(
     from: u64,
     stride: u32,
     records: u32,
-) -> Option<ID3D12Resource> {
-    let e = expand()?;
-    if stride < 16 || !stride.is_multiple_of(4) || !from.is_multiple_of(4) || records == 0 {
-        return None;
+) -> Result<ID3D12Resource, &'static str> {
+    let e = expand().ok_or("no expansion shader")?;
+    if stride < 16 || !stride.is_multiple_of(4) || !from.is_multiple_of(4) {
+        return Err("draw records unaligned");
+    }
+    if records == 0 {
+        return Err("no records");
     }
     let size = u64::from(stride) * u64::from(records);
-    let (buffer, _) = host.shared_buffer(size)?;
+    let (buffer, _) = host.shared_buffer(size).ok_or("no records buffer")?;
     crate::host::name(&buffer, || format!("rectangle records {size:#x}"));
     list.keep(&buffer);
     // SAFETY: a live buffer.
@@ -313,7 +322,7 @@ pub(crate) fn records(
             ),
         ]);
     }
-    Some(buffer)
+    Ok(buffer)
 }
 
 #[cfg(test)]

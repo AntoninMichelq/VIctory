@@ -185,7 +185,10 @@ fn null_uav_dropped(pipeline: &str) {
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
         seen.push(pipeline.to_owned());
-        tracing::warn!(pipeline, "a dispatch writing through a null unordered access view dropped");
+        tracing::warn!(
+            pipeline,
+            "a dispatch writing through a null unordered access view dropped"
+        );
     }
 }
 
@@ -711,7 +714,23 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let traced = self.trace_dispatch(x, y, z);
+        #[cfg(feature = "diagnostics")]
+        let pipe = self.pipeline;
+        #[cfg(feature = "diagnostics")]
+        let outcome = |why: &str| {
+            if traced {
+                tracing::debug!(
+                    pipeline = format_args!("{pipe:#x}"),
+                    "dispatch {x}x{y}x{z} {why}"
+                );
+            }
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let outcome = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            outcome("DROPPED (pipeline skipped)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
@@ -721,6 +740,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            outcome("DROPPED (no host pipeline)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -728,18 +748,22 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            outcome("DROPPED (graphics pipeline)");
             return;
         }
         if !dispatch_fits(x, y, z) {
             once!(x, y, z, "a dispatch past the host's group limits dropped");
+            outcome("DROPPED (past group limits)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if !self.bind(list, p, true) {
+            outcome("DROPPED (bind failed)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if self.null_uav && skip_null_uav_dispatches() {
+            outcome("DROPPED (null UAV)");
             null_uav_dropped(&p.name);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -751,7 +775,35 @@ impl State {
         if p.has_root_uavs() {
             emit_uav_barrier(list);
         }
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            outcome(&format!("RUN reads {:?}", self.reads(true)));
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether this dispatch is in a listed (captured) frame and debug
+    /// logging is on; logs its pipeline and shader hashes (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, x: u32, y: u32, z: u32) -> bool {
+        if !tracing::enabled!(tracing::Level::DEBUG)
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return false;
+        }
+        let hashes: Vec<String> = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map(|p| {
+                p.stages
+                    .iter()
+                    .map(|s| format!("{}", s.shader.hash))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            "dispatch {x}x{y}x{z} pipeline {:#x} shaders {hashes:?}",
+            self.pipeline
+        );
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -961,7 +1013,10 @@ impl State {
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
                 if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
-                    once!(n, "a constant table did not fit in command-list slots; draw dropped");
+                    once!(
+                        n,
+                        "a constant table did not fit in command-list slots; draw dropped"
+                    );
                     return None;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
@@ -1215,7 +1270,7 @@ impl State {
     /// pipeline reads expanded into triangles, and the records rewritten
     /// for them, both on the GPU ([`crate::rects`]). Records before the
     /// pipeline is bound (it replaces it). `None` if this draw cannot be
-    /// expanded (indexed, unaligned, too many elements, no pipeline).
+    /// expanded, with the reason (indexed, unaligned, too many elements...).
     #[allow(clippy::type_complexity)]
     fn indirect_rectangles(
         &self,
@@ -1224,14 +1279,14 @@ impl State {
         bounded: &ID3D12Resource,
         stride: u32,
         max: u32,
-    ) -> Option<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>)> {
+    ) -> Result<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>), &'static str> {
         if kind != 0 {
-            return None;
+            return Err("indexed");
         }
-        let host = crate::host::host()?;
-        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let host = crate::host::host().ok_or("no host")?;
+        let p = crate::pipeline::host_pipeline(self.pipeline as This).ok_or("no host pipeline")?;
         if p.compute || p.mesh {
-            return None;
+            return Err("not a graphics pipeline");
         }
         let mut views = Vec::new();
         for slot in 0..32u32 {
@@ -1246,9 +1301,10 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             if v.address == 0 || v.size == 0 || v.stride == 0 {
-                return None;
+                return Err("no vertex buffer bound");
             }
-            let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
+            let shadow = crate::shadow::find(v.address, u64::from(v.size))
+                .ok_or("vertices outside title buffers")?;
             shadow.refresh(list, v.address, u64::from(v.size));
             // The expansion binds the source as a root unordered-access view.
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
@@ -1267,7 +1323,7 @@ impl State {
         // SAFETY: a live buffer.
         let from = unsafe { bounded.GetGPUVirtualAddress() };
         let records = crate::rects::records(list, host, bounded, from, stride, max)?;
-        Some((records, views))
+        Ok((records, views))
     }
 
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -1283,9 +1339,62 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // In a captured frame, indirect draws and dispatches are traced with
+        // their outcome like direct dispatches (compute passes such as tiled
+        // lighting often run indirect, with arguments a classification pass
+        // wrote).
+        #[cfg(feature = "diagnostics")]
+        let traced = tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let hashes: Vec<String> = crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| {
+                    p.stages
+                        .iter()
+                        .map(|s| format!("{}", s.shader.hash))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::debug!(
+                "indirect kind {kind} max {max} stride {stride} count {} at {arguments:#x} pipeline {:#x} shaders {hashes:?}",
+                if count.is_some() { "buffer" } else { "none" },
+                self.pipeline
+            );
+        }
+        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let outcome = if ran {
+                "RUN".to_owned()
+            } else if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+                format!("DROPPED ({})", crate::pipeline::drop_reason(self.pipeline as This))
+            } else {
+                "DROPPED (see the why line above)".to_owned()
+            };
+            tracing::debug!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "indirect kind {kind} {outcome}"
+            );
+        }
+        ran
+    }
+
+    fn execute_indirect_inner(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && crate::capture::listed(crate::queue::presented() + 1)
+            {
+                tracing::debug!("indirect kind {kind} why: pipeline skipped");
+            }
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -1294,10 +1403,18 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let why = |what: &str| {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && crate::capture::listed(crate::queue::presented() + 1)
+            {
+                tracing::debug!("indirect kind {kind} why: {what}");
+            }
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"))
+        };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            why("no host pipeline (not translated, or still compiling)");
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -1365,13 +1482,13 @@ impl State {
         let mut rect_vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)> = Vec::new();
         if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
             match self.indirect_rectangles(list, kind, &bounded, stride, max) {
-                Some((a, views)) => {
+                Ok((a, views)) => {
                     rect_args = Some(a);
                     rect_vertices = views;
                 }
-                None => {
+                Err(_reason) => {
                     crate::indirect::done(list, &bounded);
-                    why("a rectangle list (not expanded: indexed, unaligned or unknown inputs)");
+                    why(&format!("a rectangle list not expanded: {_reason}"));
                     return false;
                 }
             }
@@ -1409,7 +1526,10 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &bounded);
-            why("prepare failed");
+            why(&format!(
+                "prepare failed (kind {kind}, topology {}, compute {}, mesh {})",
+                self.topology, p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -1510,7 +1630,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                // What the GPU wrote at its address in another format, or
+                // else the title's memory.
+                let alias = crate::resource::written_alias(*resource as This);
+                if !alias.is_some_and(|from| {
+                    crate::texture::copy_alias(list, &from, *resource as This, t)
+                }) {
+                    crate::texture::upload(list, *resource as This, t);
+                }
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
@@ -1552,7 +1679,13 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
+            Some(t) => format!("uav {t}"),
+            None => match crate::descriptor::host::buffer_range(v) {
+                Some(range) => format!("uav buffer {range:?}"),
+                None => "uav without host resource".into(),
+            },
+        },
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],

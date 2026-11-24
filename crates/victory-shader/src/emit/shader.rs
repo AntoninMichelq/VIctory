@@ -15,6 +15,12 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one `u32` element stride per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
+/// View-heap slots the runtime stride table has strides for. It is a root
+/// view, which the host does not bounds-check, so a translated program
+/// reads entry `STRIDE_TABLE_SLOTS` (always zero) for a slot at or past it:
+/// a slot from garbage descriptor words faulted 1.4 GB past every
+/// allocation (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
+pub const STRIDE_TABLE_SLOTS: u32 = 1 << 20;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

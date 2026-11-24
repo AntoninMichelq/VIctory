@@ -31,6 +31,9 @@ mod submission_tests;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// The [`LOOSE_USES`] count at its last lookup (loose windows only):
+    /// the least recently used go first past [`loose_budget`].
+    used: std::sync::atomic::AtomicU64,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -87,20 +90,12 @@ impl UnchangedPages {
         }
     }
 
+    #[cfg(test)]
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
-        let unchanged = &mut self.pages[page - self.start / PAGE];
-        if *unchanged {
-            return false;
-        }
-        if current != before {
-            return true;
-        }
-        // A later range can touch bytes a partial comparison missed. At
-        // the edges, only bytes covered by the snapshot can be compared.
-        *unchanged = address == (page * PAGE).max(self.start)
-            && address + current.len() == ((page + 1) * PAGE).min(self.end);
-        false
+        let (start, end) = (self.start, self.end);
+        let unchanged = &mut self.pages[page - start / PAGE];
+        page_differs(unchanged, (start, end), address, current, before)
     }
 
     fn clear(&mut self) {
@@ -249,6 +244,7 @@ impl Shadow {
             watched: AtomicU8::new(WATCH_UNKNOWN),
             pending: Mutex::default(),
             before: Mutex::default(),
+            used: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -419,7 +415,6 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
-                at += n;
             }
             give_back(title);
             // Pages made equal to title memory are current in the copy, so
@@ -736,12 +731,138 @@ fn allocate_buffer(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
         add(C::ShadowAllocationUs, started.elapsed().as_micros() as u64);
     }
     Some(allocation)
+/// Loose windows copied, and the title memory they cover (less when
+/// windows overlap and copy the same bytes more than once).
+pub(crate) fn loose_cover() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut covered, mut reach) = (0u64, 0u64);
+    for &(start, len) in map.keys() {
+        let end = start + len;
+        if end > reach {
+            covered += end - start.max(reach);
+            reach = end;
+        }
+    }
+    (map.len(), covered)
+}
+
+/// Loose window lookups so far: the clock of [`Shadow::used`].
+static LOOSE_USES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes of loose windows kept before the least recently used ones
+/// nothing holds are released: `VICTORY_LOOSE_BUDGET_MB`, 1.5 GiB by
+/// default. The world's GPU reads over 3 GB of such memory within minutes
+/// and kept a copy of all of it for good.
+fn loose_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_LOOSE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1536)
+            << 20
+    })
+}
+
+/// References to `buffer` besides the caller's: descriptor slots that
+/// view it hold one each.
+fn com_refs(buffer: &ID3D12Resource) -> u32 {
+    use windows::core::Interface;
+    // SAFETY: every COM interface's table starts with IUnknown's; an
+    // AddRef then a Release leaves the count as it was and returns it.
+    unsafe {
+        let raw = buffer.as_raw();
+        let table = &**raw.cast::<*const windows::core::IUnknown_Vtbl>();
+        (table.AddRef)(raw);
+        (table.Release)(raw)
+    }
+}
+
+/// Whether nothing but the window map holds `shadow`: no list (which
+/// holds it until reset, after its submission ran), no descriptor slot
+/// viewing its buffer, and no GPU writes waiting to go back to title
+/// memory. Title memory then holds all it has: it can be made again.
+fn idle(shadow: &Arc<Shadow>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reason = if Arc::strong_count(shadow) != 1 {
+        0
+    } else if com_refs(&shadow.buffer) != 1 {
+        1
+    } else if !shadow.pending.lock().is_ok_and(|p| p.is_empty()) {
+        2
+    } else if !shadow.before.lock().is_ok_and(|b| b.pages.is_empty() && b.spans.is_empty()) {
+        3
+    } else {
+        return true;
+    };
+    LOOSE_HELD[reason].fetch_add(1, Relaxed);
+    false
+}
+
+/// At the last eviction: windows held by a list, by a descriptor slot, by
+/// GPU writes waiting, by a snapshot; and windows released so far.
+static LOOSE_HELD: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static LOOSE_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`LOOSE_HELD`] and [`LOOSE_RELEASED`] say, for the memory log.
+pub(crate) fn loose_eviction() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = LOOSE_HELD.each_ref().map(|a| a.load(Relaxed));
+    format!(
+        "loose released {}, held at last try: list {}, slot {}, gpu writes {}, snapshot {}",
+        LOOSE_RELEASED.load(Relaxed),
+        h[0],
+        h[1],
+        h[2],
+        h[3]
+    )
+}
+
+/// Releases the least recently used idle windows until those kept and
+/// `more` bytes fit [`loose_budget`].
+fn evict_loose(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, more: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let budget = loose_budget();
+    let kept = || crate::memstat::LOOSE.load(Relaxed);
+    if kept() + more <= budget {
+        return;
+    }
+    for held in &LOOSE_HELD {
+        held.store(0, Relaxed);
+    }
+    let mut idle: Vec<(u64, (u64, u64))> = map
+        .iter()
+        .filter(|(_, s)| idle(s))
+        .map(|(k, s)| (s.used.load(Relaxed), *k))
+        .collect();
+    idle.sort_unstable();
+    let mut freed = 0;
+    for (_, key) in idle {
+        if kept() + more <= budget {
+            break;
+        }
+        if let Some(shadow) = map.remove(&key) {
+            crate::memstat::sub(&crate::memstat::LOOSE, key.1);
+            freed += key.1;
+            LOOSE_RELEASED.fetch_add(1, Relaxed);
+            crate::host::retire(shadow);
+        }
+    }
+    if freed > 0 {
+        tracing::debug!(
+            freed_mib = freed >> 20,
+            kept_mib = kept() >> 20,
+            "loose windows released"
+        );
+    }
 }
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let end = end.max(address.saturating_add(64 << 10));
     let len = end.checked_next_multiple_of(WINDOW)? - start;
+    let now = LOOSE_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
@@ -752,11 +873,13 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        shadow.used.store(now, std::sync::atomic::Ordering::Relaxed);
         return Some(shadow);
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
+    evict_loose(&mut map, len);
     let (buffer, data) = allocate_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -767,7 +890,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    shadow.used.store(now, std::sync::atomic::Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
+    crate::memstat::add(&crate::memstat::LOOSE, len);
     Some(shadow)
 }
 

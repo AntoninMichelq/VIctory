@@ -24,9 +24,9 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
-/// BLAKE3 hex digest of `victory-shader`'s source tree, computed at build
-/// time: shader caches key on it, so they are kept across rebuilds that do
-/// not change the translator and dropped when it changes.
+/// Deterministic BLAKE3 hex digest of `victory-shader`'s source tree, computed
+/// at build time so shader caches invalidate automatically when translator code
+/// changes without being wiped by unrelated crate rebuilds.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

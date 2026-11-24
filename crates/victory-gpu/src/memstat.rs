@@ -12,6 +12,8 @@ pub(crate) static TITLE_GPU: AtomicU64 = AtomicU64::new(0);
 /// memory visible to the GPU), and how many there are.
 pub(crate) static SHADOWS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Of those, copies of memory outside any buffer (never freed).
+pub(crate) static LOOSE: AtomicU64 = AtomicU64::new(0);
 
 /// Host textures (the driver's allocations, video memory while it fits),
 /// how many, and how many are textures the title placed itself, never
@@ -35,10 +37,11 @@ pub fn report() -> String {
     let mib = |v: u64| v >> 20;
     #[allow(unused_mut)]
     let mut line = format!(
-        "title gpu heaps {} MiB, buffer copies {} MiB ({}), host textures {} MiB ({}, {} placed)",
+        "title gpu heaps {} MiB, buffer copies {} MiB ({}; loose {} MiB), host textures {} MiB ({}, {} placed)",
         mib(TITLE_GPU.load(Relaxed)),
         mib(SHADOWS.load(Relaxed)),
         SHADOW_COUNT.load(Relaxed),
+        mib(LOOSE.load(Relaxed)),
         mib(HOST_TEXTURES.load(Relaxed)),
         HOST_TEXTURE_COUNT.load(Relaxed),
         PLACED_COUNT.load(Relaxed),
@@ -48,10 +51,13 @@ pub fn report() -> String {
         use std::fmt::Write;
         let _ = write!(
             line,
-            ", texture staging {} MiB, snapshots {} MiB",
+            ", loose windows {} covering {} MiB, texture staging {} MiB, snapshots {} MiB",
+            crate::shadow::loose_cover().0,
+            mib(crate::shadow::loose_cover().1),
             mib(crate::texture::staged_bytes()),
             mib(crate::shadow::pool_bytes()),
         );
+        let _ = write!(line, ", {}", crate::shadow::loose_eviction());
         if let Some([local, system]) = crate::host::video_memory() {
             let _ = write!(
                 line,

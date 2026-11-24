@@ -132,7 +132,7 @@ impl Shader {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let target = crate::shader_cache::runtime_target();
     let host = crate::shader_cache::host_shader(container, target)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
@@ -282,6 +282,19 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+/// Why a draw or dispatch of `this` has no host pipeline (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn drop_reason(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline set".to_owned();
+    }
+    let p = pipeline(this);
+    skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host))
+        .unwrap_or_else(|| "pipeline still compiling or kind mismatch".to_owned())
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).

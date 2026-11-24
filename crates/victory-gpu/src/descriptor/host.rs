@@ -253,7 +253,9 @@ impl HostHeap {
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            // Every slot the translation reads, and the zero entry it reads
+            // for slots past them.
+            StrideTable::new(&host.device, victory_shader::emit::STRIDE_TABLE_SLOTS + 1)
         };
         let h = HostHeap {
             heap,
@@ -491,7 +493,7 @@ impl HostHeap {
 
     fn set_stride(&self, index: u32, stride: u32) {
         if let Some(t) = &self.strides
-            && index < t.len
+            && index < t.len.min(victory_shader::emit::STRIDE_TABLE_SLOTS)
         {
             // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
             unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
@@ -970,6 +972,31 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
+    // The view must stay inside the title buffer, as `buffer_srv` checks:
+    // the host does not bounds-check a view past its resource, and a
+    // dispatch writing through one faulted past every allocation
+    // (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
+    {
+        let bytes = if element != 0 {
+            element
+        } else {
+            u64::from(buffer.StructureByteStride)
+        };
+        let end = buffer
+            .FirstElement
+            .checked_add(u64::from(buffer.NumElements))
+            .and_then(|n| n.checked_mul(bytes));
+        if bytes == 0 || end.is_none_or(|end| end > len) {
+            once!(
+                first = buffer.FirstElement,
+                elements = buffer.NumElements,
+                bytes,
+                len,
+                "unordered buffer view past its buffer left null"
+            );
+            return None;
+        }
+    }
     let offset = shadow.offset(address);
     buffer.CounterOffsetInBytes = 0;
     if element != 0 && offset % element == 0 {

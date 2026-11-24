@@ -1167,8 +1167,20 @@ impl Drop for Timed {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// Dynamic descriptor slots, given back when dropped.
+struct DynamicSlots(Vec<(usize, u32, u32)>);
+
+impl Drop for DynamicSlots {
+    fn drop(&mut self) {
+        for &(heap, first, n) in &self.0 {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+}
+
 impl Drop for HostList {
     fn drop(&mut self) {
+        self.retire_held();
         self.release_kept();
     }
 }
@@ -1431,6 +1443,13 @@ impl Host {
     /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
     /// immediately.
     pub(crate) fn recycle_list(&self, list: HostList) {
+        // What its submission needed (copies of title memory, texture
+        // staging, textures, buffers it named) is not held while the list
+        // waits in the pool: up to 64 idle lists kept gigabytes of loose
+        // memory copies from being released (2026-11-24). It is retired, not
+        // dropped: the submission may still be running (a page fault inside
+        // a freed 256x256 texture after pooled lists cleared their holds).
+        list.retire_held();
         list.release_kept();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < LIST_POOL_CAP {
@@ -1711,6 +1730,9 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Queues these writes release run their work once no lock is held:
+        // it submits lists itself (this lock, the lists' `deferred`).
+        let mut woken = crate::fence::Woken::default();
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
@@ -1724,10 +1746,12 @@ impl Host {
                     },
                     what => what,
                 };
-                what.write(at as *mut u8, bytes);
+                woken.add(what.write(at as *mut u8, bytes));
             }
         }
         self.log_messages();
+        drop(submitted);
+        woken.run();
     }
 
     /// How host GPU timestamps map onto the title's GPU clock
@@ -2047,15 +2071,16 @@ impl HostList {
     }
 
     /// Frees kept upload blocks and returns kept dynamic descriptor slots.
+    /// Through [`retire`]: a submission still running may read them.
     fn release_kept(&self) {
-        self.kept_uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let uploads = std::mem::take(&mut *self.kept_uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        if !uploads.is_empty() {
+            retire(uploads);
+        }
         let dynamic =
             std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
-        for (heap, first, n) in dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        if !dynamic.is_empty() {
+            retire(DynamicSlots(dynamic));
         }
     }
 
@@ -2104,7 +2129,25 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// Hands the objects the list holds for its commands (buffers it
+    /// named, textures it moved) to [`retire`]: a submission still running
+    /// may read them (a page fault inside a freed rectangle records buffer,
+    /// 2026-11-24).
+    fn retire_held(&self) {
+        // The whole recording's holds: buffers it named, texture staging
+        // and buffer copies its copies read.
+        let deferred = std::mem::take(&mut *self.deferred());
+        retire(deferred);
+        let buffers = std::mem::take(&mut *self.buffers.lock().unwrap_or_else(|e| e.into_inner()));
+        retire(buffers);
+        let states = std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
+        if !states.is_empty() {
+            retire(states);
+        }
+    }
+
     pub(crate) fn reset(&self) {
+        self.retire_held();
         self.release_kept();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2149,6 +2192,28 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
+    /// As [`HostList::transition`], for a host copy named directly (one a
+    /// title texture reads through another's memory, see
+    /// `resource::written_alias`).
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then(|| (copy.texture.clone(), before))
             }
         }
     }

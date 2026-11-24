@@ -1,7 +1,7 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the translator
-//! that translated it (the BLAKE3 of victory-shader's source, see
-//! [`build`]), so a changed translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the VIctory build
+//! that translated it (the BLAKE3 of our executable), so a rebuilt
+//! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+pub use victory_pipeline::Cache;
+use victory_pipeline::Converter;
 use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
@@ -36,13 +37,12 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies the translation: the translator's source
-/// ([`victory_shader::SOURCE_HASH`]), this file's source (the entry
-/// encoding), and the translation settings it runs with (the loop and
-/// spin-wait limits, which `VICTORY_SHADER_LOOP_LIMIT` and
-/// `VICTORY_SHADER_SPIN_LIMIT` change at run time). Not the executable: a
-/// rebuild that leaves the translator alone keeps every cached shader.
-/// `VICTORY_SHADER_CACHE_KEY=exe` keys on the executable as before.
+/// What identifies this build's translations: the BLAKE3 of the
+/// translator's source (`victory_shader::SOURCE_HASH`, so a rebuild that
+/// does not touch the translator keeps the cache), of this file (the entry
+/// encoding), of the build profile, and of the translation settings it runs
+/// with (the loop and spin-wait limits, which `VICTORY_SHADER_LOOP_LIMIT`
+/// and `VICTORY_SHADER_SPIN_LIMIT` change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -61,29 +61,10 @@ fn build() -> &'static [u8; 32] {
             );
         }
         let mut h = blake3::Hasher::new();
-        if std::env::var("VICTORY_SHADER_CACHE_KEY").is_ok_and(|v| v.trim() == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => {
-                    h.update(&bytes);
-                }
-                Err(e) => {
-                    // Without it no entry can be trusted: a fresh key per run.
-                    tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    h.update(&now.as_nanos().to_le_bytes());
-                }
-            }
-        } else {
-            h.update(b"victory shader cache v2\0");
-            h.update(victory_shader::SOURCE_HASH.as_bytes());
-            h.update(include_str!("shader_cache.rs").as_bytes());
-            tracing::info!(
-                translator = &victory_shader::SOURCE_HASH[..12],
-                "shader cache keyed on the translator's source"
-            );
-        }
+        h.update(b"victory shader cache v2");
+        h.update(victory_shader::SOURCE_HASH.as_bytes());
+        h.update(include_str!("shader_cache.rs").as_bytes());
+        h.update(&[u8::from(cfg!(debug_assertions)), u8::from(cfg!(feature = "diagnostics"))]);
         h.update(&limit.to_le_bytes());
         h.update(&spin.to_le_bytes());
         h.update(&[u8::from(victory_shader::emit::root_uavs())]);
@@ -91,15 +72,91 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// The wave sizes the runtime translates for: its host device's
+/// ([`Target::ANY`] without one). `victory translate --write-cache` asks
+/// the same function, so its entries carry the runtime's key.
+pub fn runtime_target() -> Target {
+    crate::host::host().map_or(Target::ANY, |h| h.target())
+}
+
+/// The key part of every entry this build translates for `target` (see
+/// [`key`]): the one [`host_shader`] looks entries up with and [`store`]
+/// writes them with.
+pub fn cache_key(target: Target) -> [u8; 32] {
+    key(build(), target)
+}
+
+/// The translation the runtime makes of a container (and keeps).
+fn translate_for(target: Target) -> impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync {
+    move |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string())
+}
+
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+    let translate = translate_for(target);
     match CACHE.get() {
-        Some(cache) => cached(cache, &key(build(), target), container, translate),
+        Some(cache) => cached(cache, &cache_key(target), container, translate),
         None => translate(container),
     }
+}
+
+/// What [`store`] did with a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// Translated and written.
+    Written,
+    /// A readable entry was there already.
+    AlreadyCached,
+}
+
+/// Opens the shader cache in `dir` for [`store`] (the runtime's is the
+/// `shaders` folder of the configured cache).
+pub fn open(dir: PathBuf) -> anyhow::Result<Cache> {
+    Cache::open(dir)
+}
+
+/// Ahead of time: translates `container` as the runtime would for
+/// `target` and keeps it in `cache` under `key` (from [`cache_key`]), so a
+/// run with the same build, settings and host finds it instead of
+/// translating it. The same converter and entry encoding as the runtime's
+/// lookup, so the two cannot disagree on where an entry lives.
+pub fn store(
+    cache: &Cache,
+    key: &[u8; 32],
+    container: &[u8],
+    target: Target,
+) -> Result<Stored, String> {
+    store_with(cache, key, container, translate_for(target))
+}
+
+fn store_with(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<Stored, String> {
+    let input = [&build[..], container].concat();
+    let converter = Translate {
+        translate,
+        ran: AtomicBool::new(false),
+        translated: AtomicBool::new(false),
+    };
+    for _ in 0..2 {
+        let path = cache
+            .get_or_convert(&converter, &input)
+            .map_err(|e| format!("{e:#}"))?;
+        if std::fs::read(&path).ok().and_then(|b| decode(&b)).is_some() {
+            return Ok(if converter.ran.load(Ordering::Relaxed) {
+                Stored::Written
+            } else {
+                Stored::AlreadyCached
+            });
+        }
+        // An entry the runtime could not read: replace it.
+        let _ = std::fs::remove_file(&path);
+    }
+    Err("the cache entry does not read back".to_owned())
 }
 
 /// The part of an entry's key before the container: the build, and the
@@ -387,6 +444,31 @@ mod tests {
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn stored_entries_are_what_the_runtime_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = key(&[7; 32], Target::ANY);
+        let container = b"a console container".as_slice();
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::Written));
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::AlreadyCached));
+        // The runtime's lookup with the same key does not translate.
+        let never = |_: &[u8]| -> Result<HostShader, String> { panic!("translated again") };
+        assert_eq!(cached(&cache, &build, container, never), Ok(shader()));
+        // Another host's waves are another entry.
+        let other = key(&[7; 32], Target { lanes_min: 32, lanes_max: 32 });
+        assert_eq!(store_with(&cache, &other, container, ok), Ok(Stored::Written));
+        // A damaged entry is written again; failures are not stored.
+        for e in walk(dir.path()) {
+            std::fs::write(e, b"VSH3 broken").unwrap();
+        }
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::Written));
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        assert!(store_with(&cache, &build, b"other", fail).is_err());
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
