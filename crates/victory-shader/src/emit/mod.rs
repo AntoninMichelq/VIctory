@@ -127,8 +127,27 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// dropped, as before root UAVs were lowered. The value is part of the
 /// translation, so the shader cache keys on it.
 pub fn root_uavs() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAVS").is_ok_and(|v| v.trim() == "1"))
+    use std::sync::atomic::Ordering;
+    match ROOT_UAVS.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("VICTORY_ROOT_UAVS").is_ok_and(|v| v.trim() == "1");
+            // A test's forced value wins over the variable.
+            let _ = ROOT_UAVS.compare_exchange(0, 1 + u8::from(on), Ordering::Relaxed, Ordering::Relaxed);
+            ROOT_UAVS.load(Ordering::Relaxed) == 2
+        }
+    }
+}
+
+/// [`root_uavs`]: 0 not read yet, 1 off, 2 on.
+static ROOT_UAVS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Turns root UAVs on for this process, for tests of the runtime that
+/// need them whatever `VICTORY_ROOT_UAVS` says.
+#[doc(hidden)]
+pub fn enable_root_uavs_for_tests() {
+    ROOT_UAVS.store(2, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The iteration count after which a translated loop is left, per lane and
