@@ -159,7 +159,10 @@ fn null_uav_dropped(pipeline: &str) {
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
         seen.push(pipeline.to_owned());
-        tracing::warn!(pipeline, "a dispatch writing through a null unordered access view dropped");
+        tracing::warn!(
+            pipeline,
+            "a dispatch writing through a null unordered access view dropped"
+        );
     }
 }
 
@@ -565,7 +568,11 @@ impl State {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, srv, "a shader reads a root view the title did not set");
+                        once!(
+                            slot,
+                            srv,
+                            "a shader reads a root view the title did not set"
+                        );
                         return false;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
@@ -613,7 +620,23 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let traced = self.trace_dispatch(x, y, z);
+        #[cfg(feature = "diagnostics")]
+        let pipe = self.pipeline;
+        #[cfg(feature = "diagnostics")]
+        let outcome = |why: &str| {
+            if traced {
+                tracing::debug!(
+                    pipeline = format_args!("{pipe:#x}"),
+                    "dispatch {x}x{y}x{z} {why}"
+                );
+            }
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let outcome = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            outcome("DROPPED (pipeline skipped)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
@@ -623,6 +646,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            outcome("DROPPED (no host pipeline)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -630,18 +654,22 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            outcome("DROPPED (graphics pipeline)");
             return;
         }
         if !dispatch_fits(x, y, z) {
             once!(x, y, z, "a dispatch past the host's group limits dropped");
+            outcome("DROPPED (past group limits)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if !self.bind(list, p, true) {
+            outcome("DROPPED (bind failed)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if self.null_uav && skip_null_uav_dispatches() {
+            outcome("DROPPED (null UAV)");
             null_uav_dropped(&p.name);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -650,7 +678,35 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            outcome(&format!("RUN reads {:?}", self.reads(true)));
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether this dispatch is in a listed (captured) frame and debug
+    /// logging is on; logs its pipeline and shader hashes (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, x: u32, y: u32, z: u32) -> bool {
+        if !tracing::enabled!(tracing::Level::DEBUG)
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return false;
+        }
+        let hashes: Vec<String> = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map(|p| {
+                p.stages
+                    .iter()
+                    .map(|s| format!("{}", s.shader.hash))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            "dispatch {x}x{y}x{z} pipeline {:#x} shaders {hashes:?}",
+            self.pipeline
+        );
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -850,7 +906,10 @@ impl State {
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
                 if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
-                    once!(n, "a constant table did not fit in command-list slots; draw dropped");
+                    once!(
+                        n,
+                        "a constant table did not fit in command-list slots; draw dropped"
+                    );
                     return None;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
@@ -1127,10 +1186,17 @@ impl State {
             if v.address == 0 || v.size == 0 || v.stride == 0 {
                 return Err("no vertex buffer bound");
             }
-            let shadow = crate::shadow::find(v.address, u64::from(v.size)).ok_or("vertices outside title buffers")?;
+            let shadow = crate::shadow::find(v.address, u64::from(v.size))
+                .ok_or("vertices outside title buffers")?;
             shadow.refresh(list, v.address, u64::from(v.size));
-            let (_, gpu, size) =
-                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            let (_, gpu, size) = crate::rects::vertices(
+                list,
+                host,
+                shadow.gpu(v.address),
+                u64::from(v.size),
+                v.stride,
+                &elements,
+            )?;
             views.push((
                 slot,
                 D3D12_VERTEX_BUFFER_VIEW {
