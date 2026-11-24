@@ -528,7 +528,7 @@ impl State {
 
     /// A one-descriptor table holding a null raw SRV (reads return 0), for
     /// pointer views whose address is null.
-    fn null_srv_table(&mut self) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+    fn null_srv_table(&mut self, uav: bool) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         let heap = self
             .heaps
             .iter()
@@ -536,13 +536,17 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
-        let key = (std::ptr::from_ref(heap) as usize, 0, 0, 0);
+        let key = (std::ptr::from_ref(heap) as usize, 0, 0, u64::from(uav) << 63);
         let first = match self.root_srv_slots.get(&key) {
             Some(&first) => first,
             None => {
                 let first = host.dynamic(1)?;
                 self.dynamic.push((key.0, first, 1));
-                host.null_raw_srv_at(first);
+                if uav {
+                    host.null_raw_uav_at(first);
+                } else {
+                    host.null_raw_srv_at(first);
+                }
                 self.root_srv_slots.insert(key, first);
                 first
             }
@@ -750,8 +754,9 @@ impl State {
                         }
                         bound_params |= 1u64 << param;
                     }
+                    // A pointer the program writes through is a root UAV.
                     let pointer = slot >= victory_shader::emit::POINTER_SLOT
-                        && matches!(kind, RootView::Srv);
+                        && matches!(kind, RootView::Srv | RootView::Uav);
                     let address = if pointer {
                         // An address the program keeps in root constants.
                         let index = u32::from(slot - victory_shader::emit::POINTER_SLOT);
@@ -788,7 +793,7 @@ impl State {
                     if kind != RootView::Cbv && crate::pipeline::host::root_srv_tables() {
                         let table = if pointer && address == 0 {
                             // A null address the program tests before reading.
-                            self.null_srv_table()
+                            self.null_srv_table(kind == RootView::Uav)
                         } else {
                             self.root_srv_table(list, address, kind == RootView::Uav)
                         };

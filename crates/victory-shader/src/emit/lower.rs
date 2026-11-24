@@ -1601,17 +1601,134 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A global atomic (`global_atomic_*`) on a root UAV, or a pointer
+    /// view the program writes through, at the address the title sets.
+    fn global_atomic(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        op: &str,
+        data: Option<&Operand>,
+        dst: Option<&Operand>,
+        returns: bool,
+    ) -> Result<(), Why> {
+        if op.ends_with("_x2") {
+            return Err("a 64-bit global atomic");
+        }
+        // DXIL atomic operations: add, and, or, xor, signed and unsigned
+        // min and max, exchange; compare-exchange apart.
+        let native = match op {
+            "add" | "sub" => Some(0),
+            "and" => Some(1),
+            "or" => Some(2),
+            "xor" => Some(3),
+            "smin" => Some(4),
+            "smax" => Some(5),
+            "umin" => Some(6),
+            "umax" => Some(7),
+            "swap" => Some(8),
+            "cmpswap" | "inc" | "dec" => None,
+            "csub" if returns => None,
+            "csub" => return Err("global_atomic_csub without the required GLC bit"),
+            _ => return Err("a global floating-point atomic"),
+        };
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("an untracked global address")?;
+        if a.param == CODE {
+            return Err("a global memory write");
+        }
+        let guard = self.guard(site.0, site.1)?;
+        let d = data.ok_or("global atomic data")?;
+        let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 } else { 1 })?;
+        let val = vals[0];
+        let zero = self.s.m.i32(0);
+        let c = self.cur;
+        let mut off = self.s.m.i32(a.offset);
+        if let Some(dd) = self.dynamic_term(&a)? {
+            off = self.s.m.bin(c, Bin::Add, off, dd);
+        }
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let h = self.handle(site, &src, false, (11 | 0x1000, 0))?;
+        let (in_bounds, safe) = self.bound_raw_offset(off);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let coords = [safe, iu, iu];
+        let active = if native.is_none() || op == "sub" {
+            let bounds = self.buffer_bounds(h, None, off, 0, 4);
+            Some(self.buffer_store_guard(bounds, guard))
+        } else {
+            guard
+        };
+        let active = self.and_guard(active, in_bounds);
+        let at = self.begin_guarded(active);
+        let r = if op == "cmpswap" {
+            // cmpswap: data is (new, compare).
+            self.buffer_compare_exchange(h, coords, vals[1], val, false)
+        } else if let Some(code) = native {
+            let data = if op == "sub" {
+                self.s.m.bin(self.cur, Bin::Sub, zero, val)
+            } else {
+                val
+            };
+            let code = self.s.m.i32(code);
+            let ty = self.s.t.i32;
+            self.s.op(
+                self.cur,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                ty,
+                78,
+                &[h, code, coords[0], coords[1], coords[2], data],
+            )
+        } else {
+            let update = match op {
+                "inc" => AtomicUpdate::Inc,
+                "dec" => AtomicUpdate::Dec,
+                _ => AtomicUpdate::ClampSub,
+            };
+            self.atomic_update(zero, |l, old| {
+                let x = l.atomic_new_value(update, old, val, zero);
+                l.buffer_compare_exchange(h, coords, old, x, false)
+            })
+        };
+        if returns {
+            let Some(&Operand::Vector { reg, .. }) = dst else {
+                return Err("a global atomic result");
+            };
+            let r = self.end_guarded(at, &[(r, zero)])[0];
+            self.write_atomic_result(inst, reg, r, false, guard);
+        } else {
+            self.end_guarded(at, &[]);
+        }
+        Ok(())
+    }
+
     /// A global memory access (`global_load_*`, `global_store_*`): from the
     /// program's constant table, or from a root SRV/UAV at the address the
     /// title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, lds, data, .. } = &inst.fields else {
+        let Fields::Flat {
+            dst,
+            lds,
+            data,
+            cache,
+            ..
+        } = &inst.fields
+        else {
             unreachable!()
         };
         if *lds {
             return Err("a global load directly into LDS");
         }
         let name = inst.name();
+        if let Some(op) = name.strip_prefix("global_atomic_") {
+            return self.global_atomic(inst, (b, i), op, data.as_ref(), dst.as_ref(), cache.glc);
+        }
         if let Some(rest) = name.strip_prefix("global_store_") {
             let n = match rest {
                 "dword" => 1u32,
@@ -6399,6 +6516,16 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Whether the program stores or runs an atomic through address
+    /// parameter `param` somewhere.
+    fn pointer_written(&self, param: usize) -> bool {
+        self.scalar.iter().any(|(&(b, i), a)| {
+            let name = self.x.p.blocks[b].insts[i].name();
+            a.param == param
+                && (name.starts_with("global_store_") || name.starts_with("global_atomic_"))
+        })
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -6445,9 +6572,16 @@ impl<'a> Lower<'a> {
                 if let Some(index) = crate::resource::pointer_user_data(address.param) =>
             {
                 // An address in root constants: a root SRV the host binds
-                // at the address its two dwords hold, read as user data.
-                if props.0 != 11 {
-                    return Err("a write or typed view through an address in root constants");
+                // at the address its two dwords hold, read as user data; a
+                // root UAV when the program writes through it anywhere (its
+                // reads then see its writes).
+                let write = props.0 == 11 | 0x1000;
+                if props.0 != 11 && !write {
+                    return Err("a typed view through an address in root constants");
+                }
+                let uav = write || self.pointer_written(address.param);
+                if uav && !(cfg!(test) || super::root_uavs()) {
+                    return Err("a write through an address in root constants without root UAVs");
                 }
                 // A shifted address (bit 8): one dword, registers from
                 // `POINTER_SLOT + 64` on.
@@ -6473,7 +6607,11 @@ impl<'a> Lower<'a> {
                 if !shifted {
                     let _ = self.user(param, dword + 1);
                 }
-                Ok(self.s.root_srv_handle(super::POINTER_SLOT + slot))
+                Ok(if uav {
+                    self.s.root_uav_handle(super::POINTER_SLOT + slot)
+                } else {
+                    self.s.root_srv_handle(super::POINTER_SLOT + slot)
+                })
             }
             Source::Built { address, .. } => {
                 let rp = *self
@@ -14245,6 +14383,35 @@ mod tests {
         let mut read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
         read.sort_unstable();
         assert_eq!(read, [2, 3]);
+    }
+
+    /// An address in root constants written through (a returning add, an
+    /// unsigned max and a store) as well as read: one root UAV at the
+    /// pointer register, which the read uses too.
+    #[test]
+    fn writes_through_addresses_in_root_constants_lower_to_pointer_uavs() {
+        let words = [
+            0x7E00_0202, // v_mov_b32_e32 v0, s2
+            0x7E02_0203, // v_mov_b32_e32 v1, s3
+            0xDC30_8004,
+            0x027D_0000, // global_load_dword v2, v[0:1], off offset:4
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xDCC9_8000,
+            0x037D_0400, // global_atomic_add v3, v[0:1], v4, off glc
+            0xDCE0_8010,
+            0x007D_0400, // global_atomic_umax v[0:1], v4, off offset:16
+            0xDC70_8008,
+            0x007D_0200, // global_store_dword v[0:1], v2, off offset:8
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        let mut constants = root(RootType::Constants, 0, 0);
+        constants.sgprs = 4;
+        let l = lower_with(&words, vec![constants], vec![]).unwrap();
+        assert_eq!(l.root_uavs, [crate::emit::POINTER_SLOT + 2]);
+        assert!(l.root_srvs.is_empty());
     }
 
     /// An address kept shifted right by 8 in one root constant (s3 of
