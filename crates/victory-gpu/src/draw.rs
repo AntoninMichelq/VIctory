@@ -945,7 +945,8 @@ impl State {
     /// read state). Each window is refreshed whole for this command (dirty
     /// pages only, from the write watch). Programs that load an address
     /// from memory and read through it find the window there.
-    /// `VICTORY_NO_MEMORY_TABLE=1` binds an empty table (such reads give 0).
+    /// `VICTORY_NO_MEMORY_TABLE=1` binds a table of one empty window (such
+    /// reads give 0); an empty table always gets that window too.
     ///
     /// shortcut: rebuilt for every command that reads it, and reads only:
     /// a program writing through a loaded address is not copied back.
@@ -960,8 +961,13 @@ impl State {
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers());
-        if let Some(heap) = heap.filter(|_| !no_memory_table()) {
-            let host = heap.host()?;
+        // The shader indexes the view heap: without one it cannot run.
+        let Some(heap) = heap else {
+            once!("a shader reads the memory table without a view heap bound");
+            return None;
+        };
+        let host = heap.host()?;
+        if !no_memory_table() {
             let mut windows: Vec<_> = crate::shadow::live()
                 .into_iter()
                 .map(|s| (s.range(), s))
@@ -1030,6 +1036,23 @@ impl State {
                 ]);
                 reach = end;
             }
+        }
+        // The shader reads entry 0 when no window holds an address (its
+        // offset then out of bounds): there must be one, naming a valid
+        // raw view. A null raw SRV with no bytes.
+        if entries.is_empty() {
+            let key = (std::ptr::from_ref(heap) as usize, 0, 0, 1 << 62);
+            let slot = match self.root_srv_slots.get(&key) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = host.dynamic(1)?;
+                    self.dynamic.push((key.0, slot, 1));
+                    host.null_raw_srv_at(slot);
+                    self.root_srv_slots.insert(key, slot);
+                    slot
+                }
+            };
+            entries.push([0, 0, 0, slot, NONE, 0, 0, 0]);
         }
         let bytes = 4 + 32 * entries.len();
         let (gpu, data) = list.scratch(bytes as u64)?;
