@@ -339,6 +339,12 @@ fn show(resource: Option<object::Held>) {
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static LAST_DRAWN: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn();
+        crate::capture::note_frame(frame, now - LAST_DRAWN.swap(now, Ordering::Relaxed));
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
