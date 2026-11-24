@@ -125,6 +125,50 @@ fn code_tables_read_through_an_address_from_the_first_lane_lower() {
     lowers(crate::resource::tests::CODE_TABLE_THROUGH_FIRST_LANE).unwrap();
 }
 
+#[test]
+fn code_table_load_keeps_first_lane_selection() {
+    // Two threads produce distinct, in-bounds addresses of the two
+    // dwords after s_endpgm. The scalar load reads the first lane's
+    // dword. The later mask leaves only lane one to perform the
+    // scalar load and write; it must still use lane zero's selection.
+    let words = [
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0x3602_0081, // v_and_b32 v1, 1, v0
+        0x3406_0282, // v_lshlrev_b32 v3, 2, v1
+        0xD70F_6A04,
+        0x0002_0604, // v_add_co_u32 v4, vcc_lo, s4, v3
+        0x7E0C_0205, // v_mov_b32 v6, s5
+        0x500A_0C80, // v_add_co_ci_u32 v5, vcc_lo, 0, v6, vcc_lo
+        0x7E10_0504, // v_readfirstlane_b32 s8, v4
+        0x7E12_0505, // v_readfirstlane_b32 s9, v5
+        0x7D8A_0080, // v_cmp_ne_u32 vcc_lo, 0, v0
+        0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+        0xBF88_0007, // s_cbranch_execz -> s_endpgm
+        0xF400_0184,
+        0xFA00_004C, // s_load_dword s6, s[8:9], 0x4c
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xD834_0000,
+        0x0000_0207, // ds_write_b32 v7, v2
+        S_ENDPGM,
+        0xBF80_0000, // Data at offset 0x50.
+        0xBF80_0001,
+    ];
+    with_compute_parts(&words, vec![], vec![], false, [2, 1, 1], |parts| {
+        let bad = std::collections::HashMap::new();
+        let mut l = super::Lower::new(parts, &bad, false);
+        assert!(l.lower_ir().is_ok());
+        let (table, _, _) = l.code_table.expect("code table");
+        assert!(
+            l.s.m.has_broadcast_before_table_load(table),
+            "the post-branch table load must use the pre-branch broadcast"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
 /// Lowers a compute program of constants: whether it translates.
 fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
     lower_with(words, vec![], vec![]).map(|_| ())
@@ -147,6 +191,17 @@ fn lower_wave(
     used: Vec<UsedResource>,
     wave64: bool,
 ) -> Result<Lowered, crate::ShaderError> {
+    with_compute_parts(words, layout, used, wave64, [1, 1, 1], lower)
+}
+
+fn with_compute_parts<T>(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    wave64: bool,
+    threads: [u32; 3],
+    run: impl FnOnce(&Parts) -> Result<T, ShaderError>,
+) -> Result<T, ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
     let native = NativeProgram {
@@ -158,7 +213,7 @@ fn lower_wave(
         io: StageIo::Cs(ComputeIo {
             // The layout's user SGPRs (at least two), 512 bytes of LDS.
             rsrc2: 1 << 15 | sgprs.max(2) << 1,
-            threads: [1, 1, 1],
+            threads,
         }),
         code,
     };
@@ -166,7 +221,7 @@ fn lower_wave(
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native).unwrap();
     let st = structure::structure(&p).unwrap();
-    lower(&Parts {
+    run(&Parts {
         psv: None,
         native: &native,
         p: &p,

@@ -13,6 +13,7 @@
 //! parameters, by data flow: copies, phis that agree, and additions.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -125,6 +126,9 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// For a read-first-lane result used as an address offset, the lane-local
+    /// offset to broadcast at that instruction instead of its full pointer.
+    pub first_lane_offsets: BTreeMap<Value, Value>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -242,6 +246,25 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
             });
         }
     }
+    let offsets = t.first_lane_offsets.into_inner();
+    if !offsets.is_empty() {
+        let used = out.scalar.iter().map(|s| s.1).chain(
+            out.descriptors.iter().flat_map(|d| {
+                d.source.leaves().into_iter().filter_map(|leaf| match leaf {
+                    Source::Built { address, .. } => Some(*address),
+                    _ => None,
+                })
+            }),
+        );
+        for mut selected in used.filter_map(|a| a.dynamic) {
+            while let Some(&offset) = offsets.get(&selected) {
+                if out.first_lane_offsets.insert(selected, offset).is_some() {
+                    break;
+                }
+                selected = offset;
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -280,6 +303,7 @@ struct Tracer<'a> {
     lane_joins: RefCell<Vec<(usize, Vec<Term>)>>,
     /// See [`Waterfall::unset`].
     unset: RefCell<Vec<Value>>,
+    first_lane_offsets: RefCell<BTreeMap<Value, Value>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -328,6 +352,7 @@ impl<'a> Tracer<'a> {
             sums: std::cell::RefCell::new(Vec::new()),
             lane_joins: RefCell::new(Vec::new()),
             unset: RefCell::new(Vec::new()),
+            first_lane_offsets: RefCell::default(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -441,7 +466,7 @@ impl<'a> Tracer<'a> {
 
     /// The VGPR term `t` reads the first lane of, if `t` is a
     /// `v_readfirstlane_b32` (an address made in VGPRs, then made uniform):
-    /// taken as that term, the same in every lane that gets here.
+    /// used to trace the address base. The offset may still vary by lane.
     fn through_firstlane(&self, t: Term) -> Term {
         let Term::Value(v) = t else { return t };
         let Some(inst) = self.def(v) else { return t };
@@ -474,8 +499,17 @@ impl<'a> Tracer<'a> {
 
     fn sum_uncached(&self, t: Term) -> Sum {
         let through = self.through_firstlane(t);
-        if through != t {
-            return self.sum(through);
+        if let Term::Value(selected) = t
+            && through != t
+        {
+            let mut sum = self.sum(through);
+            if let Some(offset) = sum.dynamic {
+                if sum.base.is_some() || sum.offset != 0 || through != Term::Value(offset) {
+                    self.first_lane_offsets.borrow_mut().insert(selected, offset);
+                }
+                sum.dynamic = Some(selected);
+            }
+            return sum;
         }
         let v = match t {
             Term::Const(c) => {

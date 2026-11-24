@@ -262,6 +262,51 @@ impl Module {
         n
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_broadcast_before_table_load(&self, table: V) -> bool {
+        fn depends_on(module: &Module, value: V, source: V) -> bool {
+            if value == source {
+                return true;
+            }
+            let V::Inst(id) = value else { return false };
+            match module.insts[id as usize].op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+                    depends_on(module, a, source) || depends_on(module, b, source)
+                }
+                Op::Select(c, a, b) => {
+                    [c, a, b].into_iter().any(|v| depends_on(module, v, source))
+                }
+                _ => false,
+            }
+        }
+
+        self.blocks.iter().any(|block| {
+            let Some(Term::CondBr(_, yes, no)) = block.term else {
+                return false;
+            };
+            block.body.iter().any(|&id| {
+                let Op::Call(func, _) = self.insts[id as usize].op else {
+                    return false;
+                };
+                if self.funcs[func as usize].name != "dx.op.waveReadLaneFirst.i32" {
+                    return false;
+                }
+                [yes, no].into_iter().any(|succ| {
+                    self.blocks[succ].body.iter().any(|&load| {
+                        let Op::Load(V::Inst(ptr)) = self.insts[load as usize].op else {
+                            return false;
+                        };
+                        let Op::Gep(_, base, ref indices) = self.insts[ptr as usize].op else {
+                            return false;
+                        };
+                        base == table
+                            && indices.iter().any(|&v| depends_on(self, v, V::Inst(id)))
+                    })
+                })
+            })
+        })
+    }
+
     pub fn void(&mut self) -> Ty {
         self.ty(TypeDef::Void)
     }

@@ -492,6 +492,7 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    selected_offsets: HashMap<Value, Result<V, Why>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -1259,6 +1260,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            selected_offsets: HashMap::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -2311,7 +2313,7 @@ impl<'a> Lower<'a> {
     /// pointer that holds it (see [`Address::includes_base`]).
     fn dynamic_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
         let Some(d) = a.dynamic else { return Ok(None) };
-        let d = self.i32_of(d)?;
+        let d = self.offset_value(d)?;
         if !a.includes_base {
             return Ok(Some(d));
         }
@@ -2323,6 +2325,17 @@ impl<'a> Lower<'a> {
             _ => return Err("an advanced pointer into a root descriptor"),
         };
         Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
+    }
+
+    fn offset_value(&mut self, v: Value) -> Result<V, Why> {
+        if self.x.res.first_lane_offsets.contains_key(&v) {
+            return self
+                .selected_offsets
+                .get(&v)
+                .copied()
+                .ok_or("a selected address offset before its broadcast")?;
+        }
+        self.i32_of(v)
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -6290,6 +6303,16 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        // Select the offset here: EXEC may name different lanes by the time
+        // the scalar load consumes this address.
+        if let Some(&(_, selected)) = inst.writes.first()
+            && let Some(&offset) = self.x.res.first_lane_offsets.get(&selected)
+        {
+            let v = self
+                .offset_value(offset)
+                .and_then(|v| self.read_first_lane(inst, v));
+            self.selected_offsets.insert(selected, v);
+        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
@@ -7263,48 +7286,9 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
-            "v_readfirstlane_b32" if self.console_cf => {
-                // The console's first lane in EXEC (lane 0 when none).
-                let a = s(self, 0)?;
-                let word = |l: &mut Self, r: u8| -> Result<V, Why> {
-                    match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
-                        Val::I32(x) => Ok(x),
-                        _ => Err(LANE_MASK),
-                    }
-                };
-                let lo = word(self, EXEC)?;
-                let hi = if self.x.native.wave64 {
-                    word(self, EXEC + 1)?
-                } else {
-                    self.s.m.i32(0)
-                };
-                let i32t = self.s.t.i32;
-                let flo = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-                let fhi = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-                let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
-                let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
-                let fhi = self.s.m.select(c, none_hi, z, fhi);
-                let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
-                let first = self.s.m.select(c, some_lo, flo, fhi);
-                let r = self.console_read_lane(a, first);
-                int(self, r)
-            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = self.read_first_lane(inst, a)?;
                 int(self, r)
             }
             n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
@@ -7313,6 +7297,47 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    fn read_first_lane(&mut self, inst: &Inst, a: V) -> Result<V, Why> {
+        let c = self.cur;
+        if self.console_cf {
+            let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+                match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
+                    Val::I32(x) => Ok(x),
+                    _ => Err(LANE_MASK),
+                }
+            };
+            let lo = word(self, EXEC)?;
+            let hi = if self.x.native.wave64 {
+                word(self, EXEC + 1)?
+            } else {
+                self.s.m.i32(0)
+            };
+            let i32t = self.s.t.i32;
+            let flo = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+            let fhi = self
+                .s
+                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+            let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+            let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+            let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+            let fhi = self.s.m.select(c, none_hi, z, fhi);
+            let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
+            let first = self.s.m.select(c, some_lo, flo, fhi);
+            return Ok(self.console_read_lane(a, first));
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        Ok(self.s.op(
+            c,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            118,
+            &[a],
+        ))
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
