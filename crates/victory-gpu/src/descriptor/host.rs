@@ -289,7 +289,10 @@ impl HostHeap {
         if let Err(e) = h.fill_null(kind, count + extra) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
-        tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            "host descriptor heap made null"
+        );
         h
     }
 
@@ -382,7 +385,13 @@ impl HostHeap {
         let n = n as usize;
         let Some(first) = free_table(&taken[..spare.min(taken.len())], *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    spare,
+                    "no free dynamic descriptor slots: a table is not made"
+                )
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -440,7 +449,12 @@ impl HostHeap {
 
     /// Makes slot `index` a null view matching the resource kind a shader
     /// expects there (CBV, buffer SRV/UAV, or 2D texture).
-    pub(crate) fn make_null_kind(&self, index: u32, kind: victory_shader::ResourceType, dwords: u8) {
+    pub(crate) fn make_null_kind(
+        &self,
+        index: u32,
+        kind: victory_shader::ResourceType,
+        dwords: u8,
+    ) {
         if self.sampler {
             self.null_sampler(index);
             self.keep(index, None);
@@ -535,7 +549,22 @@ impl HostHeap {
     /// of `buffer` from dword `first`: a title root view made a
     /// one-descriptor table, so reads past the title buffer return zero
     /// instead of faulting (root views have no bounds).
-    pub(crate) fn raw_srv_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, elements: u32) {
+    pub(crate) fn raw_srv_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        first: u64,
+        elements: u32,
+    ) {
+        // The host removes the device for a raw view not on 16 bytes.
+        if !raw_start_fits(first) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(first, "raw view not on 16 bytes of its buffer left null");
+            });
+            self.null_raw_srv_at(index);
+            return;
+        }
         self.keep(index, Some(buffer.clone()));
         self.set_stride(index, 0);
         let Some(host) = host() else { return };
@@ -562,7 +591,22 @@ impl HostHeap {
     /// As [`Self::raw_srv_at`], a raw UAV: a title root UAV made a
     /// one-descriptor table, so accesses past the title buffer are
     /// dropped (writes) or return zero (reads) instead of faulting.
-    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, elements: u32) {
+    pub(crate) fn raw_uav_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        first: u64,
+        elements: u32,
+    ) {
+        // The host removes the device for a raw view not on 16 bytes.
+        if !raw_start_fits(first) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(first, "raw view not on 16 bytes of its buffer left null");
+            });
+            self.null_raw_uav_at(index);
+            return;
+        }
         self.keep(index, Some(buffer.clone()));
         self.set_stride(index, 0);
         let Some(host) = host() else { return };
@@ -799,7 +843,10 @@ impl HostHeap {
         for (shadow, address, end) in all {
             if let Some((last, _, last_end)) = ranges.last_mut()
                 && Arc::ptr_eq(last, &shadow)
-                && address <= (*last_end).next_multiple_of(crate::watch::PAGE).saturating_add(gap)
+                && address
+                    <= (*last_end)
+                        .next_multiple_of(crate::watch::PAGE)
+                        .saturating_add(gap)
             {
                 *last_end = (*last_end).max(end);
                 continue;
@@ -1108,8 +1155,7 @@ fn buffer_srv(
     };
     if element != 0 && offset % element == 0 {
         buffer.FirstElement += offset / element;
-        if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
-            && !raw_start_fits(buffer.FirstElement)
+        if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement)
         {
             let first = buffer.FirstElement;
             once!(first, "raw buffer view not on 16 bytes of its host copy");
@@ -1221,8 +1267,7 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     if element != 0 && offset % element == 0 {
         buffer.FirstElement += offset / element;
-        if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
-            && !raw_start_fits(buffer.FirstElement)
+        if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement)
         {
             let first = buffer.FirstElement;
             once!(
@@ -1253,7 +1298,11 @@ fn buffer_uav(
         };
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     } else {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
         return None;
     }
     let host = host()?;

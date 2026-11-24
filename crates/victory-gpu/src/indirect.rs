@@ -218,7 +218,11 @@ fn config() -> Config {
         let on = |name: &str| std::env::var(name).is_ok_and(|v| v == "1");
         let c = Config {
             mesh_2d: on("VICTORY_MESH_2D"),
-            budget_shift: budget_shift(std::env::var("VICTORY_INDIRECT_BUDGET_SHIFT").ok().as_deref()),
+            budget_shift: budget_shift(
+                std::env::var("VICTORY_INDIRECT_BUDGET_SHIFT")
+                    .ok()
+                    .as_deref(),
+            ),
             stats: cfg!(feature = "diagnostics") && on("VICTORY_INDIRECT_STATS"),
         };
         if c != Config::DEFAULT {
@@ -567,7 +571,10 @@ pub(crate) fn log_stats(frames: f64) {
     if !stats_on() {
         return;
     }
-    let c: Vec<f64> = STATS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let c: Vec<f64> = STATS
+        .iter()
+        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .collect();
     let [y, z] = [0, 1].map(|i| MESH_MAX[i].swap(0, Relaxed));
     let c = &c;
     let bucket = |b: usize| {

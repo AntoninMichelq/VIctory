@@ -386,7 +386,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -490,14 +495,22 @@ impl State {
         }
         // SAFETY: a live buffer.
         let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
-        // A raw UAV must start 16 bytes into its buffer (the debug layer:
-        // "the offset of the first element ... must be a multiple of 16
-        // bytes"); the host removes the device for one that does not.
-        if uav && !(gpu - base).is_multiple_of(16) {
-            once!(
-                address = format_args!("{address:#x}"),
-                "a root UAV not 16-byte aligned in its copy: no bounded table"
-            );
+        // A raw view (UAV or SRV) must start a multiple of 16 bytes into its
+        // buffer (the debug layer: "the offset of the first element ... must
+        // be a multiple of 16 bytes"); the host removes the device for one
+        // that does not.
+        if !(gpu - base).is_multiple_of(16) {
+            if uav {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root UAV not 16-byte aligned in its copy: no bounded table"
+                );
+            } else {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root SRV not 16-byte aligned in its copy: no bounded table"
+                );
+            }
             return None;
         }
         let heap = self
@@ -550,7 +563,12 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
-        let key = (std::ptr::from_ref(heap) as usize, 0, 0, u64::from(uav) << 63);
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            0,
+            0,
+            u64::from(uav) << 63,
+        );
         let first = match self.root_srv_slots.get(&key) {
             Some(&first) => first,
             None => {
@@ -799,7 +817,11 @@ impl State {
                         let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(slot))
                         else {
-                            once!(slot, ?kind, "a shader reads a root view the title did not set");
+                            once!(
+                                slot,
+                                ?kind,
+                                "a shader reads a root view the title did not set"
+                            );
                             return false;
                         };
                         *address
@@ -1495,8 +1517,14 @@ impl State {
             shadow.refresh(list, v.address, u64::from(v.size));
             // The expansion binds the source as a root unordered-access view.
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
-            let (_, gpu, size) =
-                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            let (_, gpu, size) = crate::rects::vertices(
+                list,
+                host,
+                shadow.gpu(v.address),
+                u64::from(v.size),
+                v.stride,
+                &elements,
+            )?;
             views.push((
                 slot,
                 D3D12_VERTEX_BUFFER_VIEW {
@@ -1555,7 +1583,10 @@ impl State {
             let outcome = if ran {
                 "RUN".to_owned()
             } else if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
-                format!("DROPPED ({})", crate::pipeline::drop_reason(self.pipeline as This))
+                format!(
+                    "DROPPED ({})",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                )
             } else {
                 "DROPPED (see the why line above)".to_owned()
             };
@@ -1671,9 +1702,17 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 let _reason = format!(
                     "{_reason}; shaders {:?}, stride {stride}, max {max}, arguments at +{:#x}, count {}",
-                    p.stages.iter().map(|s| format!("{}", s.shader.hash)).collect::<Vec<_>>(),
+                    p.stages
+                        .iter()
+                        .map(|s| format!("{}", s.shader.hash))
+                        .collect::<Vec<_>>(),
                     args.offset(arguments),
-                    counter.as_ref().map_or("none".to_owned(), |(s, at)| format!("+{:#x}", s.offset(*at)))
+                    counter
+                        .as_ref()
+                        .map_or("none".to_owned(), |(s, at)| format!(
+                            "+{:#x}",
+                            s.offset(*at)
+                        ))
                 );
                 why(&format!("not bounded: {_reason}"));
                 return false;
@@ -1843,7 +1882,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                     crate::texture::upload(list, *resource as This, t);
                 }
             }
-            let mips = desc.as_ref().and_then(|d| crate::descriptor::host::srv_mips(t, d));
+            let mips = desc
+                .as_ref()
+                .and_then(|d| crate::descriptor::host::srv_mips(t, d));
             crate::list::ensure_mips(list, *resource as This, SHADER_RESOURCE, mips);
             #[cfg(feature = "diagnostics")]
             {
@@ -2186,7 +2227,16 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
+        let shader = victory_shader::emit::emit(
+            &c,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         (shader, used)
     }
 
