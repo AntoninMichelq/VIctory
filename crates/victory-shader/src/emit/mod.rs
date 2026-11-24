@@ -986,3 +986,152 @@ mod atomic_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod packed_half_tests {
+    use super::container::SigElement;
+    use super::*;
+    use crate::native::{PsInput, StageIo, Usage};
+
+    fn input(row: u8, mask: u8, attr: u8, flat: bool, fp16: bool) -> PsInput {
+        PsInput {
+            usage: Usage::Generic,
+            row,
+            mask,
+            attr,
+            flat,
+            fp16,
+            pack2: fp16,
+            // The console repeats the row when it names no partner.
+            row2: row,
+        }
+    }
+
+    fn element(index: u32, row: u32, cols: u8, comp: u8, half: bool) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half,
+        }
+    }
+
+    /// A pixel program with the stage data of shaders that failed with "a
+    /// packed input half no element holds": the only 16-bit input (attr1,
+    /// row 3, two dwords of halves, pack2 with row2 == row) and 32-bit
+    /// inputs in rows 2, 4, 5 and 7. The signature declares the 16-bit
+    /// half2 at row 3 and its partner, the half2 at row 6 no input names
+    /// (as the vertex side packs it, `half_outputs`): dword 0 of the
+    /// attribute holds row 3's x and y, dword 1 row 6's x and y.
+    fn pixel(words: &[u32]) -> Result<HostShader, ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![
+                    input(2, 0xf, 0, true, false),
+                    input(3, 0x3, 1, false, true),
+                    input(4, 0xf, 2, false, false),
+                    input(5, 0xf, 3, false, false),
+                    input(7, 0x1, 4, true, false),
+                ],
+                // PERSP_CENTER, POS_X, POS_Y, FRONT_FACE.
+                input_addr: 4866,
+                db_shader_control: 80,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let isg1 = [
+            element(0, 2, 4, 5, false),
+            element(1, 3, 2, 9, true),
+            element(2, 4, 4, 9, false),
+            element(3, 5, 4, 9, false),
+            element(4, 6, 2, 9, true),
+            element(5, 7, 1, 5, false),
+        ];
+        let mut isg1 = container::signature(&isg1, true);
+        // Declare rows 3 and 6 float16 (`signature` writes only 32-bit types).
+        for k in 0..6 {
+            let at = 8 + 32 * k;
+            if matches!(isg1[at + 20], 3 | 6) {
+                isg1[at + 16..at + 20].copy_from_slice(&6u32.to_le_bytes());
+            }
+        }
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// Every half of the packed attribute resolves: the high half of dword
+    /// 0 to row 3's y, both halves of dword 1 to row 6's x and y.
+    #[test]
+    fn packed_halves_with_row2_equal_to_row_read_the_unlisted_partner() {
+        let words = [
+            0xD742_0002, // v_interp_p1ll_f16 v2, v0, attr1.y
+            0x0002_0041,
+            0xD75A_0002, // v_interp_p2_f16 v2, v1, attr1.y, v2
+            0x040A_0241,
+            0xD742_0003, // v_interp_p1ll_f16 v3, v0, attr1.y high
+            0x0002_0141,
+            0xD75A_0003, // v_interp_p2_f16 v3, v1, attr1.y, v3 high
+            0x040E_0341,
+            0xD742_0004, // v_interp_p1ll_f16 v4, v0, attr1.x high
+            0x0002_0101,
+            0xD75A_0004, // v_interp_p2_f16 v4, v1, attr1.x, v4 high
+            0x0412_0301,
+            0x7E04_1702, // v_cvt_f32_f16_e32 v2, v2
+            0x7E06_1703, // v_cvt_f32_f16_e32 v3, v3
+            0x7E08_1704, // v_cvt_f32_f16_e32 v4, v4
+            0xF800_180F, // exp mrt0 v2, v3, v4, v4 done vm
+            0x0404_0302,
+            0xBF81_0000, // s_endpgm
+        ];
+        let shader = pixel(&words).unwrap();
+        let c = Container::parse(&shader.dxil).unwrap();
+        let isg1 = c.part(FourCC::ISG1).unwrap().data;
+        let n = crate::dxbc::u32_at(isg1, 0).unwrap() as usize;
+        // Read channels per register.
+        let rw = |row: u32| {
+            (0..n)
+                .map(|k| 8 + 32 * k)
+                .filter(|&at| crate::dxbc::u32_at(isg1, at + 20).unwrap() == row)
+                .map(|at| isg1[at + 25])
+                .fold(0, |a, b| a | b)
+        };
+        assert_eq!(rw(3), 0b10, "row 3 reads only y");
+        assert_eq!(rw(6), 0b11, "row 6 reads x and y");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+    }
+}
