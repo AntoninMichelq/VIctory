@@ -2108,6 +2108,18 @@ impl<'a> Tracer<'a> {
         let Some(mask) = picks.iter().flatten().map(|p| p.0).next() else {
             return Ok(None);
         };
+        // A picked dword that is only ever a float the program computes:
+        // these words are no descriptor on any side.
+        if words
+            .iter()
+            .zip(&picks)
+            .any(|(&w, p)| p.is_some() && self.computed_word(w))
+        {
+            return Err(Fail {
+                what: "a descriptor read from the first lane of computed VGPRs",
+                junk: true,
+            });
+        }
         if picks.iter().flatten().any(|p| p.0 != mask) {
             return Err(hard("a descriptor chosen per lane by several masks"));
         }
@@ -4116,6 +4128,99 @@ pub(crate) mod tests {
         };
         assert!(matches!(&args[0], Source::Paths { args, .. } if matches!(args[0], Source::NoDescriptor)), "{args:?}");
         assert_eq!(r.waterfall.compares.len(), 2);
+    }
+
+    /// [`WATERFALL_AFTER_JUNK_SELECT_WAVE64`] with dword 0 of the junk
+    /// path a select of arithmetic and 1.0, dwords 1..3 copies of real
+    /// descriptor dwords (s[9:11]).
+    const WATERFALL_AFTER_MIXED_JUNK_WAVE64: &[u32] = &[
+            0xBE94_0300, // 0x0: s_mov_b32 s20, s0
+            0xBE95_0380, // 0x4: s_mov_b32 s21, 0
+            0xBE96_0301, // 0x8: s_mov_b32 s22, s1
+            0xBE97_0380, // 0xc: s_mov_b32 s23, 0
+            0xF40C_090A,
+            0xFA00_0000, // 0x10: s_load_dwordx8 s[36:43], s[20:21], 0x0
+            0xF408_010A,
+            0xFA00_0020, // 0x18: s_load_dwordx4 s[4:7], s[20:21], 0x20
+            0xF408_020A,
+            0xFA00_0030, // 0x20: s_load_dwordx4 s[8:11], s[20:21], 0x30
+            0xF408_0E0B,
+            0xFA00_0000, // 0x28: s_load_dwordx4 s[56:59], s[22:23], 0x0
+            0xF408_0F0B,
+            0xFA00_0010, // 0x30: s_load_dwordx4 s[60:63], s[22:23], 0x10
+            0x7E04_0D00, // 0x38: v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // 0x3c: v_mov_b32 v3, v2
+            0x3420_0082, // 0x40: v_lshlrev_b32 v16, 2, v0
+            0x3674_0087, // 0x44: v_and_b32 v58, 7, v0
+            0x7E0A_0D00, // 0x48: v_cvt_f32_u32 v5, v0
+            0x080C_0AF2, // 0x4c: v_sub_f32 v6, 1.0, v5
+            0x7D88_0088, // 0x50: v_cmp_gt_u32 vcc, 8, v0
+            0x02B2_0CF2, // 0x54: v_cndmask_b32 v89, 1.0, v6, vcc
+            0x7EB4_0209, // 0x58: v_mov_b32 v90, s9
+            0x7EB6_020A, // 0x5c: v_mov_b32 v91, s10
+            0x7EB8_020B, // 0x60: v_mov_b32 v92, s11
+            0xBF8C_C07F, // 0x64: s_waitcnt lgkmcnt(0)
+            0x7D88_0090, // 0x68: v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // 0x6c: s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0004, // 0x70: s_cbranch_execz ELSE
+            0x7EB8_0207, // 0x74: v_mov_b32 v92, s7
+            0x7EB6_0206, // 0x78: v_mov_b32 v91, s6
+            0x7EB4_0205, // 0x7c: v_mov_b32 v90, s5
+            0x7EB2_0204, // 0x80: v_mov_b32 v89, s4
+            0x8AFE_7E0C, // 0x84: s_andn2_b64 exec, s[12:13], exec
+            0xBF88_0016, // 0x88: s_cbranch_execz JOIN
+            0xBE98_047E, // 0x8c: s_mov_b64 s[24:25], exec
+            0xBE9A_047E, // 0x90: s_mov_b64 s[26:27], exec
+            0xBEA0_0380, // 0x94: s_mov_b32 s32, 0
+            0xBF82_0002, // 0x98: s_branch ENTRY
+            0x87FE_1A02, // 0x9c: s_and_b64 exec, s[2:3], s[26:27]
+            0xBEA1_0320, // 0xa0: s_mov_b32 s33, s32
+            0xBF8C_3F70, // 0xa4: s_waitcnt vmcnt(0)
+            0x8120_8121, // 0xa8: s_add_i32 s32, s33, 1
+            0xBE82_047E, // 0xac: s_mov_b64 s[2:3], exec
+            0xE030_2018,
+            0x800E_5900, // 0xb0: buffer_load_dword v89, v0, s[56:59], 0 idxen offset:24
+            0xBF8C_3F70, // 0xb8: s_waitcnt vmcnt(0)
+            0xD54B_0059,
+            0x03CA_B359, // 0xbc: v_fma_f32 v89, v89, v89, 1.0
+            0x7DA4_7420, // 0xc4: v_cmpx_eq_u32 s32, v58
+            0x8A9A_7E1A, // 0xc8: s_andn2_b64 s[26:27], s[26:27], exec
+            0xBF85_FFF3, // 0xcc: s_cbranch_scc1 LOOP
+            0xBEFE_0418, // 0xd0: s_mov_b64 exec, s[24:25]
+            0x7EB8_020B, // 0xd4: v_mov_b32 v92, s11
+            0x7EB6_020A, // 0xd8: v_mov_b32 v91, s10
+            0x7EB4_0209, // 0xdc: v_mov_b32 v90, s9
+            0x7EB2_0208, // 0xe0: v_mov_b32 v89, s8
+            0xBEFE_040C, // 0xe4: s_mov_b64 exec, s[12:13]
+            0xBE82_047E, // 0xe8: s_mov_b64 s[2:3], exec
+            0x7E08_0559, // 0xec: v_readfirstlane_b32 s4, v89
+            0x7E0A_055A, // 0xf0: v_readfirstlane_b32 s5, v90
+            0x7E0C_055B, // 0xf4: v_readfirstlane_b32 s6, v91
+            0x7E0E_055C, // 0xf8: v_readfirstlane_b32 s7, v92
+            0x7DC4_B204, // 0xfc: v_cmp_eq_u64 vcc, s[4:5], v[89:90]
+            0xD4E2_0000,
+            0x0002_B606, // 0x100: v_cmp_eq_u64 s[0:1], s[6:7], v[91:92]
+            0x8780_006A, // 0x108: s_and_b64 s[0:1], vcc, s[0:1]
+            0xBE80_2400, // 0x10c: s_and_saveexec_b64 s[0:1], s[0:1]
+            0xBF8C_3F70, // 0x110: s_waitcnt vmcnt(0)
+            0xF09C_0F08,
+            0x0029_0C02, // 0x114: image_sample_lz v[12:15], v[2:3], s[36:43], s[4:7] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0x89FE_007E, // 0x11c: s_xor_b64 exec, exec, s[0:1]
+            0xBF89_FFF2, // 0x120: s_cbranch_execnz WF
+            0xBEFE_0402, // 0x124: s_mov_b64 exec, s[2:3]
+            0xE070_1000,
+            0x800F_0C10, // 0x128: buffer_store_dword v12, v16, s[60:63], 0 offen
+            0xBF81_0000, // 0x130: s_endpgm
+    ];
+
+    #[test]
+    fn words_with_a_computed_float_picked_per_lane_are_no_descriptor() {
+        let r = waterfall(WATERFALL_AFTER_MIXED_JUNK_WAVE64, true).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        let Source::Paths { args, .. } = &sampler.source else {
+            panic!("{:?}", sampler.source)
+        };
+        assert!(matches!(&args[0], Source::Paths { args, .. } if matches!(args[0], Source::NoDescriptor)), "{args:?}");
     }
 
     #[test]
