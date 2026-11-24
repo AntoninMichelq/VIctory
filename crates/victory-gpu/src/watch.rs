@@ -141,6 +141,33 @@ pub(crate) fn end_epoch() {
     EPOCH.with_borrow_mut(|e| *e = None);
 }
 
+/// Our own write of title memory `[at, at + len)` inside an epoch: the
+/// pages it touches are asked of the kernel again (it reports our write),
+/// the rest of the epoch's answers stand. Outside an epoch, nothing.
+pub(crate) fn uncover(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, (at + len).div_ceil(PAGE));
+    EPOCH.with_borrow_mut(|runs| {
+        let Some(runs) = runs else { return };
+        let hit: Vec<(usize, usize)> = runs
+            .range(..last)
+            .filter(|&(_, &e)| e > first)
+            .map(|(&a, &e)| (a, e))
+            .collect();
+        for (a, e) in hit {
+            runs.remove(&a);
+            if a < first {
+                runs.insert(a, first);
+            }
+            if e > last {
+                runs.insert(last, e);
+            }
+        }
+    });
+}
+
 /// Whether pages `[first, last)` were asked in this epoch.
 fn covered(runs: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
     runs.range(..=first).next_back().is_some_and(|(_, &end)| end >= last)
