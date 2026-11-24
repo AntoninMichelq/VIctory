@@ -687,6 +687,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
+    crate::memstat::add(&crate::memstat::LOOSE, len);
     Some(shadow)
 }
 
