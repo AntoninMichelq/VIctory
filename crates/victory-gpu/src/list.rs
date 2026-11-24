@@ -479,6 +479,25 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// A copy or resolve in a listed frame, with both resources' console
+/// addresses and host textures (diagnostics), before it is recorded or
+/// dropped.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn trace_copy(what: &str, dst: This, src: This) {
+    if tracing::enabled!(tracing::Level::DEBUG) && crate::capture::listed(crate::queue::presented() + 1) {
+        let kind = |r: This| {
+            if crate::resource::buffer_bytes(r).is_some() { "buffer" } else { "texture" }
+        };
+        tracing::debug!(
+            "{what} to {} {} from {} {}",
+            kind(dst),
+            crate::draw::identity(dst),
+            kind(src),
+            crate::draw::identity(src)
+        );
+    }
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -500,6 +519,8 @@ extern "system" fn copy_buffer_region(
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_copy("copy resource", dst, src);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -589,6 +610,11 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    // SAFETY: the title passes valid locations (null is tolerated).
+    if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        trace_copy("copy region", d.resource, s.resource);
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -848,6 +874,8 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_copy("resolve", dst, src);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1034,6 +1062,10 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if tracing::enabled!(tracing::Level::DEBUG) && crate::capture::listed(crate::queue::presented() + 1) {
+        tracing::debug!("copy memory to {dst:#x} from {src:#x} len {len:#x}");
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0

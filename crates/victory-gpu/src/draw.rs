@@ -1675,7 +1675,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 /// textures at one address with different host textures do not see each
 /// other's contents).
 #[cfg(feature = "diagnostics")]
-fn identity(r: This) -> String {
+pub(crate) fn identity(r: This) -> String {
     use windows::core::Interface;
     let address = crate::resource::texture_memory(r).map_or(0, |(m, _)| m as usize);
     let host = crate::resource::host_resource(r).map_or(std::ptr::null_mut(), |t| t.as_raw());
