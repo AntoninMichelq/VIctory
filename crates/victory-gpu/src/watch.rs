@@ -66,6 +66,11 @@ struct Journal {
     /// Title allocations seen: base → (end, whether write-watched). Only
     /// write-watched ones outlive an epoch.
     allocations: BTreeMap<usize, (usize, bool)>,
+    /// Page ranges the kernel refused to answer for (not write-watched,
+    /// mostly views of physical memory, or across allocations): asked
+    /// again only after a remap. ~100k refused asks a frame in the world
+    /// before (each a system call, ~270 ms).
+    refused: BTreeSet<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -73,6 +78,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     written: BTreeMap::new(),
     found: Vec::new(),
     allocations: BTreeMap::new(),
+    refused: BTreeSet::new(),
 });
 
 std::thread_local! {
@@ -372,12 +378,19 @@ fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usiz
             let pages = guard(first * PAGE, last * PAGE)?;
             return Some(record(j, pages, first, last));
         }
-        None => match ask(j, first * PAGE, kend) {
+        None => match (!j.refused.contains(&(first, last)))
+            .then(|| ask(j, first * PAGE, kend))
+            .flatten()
+        {
             Some(count) => {
                 let pages: Vec<usize> = j.found[..count].iter().map(|&at| at / PAGE).collect();
                 return Some(record(j, pages, first, last));
             }
             None => {
+                if j.refused.len() >= 1 << 20 {
+                    j.refused.clear();
+                }
+                j.refused.insert((first, last));
                 // Not write-watched: in an epoch, the allocation is noted
                 // so, so that its next ranges do not ask again.
                 if EPOCH.with_borrow(Option::is_some)
@@ -612,6 +625,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for b in gone {
             j.allocations.remove(&b);
         }
+        // What was refused may be watched now.
+        j.refused.clear();
     }
     let mut g = guards();
     let range = at / BLOCK..(at + len).div_ceil(BLOCK);
