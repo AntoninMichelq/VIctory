@@ -1308,6 +1308,11 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && crate::capture::listed(crate::queue::presented() + 1)
+            {
+                tracing::debug!("indirect kind {kind} why: pipeline skipped");
+            }
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -1327,6 +1332,7 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            why("no host pipeline (not translated, or still compiling)");
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -1438,7 +1444,10 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &bounded);
-            why("prepare failed");
+            why(&format!(
+                "prepare failed (kind {kind}, topology {}, compute {}, mesh {})",
+                self.topology, p.compute, p.mesh
+            ));
             return false;
         }
         #[cfg(feature = "diagnostics")]
