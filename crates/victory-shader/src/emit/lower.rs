@@ -3743,6 +3743,27 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            // A buffer the code reads with s_buffer_load: a raw buffer
+            // (SRV) has a size the host can query; a constant buffer has
+            // none, its record count reads as the largest a host CBV can be
+            // (64 KB), so bounds the code checks or clamps to hold.
+            // shortcut: a CBV smaller than 64 KB reads past its end where
+            // the console's would clamp; the host returns zeros there.
+            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                ((11, 0), None)
+            }
+            Fields::Smem { .. } => {
+                let max = self.s.m.i32(65536);
+                for k in 0..count {
+                    let rel = (k as i32).wrapping_add(skew);
+                    if rel == 2 {
+                        self.write(inst, Reg::S(code + k as u8), max, None);
+                    } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, Val::Missing(OTHER));
+                    }
+                }
+                return Ok(());
+            }
             _ => return Err("a scalar memory read as data"),
         };
         // The handle is built from this load's own address (the other
@@ -8058,6 +8079,44 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words).unwrap();
+    }
+
+    #[test]
+    fn record_count_of_a_buffer_read_with_scalar_buffer_loads() {
+        // A buffer descriptor (a table range at s0) read with
+        // s_buffer_load, its record count (dword 2) also read as a number
+        // and clamped with: a CBV's reads as 64 KB, a raw SRV's is queried.
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0202,
+            0xFA00_0000, // s_buffer_load_dword s8, s[4:7], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8389_0806, // s_min_u32 s9, s6, s8
+            0x7E0A_0209, // v_mov_b32 v5, s9
+            0xD834_0000,
+            0x0000_0500, // ds_write_b32 v0, v5
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout(), vec![]).unwrap();
+        let srv = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            ..root_view(ResourceType::Srv, 0, 0)
+        };
+        lower_with(&words, layout(), vec![srv]).unwrap();
+        // Its address (dword 0) has no host value.
+        let mut address = words;
+        address[7] = 0x8389_0804; // s_min_u32 s9, s4, s8
+        let e = lower_with(&address, layout(), vec![]).err().unwrap();
+        assert!(
+            e.to_string()
+                .contains("a descriptor's address or format read as data"),
+            "{e}"
+        );
     }
 
     #[test]
