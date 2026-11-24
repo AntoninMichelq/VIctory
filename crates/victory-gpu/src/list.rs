@@ -918,20 +918,55 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
-        else {
+        // Clears are logged at debug level in captured frames, and each
+        // reason a clear is abandoned once at warn (a skipped clear leaves
+        // last frame's contents, e.g. text piling up).
+        #[cfg(feature = "diagnostics")]
+        let traced = tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1);
+        let Some(list) = host_list(this) else {
+            return;
+        };
+        let Some(record) = crate::descriptor::rtv_record(handle) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a render target clear without a view record dropped")
+            });
+            #[cfg(feature = "diagnostics")]
+            if traced {
+                tracing::debug!("clear rtv {handle:#x} DROPPED (no view record)");
+            }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a render target clear without a host texture dropped")
+            });
+            #[cfg(feature = "diagnostics")]
+            if traced {
+                tracing::debug!("clear rtv {handle:#x} DROPPED (no host texture)");
+            }
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                "clear rtv {}x{} f{} to {color:?} rects {count}",
+                d.Width,
+                d.Height,
+                d.Format.0
+            );
+        }
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
