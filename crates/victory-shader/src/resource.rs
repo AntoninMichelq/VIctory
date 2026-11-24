@@ -439,6 +439,22 @@ impl<'a> Tracer<'a> {
         ))
     }
 
+    /// The VGPR term `t` reads the first lane of, if `t` is a
+    /// `v_readfirstlane_b32` (an address made in VGPRs, then made uniform):
+    /// taken as that term, the same in every lane that gets here.
+    fn through_firstlane(&self, t: Term) -> Term {
+        let Term::Value(v) = t else { return t };
+        let Some(inst) = self.def(v) else { return t };
+        if inst.name() != "v_readfirstlane_b32" {
+            return t;
+        }
+        let Fields::Valu(f) = &inst.fields else { return t };
+        f.src
+            .first()
+            .and_then(|o| self.vterm(inst, o))
+            .unwrap_or(t)
+    }
+
     fn sum(&self, t: Term) -> Sum {
         let Term::Value(v) = t else {
             return self.sum_uncached(t);
@@ -457,6 +473,10 @@ impl<'a> Tracer<'a> {
     }
 
     fn sum_uncached(&self, t: Term) -> Sum {
+        let through = self.through_firstlane(t);
+        if through != t {
+            return self.sum(through);
+        }
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -914,6 +934,7 @@ impl<'a> Tracer<'a> {
     /// `hi` is `high` (0 for a table), possibly plus a carry or minus a
     /// borrow.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+        let hi = self.through_firstlane(hi);
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
@@ -927,7 +948,7 @@ impl<'a> Tracer<'a> {
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = hi else { return false };
+        let Term::Value(v) = self.through_firstlane(hi) else { return false };
         if v == high {
             return true;
         }
@@ -2639,6 +2660,39 @@ pub(crate) mod tests {
         0xBF85_FFD7, // s_cbranch_scc1 -> 0x38
         0xBF81_0000, // s_endpgm
     ];
+
+    /// A loop reading a table in the code through an address made in
+    /// VGPRs (`s_getpc_b64` plus the index), made uniform by
+    /// `v_readfirstlane_b32`.
+    pub(crate) const CODE_TABLE_THROUGH_FIRST_LANE: &[u32] = &[
+            0xBE84_1F00, // s_getpc_b64 s[4:5]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x3406_0282, // v_lshlrev_b32 v3, 2, v1
+            0xD70F_6A04,
+            0x0002_0604, // v_add_co_u32 v4, vcc_lo, s4, v3
+            0x7E0C_0205, // v_mov_b32 v6, s5
+            0x500A_0C80, // v_add_co_ci_u32 v5, vcc_lo, 0, v6, vcc_lo
+            0x7E10_0504, // v_readfirstlane_b32 s8, v4
+            0x7E12_0505, // v_readfirstlane_b32 s9, v5
+            0xF400_0184,
+            0xFA00_0008, // s_load_dword s6, s[8:9], 0x8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x7D88_0286, // v_cmp_gt_u32 vcc_lo, 6, v1
+            0xBF87_FFF6, // s_cbranch_vccnz -10
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn addresses_made_in_vgprs_and_read_from_the_first_lane_are_traced() {
+        let code: Vec<u8> = CODE_TABLE_THROUGH_FIRST_LANE.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (_, a) = r.scalar[0];
+        assert_eq!((a.param, a.offset), (CODE, 4 + 8));
+        assert!(a.dynamic.is_some());
+    }
 
     fn waterfall(words: &[u32], wave64: bool) -> Result<Resources, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
