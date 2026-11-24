@@ -974,6 +974,58 @@ impl<'a> Tracer<'a> {
         self.shifted_base(lo, hi, extra)
     }
 
+    /// `t` through joins and `v_cndmask_b32` whose every input is `t`'s
+    /// one value or the join itself (a value a loop carries or keeps):
+    /// that value. `None` for a join reached again (no value of its own).
+    fn one_value(&self, t: Term, seen: &mut Vec<Value>) -> Option<Term> {
+        let Term::Value(v) = t else { return Some(t) };
+        let args: Vec<Term> = if let Some((block, i)) = self.phis[v.0 as usize] {
+            if seen.contains(&v) {
+                return None;
+            }
+            if seen.len() > 16 {
+                return Some(t);
+            }
+            seen.push(v);
+            self.p.blocks[block].phis[i]
+                .args
+                .iter()
+                .map(|&a| self.vorigin(a))
+                .collect()
+        } else if let Some(inst) = self.def(v)
+            && inst.name() == "v_cndmask_b32"
+            && let Fields::Valu(f) = &inst.fields
+            && f.abs == 0
+            && f.neg == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
+        {
+            if seen.contains(&v) || seen.len() > 16 {
+                return Some(t);
+            }
+            seen.push(v);
+            let (Some(a), Some(b)) = (
+                f.src.first().and_then(|o| self.vterm(inst, o)),
+                f.src.get(1).and_then(|o| self.vterm(inst, o)),
+            ) else {
+                return Some(t);
+            };
+            vec![a, b]
+        } else {
+            return Some(t);
+        };
+        let mut one = None;
+        for a in args {
+            match self.one_value(a, seen) {
+                None => {}
+                Some(x) if one.is_none_or(|o| o == x) => one = Some(x),
+                Some(_) => return Some(t),
+            }
+        }
+        // A join of nothing but itself is no value: keep `t`.
+        Some(one.unwrap_or(t))
+    }
+
     /// The two operands of `v` if a plain VOP2/VOP3 `names` wrote it.
     fn valu2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
@@ -1058,8 +1110,8 @@ impl<'a> Tracer<'a> {
             return None;
         }
         // `y`: the low half of a 64-bit shift right by 8 of the
-        // descriptor's first two dwords.
-        let Term::Value(y) = pair[0] else {
+        // descriptor's first two dwords (perhaps carried around a loop).
+        let Term::Value(y) = self.one_value(pair[0], &mut Vec::new())? else {
             return None;
         };
         let shr = self.def(y)?;
@@ -3680,6 +3732,53 @@ pub(crate) mod tests {
         0x0000_0200, // ds_write_b32 v0, v2
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`GLOBAL_LOAD_AT_A_SHIFTED_BASE`] in a loop, the shifted dword
+    /// kept in a VGPR the loop carries and re-selects from the same SGPR
+    /// (`v_cndmask_b32 v28, v28, s6`).
+    pub(crate) const GLOBAL_LOAD_AT_A_CARRIED_SHIFTED_BASE: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE8C_0308, // s_mov_b32 s12, s8
+        0x870D_FF09,
+        0x0000_FFFF, // s_and_b32 s13, s9, 0xffff
+        0x9086_880C, // s_lshr_b64 s[6:7], s[12:13], 8
+        0x7E38_0206, // v_mov_b32_e32 v28, s6
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x7E46_031C, // loop: v_mov_b32_e32 v35, v28
+        0x7E48_0280, // v_mov_b32_e32 v36, 0
+        0xD6FF_0023,
+        0x0002_4688, // v_lshlrev_b64 v[35:36], 8, v[35:36]
+        0x383A_46B4, // v_or_b32_e32 v29, 52, v35
+        0x7E3C_0324, // v_mov_b32_e32 v30, v36
+        0xDC30_8000,
+        0x1F7D_001D, // global_load_dword v31, v[29:30], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D84_3E80, // v_cmp_eq_u32_e32 vcc_lo, 0, v31
+        0xD501_001C,
+        0x01A8_0D1C, // v_cndmask_b32_e64 v28, v28, s6, vcc_lo
+        0x8002_8102, // s_add_u32 s2, s2, 1
+        0xBF0A_8402, // s_cmp_lt_u32 s2, 4
+        0xBF85_FFF1, // s_cbranch_scc1 loop
+        0xD834_0000,
+        0x0000_1F00, // ds_write_b32 v0, v31
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn global_loads_at_a_carried_shifted_base_read_its_buffer() {
+        let code: Vec<u8> = GLOBAL_LOAD_AT_A_CARRIED_SHIFTED_BASE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (_, offset, dynamic) = r.described[0];
+        assert_eq!((offset, dynamic), (52, None));
+    }
 
     #[test]
     fn global_loads_at_a_descriptors_shifted_base_read_its_buffer() {
