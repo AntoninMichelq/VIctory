@@ -1058,7 +1058,31 @@ impl<'a> Tracer<'a> {
     /// where `d` is the descriptor's first two dwords (the high one masked
     /// to 16 bits) and the right shift is scalar.
     /// shortcut: the base is taken to be 256-byte aligned.
-    fn shifted_base(&self, lo: Term, hi: Term, mut extra: Sum) -> Option<(Source, Sum)> {
+    fn shifted_base(&self, lo: Term, hi: Term, extra: Sum) -> Option<(Source, Sum)> {
+        let step = std::cell::Cell::new("the low dword");
+        let r = self.shifted_base_at(lo, hi, extra, &step);
+        if r.is_none() && std::env::var("VICTORY_DESCRIBED_DEBUG").is_ok_and(|v| v.trim() == "1") {
+            let name = |t: Term| match t {
+                Term::Value(v) => self.def(v).map_or("(no instruction)", |i| i.name()),
+                Term::Const(_) => "(constant)",
+            };
+            eprintln!(
+                "described base: no shifted base at {}; low from {}, high from {}",
+                step.get(),
+                name(lo),
+                name(hi)
+            );
+        }
+        r
+    }
+
+    fn shifted_base_at(
+        &self,
+        lo: Term,
+        hi: Term,
+        mut extra: Sum,
+        step: &std::cell::Cell<&'static str>,
+    ) -> Option<(Source, Sum)> {
         let Term::Value(v) = lo else { return None };
         let plus = self
             .sop2(v, &["s_or_b32", "s_add_u32"])
@@ -1071,6 +1095,7 @@ impl<'a> Tracer<'a> {
             }
             _ => (v, 0),
         };
+        step.set("the left shift");
         // `x` and `hi`: a 64-bit shift left by 8 of `{y, 0}`.
         let shl = self.def(x)?;
         if hi != Term::Value(shl.writes.get(1)?.1) || shl.writes.first()?.1 != x {
@@ -1106,14 +1131,17 @@ impl<'a> Tracer<'a> {
             }
             _ => return None,
         };
+        step.set("the shift amount or zero high");
         if amount != Term::Const(8) || pair[1] != Term::Const(0) {
             return None;
         }
         // `y`: the low half of a 64-bit shift right by 8 of the
         // descriptor's first two dwords (perhaps carried around a loop).
+        step.set("the value through joins");
         let Term::Value(y) = self.one_value(pair[0], &mut Vec::new())? else {
             return None;
         };
+        step.set("the right shift");
         let shr = self.def(y)?;
         if shr.name() != "s_lshr_b64" || shr.writes.first()?.1 != y {
             return None;
@@ -1127,6 +1155,7 @@ impl<'a> Tracer<'a> {
         if self.term(shr, amount)? != Term::Const(8) {
             return None;
         }
+        step.set("the descriptor's low dword");
         let Term::Value(w0) = self.origin(shr.read(Reg::S(*s1))?) else {
             return None;
         };
@@ -1141,6 +1170,7 @@ impl<'a> Tracer<'a> {
             },
             Term::Const(_) => return None,
         };
+        step.set("the loaded dwords");
         let (site, first) = self.loaded_dword(w0)?;
         if self.loaded_dword(w1)? != (site, first + 1) {
             return None;
