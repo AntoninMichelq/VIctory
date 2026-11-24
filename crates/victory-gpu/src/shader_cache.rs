@@ -66,6 +66,7 @@ fn build() -> &'static [u8; 32] {
         h.update(&[u8::from(cfg!(debug_assertions)), u8::from(cfg!(feature = "diagnostics"))]);
         h.update(&limit.to_le_bytes());
         h.update(&spin.to_le_bytes());
+        h.update(&[u8::from(victory_shader::emit::root_uavs())]);
         *h.finalize().as_bytes()
     })
 }

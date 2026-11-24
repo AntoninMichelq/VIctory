@@ -5852,7 +5852,7 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
-                        if p == 11 | 0x1000 =>
+                        if p == 11 | 0x1000 && (cfg!(test) || super::root_uavs()) =>
                     {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
