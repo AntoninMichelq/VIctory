@@ -869,6 +869,12 @@ fn buffer_srv(
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    // The host refuses (and removes the device for) a buffer view of no
+    // elements; the console reads nothing through one.
+    if buffer.NumElements == 0 {
+        once!("buffer view of no elements left null");
+        return None;
+    }
     let offset = shadow.offset(address);
     // The title bytes the view covers, for refreshing directly indexed
     // views at submission.
@@ -986,7 +992,10 @@ fn buffer_uav(
             .FirstElement
             .checked_add(u64::from(buffer.NumElements))
             .and_then(|n| n.checked_mul(bytes));
-        if bytes == 0 || end.is_none_or(|end| end > len) {
+        // A view of no elements is invalid on the host: creating one
+        // removed the device (DXGI_ERROR_INVALID_CALL, debug layer id 345,
+        // 2026-11-24, RX 7600).
+        if bytes == 0 || buffer.NumElements == 0 || end.is_none_or(|end| end > len) {
             once!(
                 first = buffer.FirstElement,
                 elements = buffer.NumElements,
