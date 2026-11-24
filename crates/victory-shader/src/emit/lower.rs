@@ -5534,7 +5534,9 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        let use_at = if let Some(u) = use_at {
+            Some(u)
+        } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5582,8 +5584,21 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            // Eight dwords from a table make an image descriptor (buffers and
+            // samplers are four), and here nothing samples through this load
+            // or another of its address: the code reads the size of a texture
+            // picked by an index from constants, to scale the coordinates it
+            // samples another texture with. A 2D view's size stands in, the
+            // common case (the dwords read are width, height and base level).
+            // shortcut: an array or volume texture reads its first layer's size.
+            if count == 8 && self.scalar.contains_key(&site) {
+                None
+            } else {
+                return Err("a descriptor read only as data");
+            }
         };
+        let (at, first) = use_at.unwrap_or((site, 0));
+        let unused = use_at.is_none();
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
@@ -5593,6 +5608,7 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
+            _ if unused => ((2, 0x409), Some(2)),
             // A ray-tracing structure in a buffer of the host: read raw.
             Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
             Fields::Image { dim, .. } => {
@@ -7246,6 +7262,36 @@ impl<'a> Lower<'a> {
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane of a 16-lane row reads the lane its nibble of the
+                // 64-bit select (src2:src1) names, in its own row (16) or in
+                // the other row of its 32-lane half (x16). The title uses it
+                // in whole-wave reductions with every lane on, so the fetch-
+                // inactive and bound controls make no difference.
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let c = self.cur;
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k15, k7, k2, k16) = (k(self, 15), k(self, 7), k(self, 2), k(self, 16));
+                let pos = self.s.m.bin(c, Bin::And, lane, k15);
+                let upper = self.s.m.cmp(c, pred::IUGT, pos, k7);
+                let word = self.s.m.select(c, upper, hi, lo);
+                let nib = self.s.m.bin(c, Bin::And, pos, k7);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let not15 = k(self, !15);
+                let row = self.s.m.bin(c, Bin::And, lane, not15);
+                let row = if name == "v_permlanex16_b32" {
+                    self.s.m.bin(c, Bin::Xor, row, k16)
+                } else {
+                    row
+                };
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let r = self.read_lane(a, src);
                 int(self, r)
             }
             "v_writelane_b32" => {
