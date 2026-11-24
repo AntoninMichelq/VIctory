@@ -523,6 +523,8 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         let watched = self.watched.load(Ordering::Relaxed);
+        #[cfg(test)]
+        eprintln!("PROBE update_free {from:#x}..{to:#x} watched={watched}");
         if watched != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(WATCHED, Ordering::Relaxed);
@@ -656,6 +658,8 @@ impl Shadow {
         // the range takes in the whole page, within the buffer.
         let (from, to) = self.whole_edge_pages(from, to);
         let base = self.start as usize / PAGE;
+        #[cfg(test)]
+        eprintln!("PROBE copy_stale from={from:#x} to={to:#x} start={:#x} len={:#x} now={now} written={written:?} copied={:?}", self.start, self.len, self.copied.lock().unwrap());
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
