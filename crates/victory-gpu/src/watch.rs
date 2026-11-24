@@ -279,6 +279,9 @@ fn ask(j: &mut Journal, from: usize, to: usize) -> Option<usize> {
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
+    if failed {
+        ASKS[3].fetch_add(1, Ordering::Relaxed);
+    }
     (!failed).then_some(count)
 }
 
@@ -286,12 +289,15 @@ fn ask(j: &mut Journal, from: usize, to: usize) -> Option<usize> {
 /// asked already, else asks the kernel for a window around it. `None`:
 /// not answered (ask as outside an epoch); `Some(None)`: the memory is not
 /// write-watched.
-fn from_epoch(j: &mut Journal, first: usize, last: usize) -> Option<Option<u64>> {
+fn from_epoch(j: &mut Journal, first: usize, last: usize, kend: usize) -> Option<Option<u64>> {
     if EPOCH.with_borrow(|e| e.as_ref().map(|runs| covered(runs, first, last)))? {
         return Some(Some(j.asked));
     }
     let (base, end, watched) = allocation(j, first * PAGE)?;
-    if last * PAGE > end {
+    // The asked range (to whole kernel pages) must lie in the allocation;
+    // its last 64 KiB page may end past it (allocations end on kernel
+    // pages): that part is no one's memory.
+    if kend > end {
         return None;
     }
     if !watched {
@@ -312,9 +318,11 @@ fn from_epoch(j: &mut Journal, first: usize, last: usize) -> Option<Option<u64>>
     for page in found {
         j.written.insert(page, now);
     }
-    // Only whole pages were asked: a partial one at the allocation's end
-    // is asked again (and fails, as outside an epoch).
-    let (a, e) = (from.div_ceil(PAGE), to / PAGE);
+    // Whole pages were asked, and a last one cut by the allocation's end
+    // (the rest of it is not allocated: allocations start on 64 KiB).
+    // Before, that page was asked of the kernel again on every ask, past
+    // the allocation's end, and failed: most of the world's kernel asks.
+    let (a, e) = (from.div_ceil(PAGE), if to == end { to.div_ceil(PAGE) } else { to / PAGE });
     if a < e {
         EPOCH.with_borrow_mut(|runs| {
             if let Some(runs) = runs {
@@ -340,19 +348,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
 /// Since the last [`take_asks`]: calls of [`writes`], the microseconds
 /// they took, and the asks of the kernel among them.
-static ASKS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static ASKS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Calls of [`writes`], their microseconds and the kernel asks they made,
 /// since the last call.
-pub(crate) fn take_asks() -> [u64; 3] {
-    [0, 1, 2].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
+pub(crate) fn take_asks() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
 }
 
 fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = journal();
     let j = &mut *j;
-    let now = match from_epoch(j, first, last) {
+    // The kernel answers for whole kernel pages inside one allocation.
+    let kend = end.next_multiple_of(KERNEL_PAGE);
+    let now = match from_epoch(j, first, last, kend) {
         Some(Some(now)) => now,
         Some(None) => {
             // Not write-watched: as when the kernel says so below.
@@ -362,7 +372,7 @@ fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usiz
             let pages = guard(first * PAGE, last * PAGE)?;
             return Some(record(j, pages, first, last));
         }
-        None => match ask(j, first * PAGE, last * PAGE) {
+        None => match ask(j, first * PAGE, kend) {
             Some(count) => {
                 let pages: Vec<usize> = j.found[..count].iter().map(|&at| at / PAGE).collect();
                 return Some(record(j, pages, first, last));
@@ -372,7 +382,7 @@ fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usiz
                 // so, so that its next ranges do not ask again.
                 if EPOCH.with_borrow(Option::is_some)
                     && let Some((base, end, _)) = allocation(j, first * PAGE)
-                    && last * PAGE <= end
+                    && kend <= end
                 {
                     j.allocations.insert(base, (end, false));
                 }
