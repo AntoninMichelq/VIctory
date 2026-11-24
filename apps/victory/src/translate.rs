@@ -332,6 +332,7 @@ fn translate(
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(mut program) => {
                 victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
+                victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 let res = match resource::track(&program, &p.layout, p.stage) {
@@ -520,8 +521,9 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
     for (_, i) in &r.interps {
         match i {
-            io::Interp::Interpolated { .. } | io::Interp::Weighted { .. } => t.interpolated += 1,
+            io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {
@@ -548,7 +550,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } => {
+            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -561,12 +563,10 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Fetched { load, .. } => {
-                t.loaded += 1;
-                address(load)
-            }
-            resource::Source::Phi { .. } | resource::Source::Select { .. } | resource::Source::Lanes { .. } => {
-                unreachable!("leaves are no phis, selects or per-lane picks")
+            resource::Source::Phi { .. }
+            | resource::Source::Select { .. }
+            | resource::Source::Lanes { .. } => {
+                unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code

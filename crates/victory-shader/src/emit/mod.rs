@@ -208,6 +208,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         })?;
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     crate::unspill::unspill(&mut p, &native.layout, native.stage);
+    crate::sgpr_spill::forward(&mut p);
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
@@ -233,7 +234,9 @@ pub fn emit(
     if edges.is_empty() {
         return original;
     }
-    let p = ir::thread_edges(p, &edges)?;
+    // Renaming from registers undoes forwarded reloads: forward them again.
+    let mut p = ir::thread_edges(p, &edges)?;
+    crate::sgpr_spill::forward(&mut p);
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
@@ -736,8 +739,8 @@ mod barycentric_tests {
         let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
         assert_eq!(bary.len(), 1, "{inputs:?}");
         assert_eq!((bary[0].index, bary[0].col, bary[0].cols), (0, 0, 3));
-        // A row of its own, after the attribute's.
-        assert_eq!(bary[0].row, Some(1));
+        // Not packed: the validator wants packing location -1.
+        assert_eq!(bary[0].row, None);
         // Only y and z (I and J) are read.
         let isg1 = Container::parse(&shader.dxil).unwrap();
         let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
