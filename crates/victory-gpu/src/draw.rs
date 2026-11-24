@@ -1226,6 +1226,48 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // In a captured frame, indirect draws and dispatches are traced with
+        // their outcome like direct dispatches (compute passes such as tiled
+        // lighting often run indirect, with arguments a classification pass
+        // wrote).
+        #[cfg(feature = "diagnostics")]
+        let traced = tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            let hashes: Vec<String> = crate::pipeline::host_pipeline(self.pipeline as This)
+                .map(|p| {
+                    p.stages
+                        .iter()
+                        .map(|s| format!("{}", s.shader.hash))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::debug!(
+                "indirect kind {kind} max {max} stride {stride} count {} at {arguments:#x} pipeline {:#x} shaders {hashes:?}",
+                if count.is_some() { "buffer" } else { "none" },
+                self.pipeline
+            );
+        }
+        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            tracing::debug!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "indirect kind {kind} {}",
+                if ran { "RUN" } else { "DROPPED" }
+            );
+        }
+        ran
+    }
+
+    fn execute_indirect_inner(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1237,7 +1279,14 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let why = |what: &str| {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && crate::capture::listed(crate::queue::presented() + 1)
+            {
+                tracing::debug!("indirect kind {kind} why: {what}");
+            }
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"))
+        };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
