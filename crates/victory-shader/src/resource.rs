@@ -607,16 +607,19 @@ impl<'a> Tracer<'a> {
             offset,
             offen,
             idxen,
-            format: None,
-            lds: false,
-            tfe: false,
+            format,
+            lds,
+            tfe,
             ..
         } = &inst.fields
         else {
             return Err(WHY);
         };
+        if format.is_some() || *lds || *tfe {
+            return Err("a descriptor read from the first lane of a formatted buffer load");
+        }
         if *idxen {
-            return Err(WHY);
+            return Err("a descriptor read from the first lane of an indexed buffer load");
         }
         let Source::Built { address, .. } = self.descriptor(inst, rsrc)? else {
             return Err("a descriptor read from the first lane of a buffer of descriptors");
@@ -641,7 +644,7 @@ impl<'a> Tracer<'a> {
         for t in terms {
             let s = self.sum(t);
             if s.base.is_some() {
-                return Err(WHY);
+                return Err("a descriptor read from the first lane of a buffer load at a loaded offset");
             }
             a.offset = a.offset.wrapping_add(s.offset);
             if let Some(d) = s.dynamic {
@@ -1320,7 +1323,13 @@ impl<'a> Tracer<'a> {
                 "a descriptor read from the first lane of an LDS read"
             }
             Some(n) if n.starts_with("buffer_load") => {
-                "a descriptor read from the first lane of a buffer load"
+                if words.iter().all(|w| {
+                    matches!(*w, Term::Value(v) if self.def(v).is_some_and(|i| i.name().starts_with("buffer_load")))
+                }) {
+                    "a descriptor read from the first lane of a buffer load"
+                } else {
+                    "a descriptor read from the first lane of a buffer load mixed with other words"
+                }
             }
             Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => {
                 "a descriptor read from the first lane of a partial or mixed load"
