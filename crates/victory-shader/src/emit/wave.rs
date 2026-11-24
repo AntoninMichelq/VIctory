@@ -22,6 +22,11 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// f16 sums (`v_add_f16`), in the low half of each dword. GFX10 16-bit
+    /// operations keep the destination's high half, which the simulation
+    /// does not follow: a value made with this operation has its low half
+    /// only.
+    AddH,
     MinU,
     MaxU,
     MinI,
@@ -38,6 +43,7 @@ impl Op {
         Some(match name {
             "v_add_nc_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -71,6 +77,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::AddH => k & 0xFFFF == 0 || k & 0xFFFF == 0x8000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -81,7 +88,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
     }
 }
 
@@ -115,6 +122,16 @@ pub(crate) enum Shape {
     Active(Op, Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+}
+
+impl Shape {
+    /// Whether only the value's low half is known ([`Op::AddH`]).
+    pub(crate) fn low_half(self) -> bool {
+        matches!(
+            self,
+            Shape::Active(Op::AddH, ..) | Shape::Prefix(Op::AddH, ..)
+        )
+    }
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -553,6 +570,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .collect()
             }
             (n, Some(a)) => match (Op::of(n), src(1)) {
+                // A 16-bit operation reading or writing a high half (op_sel)
+                // is not followed.
+                (Some(Op::AddH), _) if v.opsel != 0 => vec![Sym::Unknown; wave as usize],
+                (Some(Op::AddH), Some(b)) => (0..wave as usize)
+                    .map(|l| match combine(Op::AddH, a[l], b[l]) {
+                        // The low half is the sum of the lanes' low halves
+                        // (one lane: its own); the high half is not known.
+                        Sym::Red {
+                            op: None | Some(Op::AddH),
+                            src,
+                            mask,
+                            ident,
+                            lanes,
+                        } => Sym::Red {
+                            op: Some(Op::AddH),
+                            src,
+                            mask,
+                            ident,
+                            lanes,
+                        },
+                        _ => Sym::Unknown,
+                    })
+                    .collect(),
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
                     .collect(),
@@ -854,6 +894,74 @@ mod tests {
         assert_eq!(
             shapes.get(&total),
             Some(&Shape::Active(Op::AddU, x, saved, 0))
+        );
+    }
+
+    #[test]
+    fn wave64_f16_sum_with_dpp8_and_row_mirror() {
+        // Assembled with llvm-mc (gfx1030, wave64): an f16 sum of each 8
+        // lanes (DPP8 swaps of 1, 2 and 4 lanes), of each row (row_mirror),
+        // of each 32 (`v_permlanex16`), then lane 32 read and added to every
+        // lane and lane 0 read.
+        let p = build(
+            &[
+                0xBE82_25C1, // s_or_saveexec_b64 s[2:3], -1
+                0xD501_0002,
+                0x000A_0280, // v_cndmask_b32_e64 v2, 0, v1, s[2:3]
+                0x6404_04E9,
+                0xDE54_C102, // v_add_f16_dpp v2, v2, v2 dpp8:[1,0,3,2,5,4,7,6]
+                0x6404_04E9,
+                0xB3E2_1A02, // v_add_f16_dpp v2, v2, v2 dpp8:[2,3,0,1,6,7,4,5]
+                0x6404_04E9,
+                0x688F_AC02, // v_add_f16_dpp v2, v2, v2 dpp8:[4,5,6,7,0,1,2,3]
+                0x6404_04FA,
+                0xFF01_4002, // v_add_f16_dpp v2, v2, v2 row_mirror row_mask:0xf bank_mask:0xf
+                0xD778_0003,
+                0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+                0xD532_0002,
+                0x0002_0702, // v_add_f16_e64 v2, v2, v3
+                0xD760_0008,
+                0x0001_4102, // v_readlane_b32 s8, v2, 32
+                0xD532_0002,
+                0x0002_0408, // v_add_f16_e64 v2, s8, v2
+                0xD760_0009,
+                0x0001_0102, // v_readlane_b32 s9, v2, 0
+                0xD532_0004,
+                0x0002_0408, // v_add_f16_e64 v4, s8, v2
+                0xD532_0006,
+                0x0001_0009, // v_add_f16_e64 v6, s9, 0
+                0xD532_4005,
+                0x0001_0009, // v_add_f16_e64 v5, s9, 0 op_sel:[0,0,1] (bit 14)
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+                0xBF81_0000, // s_endpgm
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let (saved, x) = (
+            insts[0].write(Reg::S(0x2)).unwrap(),
+            insts[1].read(Reg::V(1)).unwrap(),
+        );
+        let found = sections(&p, 0);
+        let shapes = &found[&0].shapes;
+        // Lane 32 holds the upper half only.
+        assert_eq!(shapes.get(&insts[8].write(Reg::S(8)).unwrap()), None);
+        let total = shapes.get(&insts[10].write(Reg::S(9)).unwrap());
+        assert_eq!(total, Some(&Shape::Active(Op::AddH, x, saved, 0)));
+        assert!(total.unwrap().low_half());
+        // Lane 0's total counted again with lane 32's half: not a sum.
+        assert_eq!(shapes.get(&insts[11].write(Reg::V(4)).unwrap()), None);
+        // The total plus 0 is the total; written to the high half, it is
+        // not followed.
+        assert_eq!(
+            shapes.get(&insts[12].write(Reg::V(6)).unwrap()),
+            Some(&Shape::Active(Op::AddH, x, saved, 0))
+        );
+        assert_eq!(shapes.get(&insts[13].write(Reg::V(5)).unwrap()), None);
+        // The 32-bit lane-own masked value is still one.
+        assert_eq!(
+            shapes.get(&insts[1].write(Reg::V(2)).unwrap()),
+            Some(&Shape::Masked(x, saved, 0))
         );
     }
 
