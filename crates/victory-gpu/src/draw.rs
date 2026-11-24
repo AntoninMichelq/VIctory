@@ -882,6 +882,7 @@ impl State {
                         }
                         bound_params |= 1u64 << param;
                     }
+                    crate::shadow::set_root_uav_key((kind == RootView::Uav).then_some((&*stage.shader.hash, slot)));
                     // A pointer the program writes through is a root UAV.
                     let pointer = slot >= victory_shader::emit::POINTER_SLOT
                         && matches!(kind, RootView::Srv | RootView::Uav);
