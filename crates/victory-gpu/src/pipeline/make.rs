@@ -51,6 +51,8 @@ pub(crate) struct Pending {
     wanted: AtomicU64,
     /// A worker has started making it.
     taken: AtomicBool,
+    /// Started early and not made yet (counted in [`EARLY_LEFT`]).
+    early: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -84,6 +86,7 @@ impl Pending {
             used: AtomicBool::new(false),
             wanted: AtomicU64::new(0),
             taken: AtomicBool::new(false),
+            early: AtomicBool::new(false),
         }
     }
 
@@ -97,9 +100,20 @@ impl Pending {
         STATS.max_us.fetch_max(us, Ordering::Relaxed);
         let counter = if made.is_some() { &STATS.ok } else { &STATS.failed };
         counter.fetch_add(1, Ordering::Relaxed);
+        if self.early.swap(false, Ordering::Relaxed) {
+            EARLY_LEFT.fetch_sub(1, Ordering::Relaxed);
+        }
         let _held = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.wait_done.notify_all();
     }
+}
+
+/// Pipelines started early (the last run drew with them) not made yet.
+static EARLY_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Pipelines started early not made yet.
+pub(crate) fn early_left() -> u64 {
+    EARLY_LEFT.load(Ordering::Relaxed)
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -380,6 +394,13 @@ fn start(p: &Arc<Pending>, wanted: u64) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        if p.made.get().is_none() && !p.early.swap(true, Ordering::Relaxed) {
+            EARLY_LEFT.fetch_add(1, Ordering::Relaxed);
+            // Made meanwhile: counted back once, by whoever clears the flag.
+            if p.made.get().is_some() && p.early.swap(false, Ordering::Relaxed) {
+                EARLY_LEFT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         start(p, 0);
     }
 }

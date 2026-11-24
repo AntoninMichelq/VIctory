@@ -89,6 +89,53 @@ fn parse_fps(value: Option<&str>) -> Option<Duration> {
 /// Per event kind: the offset from the tick, in nanoseconds, last scheduled.
 static OFFSETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// `VICTORY_PRELOAD` (opt-in, seconds; `1` means 300): while pipelines the
+/// last run drew with and the title has just created are still being made,
+/// the next frame waits for them, up to that long in all, so the world's
+/// first frames (a cutscene that runs on real time) do not start with
+/// hundreds of draws dropped. A title with a watchdog on frame time may
+/// not like long waits. Unset or 0: frames never wait for them.
+fn preload() {
+    static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    static SPENT_MS: AtomicU64 = AtomicU64::new(0);
+    let budget = *BUDGET.get_or_init(|| {
+        let secs = std::env::var("VICTORY_PRELOAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |s| if s == 1 { 300 } else { s.min(3600) });
+        if secs > 0 {
+            tracing::info!(secs, "VICTORY_PRELOAD: frames wait for early pipelines");
+        }
+        Duration::from_secs(secs)
+    });
+    if budget.is_zero() || crate::pipeline::early_left() == 0 {
+        return;
+    }
+    let started = Instant::now();
+    let mut logged = Instant::now();
+    loop {
+        let left = crate::pipeline::early_left();
+        let spent = Duration::from_millis(SPENT_MS.load(Ordering::Relaxed)) + started.elapsed();
+        if left == 0 || spent >= budget {
+            break;
+        }
+        if logged.elapsed() >= Duration::from_secs(2) {
+            logged = Instant::now();
+            tracing::info!(left, waited_s = spent.as_secs(), "preloading pipelines before the next frame");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let waited = started.elapsed();
+    SPENT_MS.fetch_add(waited.as_millis() as u64, Ordering::Relaxed);
+    if waited >= Duration::from_millis(100) {
+        tracing::info!(
+            waited_ms = waited.as_millis() as u64,
+            left = crate::pipeline::early_left(),
+            "pipelines preloaded"
+        );
+    }
+}
+
 /// Device method: events are scheduled at every tick, `offset` microseconds
 /// into it. The list is the event's wait list, which our clock does not use.
 pub(crate) extern "system" fn schedule(
@@ -190,6 +237,9 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    if origin {
+        preload();
+    }
     let limit = Duration::from_millis(u64::from(timeout_ms));
     let (_, wait) = next_tick(kind, limit);
     let hr = if wait > limit {

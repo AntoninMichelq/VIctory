@@ -208,6 +208,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines started early (from the last run's list) not made yet.
+#[cfg(windows)]
+pub(crate) fn early_left() -> u64 {
+    make::early_left()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
