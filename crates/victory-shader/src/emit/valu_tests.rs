@@ -1422,6 +1422,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         stride_table: lowered.stride_table,
+        memory_table: lowered.memory_table,
         root_uavs: lowered.root_uavs,
     })
 }
@@ -1862,6 +1863,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            memory_table: false,
             root_uavs: slots.to_vec(),
         }
     };
