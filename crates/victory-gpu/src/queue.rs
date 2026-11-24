@@ -365,7 +365,7 @@ fn show(resource: Option<object::Held>) {
     }
     // Stand-in lighting: the title's image plus a target the frame used.
     #[cfg(windows)]
-    if let Some(albedo) = crate::present_target::flat_light(frame)
+    if let Some((albedo, depth)) = crate::present_target::flat_light(frame)
         && let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
@@ -378,8 +378,12 @@ fn show(resource: Option<object::Held>) {
         let state = crate::host::legal_state(texture, state);
         let albedo_state =
             crate::host::legal_state(&albedo.texture, albedo.state.load(Ordering::Relaxed));
+        let depth = depth.as_ref().map(|d| {
+            let state = crate::host::legal_state(&d.texture, d.state.load(Ordering::Relaxed));
+            (&d.texture, state)
+        });
         if let Some(out) =
-            crate::flat_light::compose(host, texture, state, &albedo.texture, albedo_state)
+            crate::flat_light::compose(host, texture, state, &albedo.texture, albedo_state, depth)
         {
             const UNORDERED_ACCESS: u32 = 0x8;
             host.present(&out, UNORDERED_ACCESS, frame);

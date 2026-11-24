@@ -52,6 +52,37 @@ struct Used(std::sync::Mutex<(u64, Vec<(usize, std::sync::Arc<crate::resource::H
 
 static PRESENTED: Used = Used(std::sync::Mutex::new((0, Vec::new())));
 static FLAT: Used = Used(std::sync::Mutex::new((0, Vec::new())));
+/// Depth buffers of the stand-in lighting's size, for its shading.
+static FLAT_DEPTH: Used = Used(std::sync::Mutex::new((0, Vec::new())));
+
+/// Notes `resource` in [`FLAT_DEPTH`] when it is a single-sample 2D depth
+/// buffer of the stand-in lighting's size.
+fn note_depth(resource: crate::object::This) {
+    let Some((w, h, ..)) = flat_spec() else {
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if (d.Width, d.Height) != (w, h)
+        || d.SampleDesc.Count > 1
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
+        || crate::flat_light::depth_format(d.Format).is_none()
+    {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    let mut p = FLAT_DEPTH.0.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 != frame {
+        *p = (frame, Vec::new());
+    }
+    if !p.1.iter().any(|&(r, _)| r == resource as usize) {
+        p.1.push((resource as usize, copy));
+    }
+}
 
 impl Used {
     fn note(&self, spec: Spec, resource: crate::object::This) {
@@ -101,6 +132,7 @@ pub(crate) fn note(resource: crate::object::This) {
     }
     if let Some(spec) = flat_spec() {
         FLAT.note(spec, resource);
+        note_depth(resource);
     }
 }
 
@@ -112,6 +144,15 @@ pub(crate) fn present_override(frame: u64) -> Option<std::sync::Arc<crate::resou
 
 /// At the present of `frame`: the texture to add to the title's image, if
 /// `VICTORY_FLAT_LIGHT` names one the frame used.
-pub(crate) fn flat_light(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
-    FLAT.take(flat_spec()?, frame)
+/// With the frame's first depth buffer of that size, if any (for shading).
+#[allow(clippy::type_complexity)]
+pub(crate) fn flat_light(
+    frame: u64,
+) -> Option<(
+    std::sync::Arc<crate::resource::HostTexture>,
+    Option<std::sync::Arc<crate::resource::HostTexture>>,
+)> {
+    let spec = flat_spec()?;
+    let depth = FLAT_DEPTH.take((spec.0, spec.1, spec.2, 0), frame);
+    Some((FLAT.take(spec, frame)?, depth))
 }
