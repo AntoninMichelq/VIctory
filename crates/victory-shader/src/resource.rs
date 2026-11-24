@@ -51,11 +51,17 @@ pub const CODE: usize = usize::MAX;
 /// dwords hold (`crate::emit::POINTER_SLOT`).
 pub const POINTER: usize = usize::MAX - 0x1_0000;
 
-/// The user-data index of the low dword of a [`POINTER`] address.
+/// [`Address::param`] of an address the program keeps shifted right by 8
+/// in one dword of root constants (`u64(dword) << 8`): this plus the
+/// user-data index of that dword (see [`pointer_user_data`]).
+pub const SHIFTED_POINTER: usize = POINTER + 0x100;
+
+/// The user-data index of the low dword of a [`POINTER`] address, or of
+/// the dword of a [`SHIFTED_POINTER`] one (bit 8 set).
 pub fn pointer_user_data(param: usize) -> Option<u32> {
     param
         .checked_sub(POINTER)
-        .filter(|&i| i < 0x100)
+        .filter(|&i| i < 0x200)
         .map(|i| i as u32)
 }
 
@@ -1034,6 +1040,9 @@ impl<'a> Tracer<'a> {
         if !crate::emit::pointer_views() {
             return None;
         }
+        if let Some(a) = self.shifted_pointer(lo, hi, extra) {
+            return Some(a);
+        }
         let Term::Value(v) = self.through_firstlane(lo) else {
             return None;
         };
@@ -1057,6 +1066,54 @@ impl<'a> Tracer<'a> {
             param: POINTER + (u32::from(rp.user_data) + dword) as usize,
             offset: rest.offset.wrapping_add(extra.offset),
             dynamic,
+            includes_base: false,
+        })
+    }
+
+    /// `lo`/`hi` as a root constant shifted left by 8 into 64 bits
+    /// (`s_lshl_b64` of the constant and 0), plus a constant below 256 OR-ed
+    /// or added into the low dword: a [`SHIFTED_POINTER`] address.
+    fn shifted_pointer(&self, lo: Term, hi: Term, extra: Sum) -> Option<Address> {
+        let Term::Value(v) = lo else { return None };
+        let (x, k) = match self.sop2(v, &["s_or_b32", "s_add_u32"]) {
+            Some((_, [Term::Value(x), Term::Const(k)] | [Term::Const(k), Term::Value(x)]))
+                if k < 0x100 =>
+            {
+                (x, k)
+            }
+            _ => (v, 0),
+        };
+        let inst = self.def(x)?;
+        if inst.name() != "s_lshl_b64" || inst.writes.first()?.1 != x {
+            return None;
+        }
+        if hi != Term::Value(inst.writes.get(1)?.1) {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code, .. }, shift] = &src[..] else {
+            return None;
+        };
+        if self.term(inst, shift)? != Term::Const(8)
+            || self.origin(inst.read(Reg::S(code + 1))?) != Term::Const(0)
+        {
+            return None;
+        }
+        let Term::Value(c) = self.origin(inst.read(Reg::S(*code))?) else {
+            return None;
+        };
+        let reg = self.inputs[c.0 as usize]?;
+        let (param, dword) = self.param_of(reg)?;
+        let rp = self.layout[param];
+        if rp.root != RootType::Constants {
+            return None;
+        }
+        Some(Address {
+            param: SHIFTED_POINTER + (u32::from(rp.user_data) + dword) as usize,
+            offset: k.wrapping_add(extra.offset),
+            dynamic: extra.dynamic,
             includes_base: false,
         })
     }
