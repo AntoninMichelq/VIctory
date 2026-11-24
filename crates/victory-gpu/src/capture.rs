@@ -16,9 +16,44 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
+/// The first frame of the world: the first presented frame with more than
+/// 500 draws (menus and title cards have a few dozen). 0 until then.
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At each present: `draws` drawn since the last one.
+pub(crate) fn note_frame(frame: u64, draws: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if WORLD.load(Relaxed) == 0 && draws > 500 && WORLD.compare_exchange(0, frame, Relaxed, Relaxed).is_ok() {
+        tracing::info!(frame, draws, "first world frame (VICTORY_CAPTURE_AFTER_WORLD counts from here)");
+    }
+}
+
+/// `VICTORY_CAPTURE_AFTER_WORLD` (comma-separated): frames that many frames
+/// after the first world frame, listed as `VICTORY_CAPTURE_FRAMES` are, so
+/// a capture lands in the world however long the menus took.
+fn after_world(n: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let world = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    world != 0
+        && n > world
+        && LIST
+            .get_or_init(|| {
+                std::env::var("VICTORY_CAPTURE_AFTER_WORLD")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|f| f.trim().parse().ok())
+                    .collect()
+            })
+            .contains(&(n - world))
+}
+
+/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated), or counted
+/// from the world's first frame in `VICTORY_CAPTURE_AFTER_WORLD`: saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    if after_world(n) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
