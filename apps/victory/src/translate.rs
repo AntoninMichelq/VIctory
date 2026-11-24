@@ -69,6 +69,10 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// With `--write-cache`: containers translated into the runtime's
+    /// shader cache, and those it held already.
+    cache_written: usize,
+    cache_present: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +134,8 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.cache_written += other.cache_written;
+        self.cache_present += other.cache_present;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -154,6 +160,17 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `--write-cache`: the runtime's shader cache, the key part its entries
+/// carry on this host, and the wave sizes to translate for.
+#[cfg(windows)]
+struct Warm {
+    cache: victory_gpu::shader_cache::Cache,
+    key: [u8; 32],
+    target: emit::Target,
+}
+#[cfg(not(windows))]
+struct Warm;
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -161,8 +178,18 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
+    write_cache: bool,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let warm = if write_cache {
+        anyhow::ensure!(
+            host_lanes.is_none(),
+            "--write-cache translates for this host's wave sizes; drop --host-lanes"
+        );
+        Some(warm_cache()?)
+    } else {
+        None
+    };
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -230,7 +257,10 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            match &warm {
+                                Some(w) => store(job, entry.path(), &seen, &mut t, w),
+                                None => translate(job, entry.path(), &seen, &mut t, &mut checks),
+                            }
                         }
                         lock(&total).merge(t);
                     });
@@ -239,6 +269,24 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    if warm.is_some() {
+        println!(
+            "containers   {} ({} duplicates skipped)",
+            t.containers, t.duplicates
+        );
+        println!(
+            "shader cache {} stored, {} already cached, {} failed",
+            t.cache_written,
+            t.cache_present,
+            t.failed.values().map(|f| f.0).sum::<usize>()
+        );
+        let mut failed: Vec<_> = t.failed.into_iter().collect();
+        failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (reason, (n, example)) in failed {
+            println!("  {n:>7}  {reason}  (e.g. {example})");
+        }
+        return Ok(());
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -316,6 +364,78 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+/// Opens the runtime's shader cache (`<cache>/shaders` of `victory.toml`)
+/// and asks the runtime's own host for its wave sizes.
+#[cfg(windows)]
+fn warm_cache() -> Result<Warm> {
+    use victory_gpu::shader_cache;
+    let dir = victory_core::Config::load()?.cache_subdir("shaders")?;
+    let cache = shader_cache::open(dir.clone())?;
+    let target = shader_cache::runtime_target();
+    println!("shader cache {}", dir.display());
+    println!(
+        "host waves   {}-{} lanes",
+        target.lanes_min, target.lanes_max
+    );
+    Ok(Warm {
+        cache,
+        key: shader_cache::cache_key(target),
+        target,
+    })
+}
+
+#[cfg(not(windows))]
+fn warm_cache() -> Result<Warm> {
+    anyhow::bail!("--write-cache fills the D3D12 runtime's cache: Windows only")
+}
+
+/// `--write-cache`: translates the container as the runtime does and keeps
+/// it under the key the runtime looks it up with. The runtime keys on the
+/// bytes the title passes, the container itself: a container found loose
+/// in a file is cut to the size its header gives, and a packed record
+/// whose bytes run past it is also kept whole.
+fn store(
+    source: &Source,
+    path: &Path,
+    seen: &Mutex<HashSet<blake3::Hash>>,
+    t: &mut Tally,
+    warm: &Warm,
+) {
+    let example = || format!("{}{}", path.display(), source.label());
+    let Some(bytes) = source.bytes() else {
+        return t.fail("corrupt record".into(), example);
+    };
+    let Some(total) = bytes
+        .get(0x18..0x1c)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+        .filter(|&n| n <= bytes.len() && Container::parse(&bytes).is_ok())
+    else {
+        return t.fail("not a container".into(), example);
+    };
+    let mut keys = vec![&bytes[..total]];
+    if matches!(source, Source::Packed(_)) && total != bytes.len() {
+        keys.push(&bytes[..]);
+    }
+    for container in keys {
+        if !lock(seen).insert(blake3::hash(container)) {
+            t.duplicates += 1;
+            continue;
+        }
+        t.containers += 1;
+        #[cfg(windows)]
+        {
+            use victory_gpu::shader_cache::{self, Stored};
+            match shader_cache::store(&warm.cache, &warm.key, container, warm.target) {
+                Ok(Stored::Written) => t.cache_written += 1,
+                Ok(Stored::AlreadyCached) => t.cache_present += 1,
+                Err(e) => t.fail(e, example),
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = warm;
+    }
 }
 
 fn translate(
