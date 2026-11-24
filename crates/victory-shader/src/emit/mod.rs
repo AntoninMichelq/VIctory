@@ -3127,7 +3127,7 @@ mod pr306_tests {
         let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let emitted = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let emitted = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
 
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(

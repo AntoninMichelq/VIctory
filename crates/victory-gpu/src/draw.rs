@@ -1748,7 +1748,7 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+mod rect_tests {
     use super::{expanded_vertices, rect_source};
 
     #[test]
