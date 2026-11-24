@@ -43,8 +43,42 @@ pub(crate) fn frame_rate(hwnd: HWND, fps: f64, ms: f64) {
     });
 }
 
-const WIDTH: i32 = 230;
-const HEIGHT: i32 = 98;
+const WIDTH: i32 = 270;
+/// The box's height: five lines of numbers, a separator and the
+/// settings' lines.
+fn height() -> i32 {
+    98 + settings().len() as i32 * 17 + if settings().is_empty() { 0 } else { 8 }
+}
+
+/// The special settings this run has on, as the user calls them: the
+/// console mode and the environment switches that change speed or the
+/// picture. Read once (they are fixed for a run).
+fn settings() -> &'static [&'static str] {
+    static SETTINGS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    SETTINGS.get_or_init(|| {
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0");
+        let mut out = vec![match crate::console::current() {
+            crate::console::Console::SeriesS => "Mode Series S (FSR, effets bas)",
+            crate::console::Console::SeriesX => "Mode Series X (qualite)",
+        }];
+        let switches: [(&[&str], &str); 8] = [
+            (&["VICTORY_LATE_WAIT"], "CPU et GPU en parallele"),
+            (&["VICTORY_RELAY"], "Recopies sur un coeur a part"),
+            (&["VICTORY_WIDE_REFRESH", "VICTORY_WIDE_BACK", "VICTORY_WIDE_MERGE"], "Copies multi-coeurs"),
+            (&["VICTORY_JOIN_COPIES"], "Copies groupees"),
+            (&["VICTORY_TEXTURE_NO_WAIT"], "Textures sans attente"),
+            (&["VICTORY_INPLACE"], "Memoire en place"),
+            (&["VICTORY_BVH_BUILDER"], "Rayons (RT) actifs"),
+            (&["VICTORY_ROOT_UAVS_ONLY", "VICTORY_ROOT_UAVS"], "Eclairage calcule"),
+        ];
+        for (names, label) in switches {
+            if names.iter().any(|n| set(n)) {
+                out.push(label);
+            }
+        }
+        out
+    })
+}
 const MARGIN: i32 = 8;
 const TIMER: usize = 1;
 
@@ -72,7 +106,7 @@ fn run() {
             0,
             0,
             WIDTH,
-            HEIGHT,
+            height(),
             None,
             None,
             Some(instance.into()),
@@ -139,7 +173,7 @@ fn tick(hwnd: HWND) {
             corner.x - WIDTH - MARGIN,
             corner.y + MARGIN,
             WIDTH,
-            HEIGHT,
+            height(),
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
         let _ = InvalidateRect(Some(hwnd), None, true);
@@ -238,6 +272,14 @@ impl Stats {
             used_ram / 1e9,
             total_ram / 1e9,
         );
+        let mut text = text;
+        if !settings().is_empty() {
+            text.push_str("\n------------------------");
+            for label in settings() {
+                text.push_str("\n+ ");
+                text.push_str(label);
+            }
+        }
         text.encode_utf16().collect()
     }
 
