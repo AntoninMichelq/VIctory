@@ -363,6 +363,29 @@ fn show(resource: Option<object::Held>) {
         host.present(&target.texture, state, frame);
         return;
     }
+    // Stand-in lighting: the title's image plus a target the frame used.
+    #[cfg(windows)]
+    if let Some(albedo) = crate::present_target::flat_light(frame)
+        && let Some(resource) = resource.as_ref().map(object::Held::get)
+        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(host) = crate::host::host()
+    {
+        // The image's state, as the tracking has it (left unchanged).
+        const COPY_SOURCE: u32 = 0x800;
+        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+            .map_or(COPY_SOURCE, |(_, before)| before);
+        crate::resource::host_transition(resource, state);
+        let state = crate::host::legal_state(texture, state);
+        let albedo_state =
+            crate::host::legal_state(&albedo.texture, albedo.state.load(Ordering::Relaxed));
+        if let Some(out) =
+            crate::flat_light::compose(host, texture, state, &albedo.texture, albedo_state)
+        {
+            const UNORDERED_ACCESS: u32 = 0x8;
+            host.present(&out, UNORDERED_ACCESS, frame);
+            return;
+        }
+    }
     #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)
