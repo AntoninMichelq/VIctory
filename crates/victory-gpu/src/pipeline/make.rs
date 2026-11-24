@@ -367,7 +367,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         let frame = crate::frame::current();
         start(p, frame.saturating_add(1));
-        wait(p, frame);
+        if p.graphics.is_none() && dispatches_wait() {
+            wait_made(p, Duration::from_secs(30));
+        } else {
+            wait(p, frame);
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -403,6 +407,39 @@ pub(crate) fn early(p: &Arc<Pending>) {
         }
         start(p, 0);
     }
+}
+
+/// `VICTORY_DISPATCH_WAIT=1` (opt-in): a compute dispatch whose pipeline is
+/// not made yet waits for it (up to 30 s) instead of being dropped. A
+/// dropped dispatch leaves data later passes read wrong (culling, light
+/// lists, indirect arguments), so geometry built on it goes missing for
+/// as long as it compiles; draws keep the frame budget.
+fn dispatches_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_DISPATCH_WAIT").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("VICTORY_DISPATCH_WAIT: compute dispatches wait for their pipeline");
+        }
+        on
+    })
+}
+
+/// Waits for `p` until it is made or `limit` passes, outside the frame
+/// budget (counted as a pipeline wait in the frame CPU split).
+fn wait_made(p: &Pending, limit: Duration) {
+    let started = Instant::now();
+    let mut held = p.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = limit.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            tracing::warn!(key = %p.key, "a dispatch's pipeline still not made after 30 s; dropped");
+            break;
+        }
+        held = p.wait_done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    crate::draw::BLOCKED_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Waits for `p` while frame `frame` has budget left, reserving budget
