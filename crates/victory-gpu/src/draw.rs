@@ -757,11 +757,25 @@ impl State {
         for root in self.roots_ref(compute) {
             match root {
                 Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
+                // Only the structure builder passes structures as root constants (see
+                // `crate::memory`): elsewhere they are numbers, and the float or index
+                // that looks like an address named a copy every list then refreshed (the
+                // trace and shading programs of the traced light, ~190 MB a frame).
+                // A walker reaching memory only that way finds it through the faults.
+                Root::Constants(values) if self.constants_name_memory() => constants.extend_from_slice(values),
                 _ => {}
             }
         }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
+    }
+
+    /// Whether the bound pipeline's root constants may be title addresses
+    /// ([`Self::memory_ready`]): a builder stage's, or every pipeline's with
+    /// `VICTORY_MEMORY_CONSTANTS=1` (as before).
+    fn constants_name_memory(&self) -> bool {
+        static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALL.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CONSTANTS").is_some_and(|v| v == "1"))
+            || crate::pipeline::is_builder(self.pipeline as This)
     }
 
     /// The bound heap holding `handle`.
