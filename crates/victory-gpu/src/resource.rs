@@ -228,14 +228,24 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// Nor have its 10-bit float colour formats (116 and 117, R10G10B10 with
+/// 7e3 or 6e4 floats and a 2-bit alpha, HDR lighting targets): no DXGI
+/// number is theirs, so the host refused the texture and every view and
+/// target of it read and wrote nothing. R16G16B16A16_FLOAT holds their
+/// values; texel copies to or from title memory see the size differ and
+/// are skipped.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        116 | 117 => R16G16B16A16_FLOAT,
         118 => 45,
         119 => 46,
         120 => 47,
         other => other,
     }
 }
+
+/// DXGI_FORMAT_R16G16B16A16_FLOAT.
+const R16G16B16A16_FLOAT: u32 = 10;
 
 /// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
 /// host cannot make (see [`target_format`]).
