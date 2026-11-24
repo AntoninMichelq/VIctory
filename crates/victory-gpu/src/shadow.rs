@@ -218,6 +218,11 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// Where the copied title range starts, and its length.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
@@ -798,18 +803,24 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// stream offsets of up to 32 MiB at the view's start; a copy ending
 /// sooner (a small title buffer, a 4 MiB window) read the rest as zeros
 /// and left the model's vertices in one point.
-pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
+///
+/// Views of one model pool share their copy: a window made for this starts
+/// on a [`SPAN`] boundary and is at least two spans long, so views a span
+/// apart land in the same one, and `true` (made longer) tells the caller to
+/// refresh the window whole, once per watch generation, instead of a range
+/// per view.
+pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<(Arc<Shadow>, bool)> {
     let near = find(address, 1)?;
     if near.left(address) >= reach {
-        return Some(near);
+        return Some((near, false));
     }
     let end = address.checked_add(reach)?;
     let far = match buffer_covering(address, end) {
-        Some(found) => found,
-        None => loose(address, end),
+        Some(found) => found.map(|s| (s, false)),
+        None => loose_span(address, end).map(|s| (s, true)),
     };
-    let Some(far) = far else {
-        return Some(near);
+    let Some((far, window)) = far else {
+        return Some((near, false));
     };
     static LONGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = LONGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -823,7 +834,19 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
             "root view copy made longer for what its program reads"
         );
     }
-    Some(far)
+    Some((far, window))
+}
+
+/// Alignment and least length (twice this) of the windows
+/// [`find_reaching`] makes.
+const SPAN: u64 = 32 << 20;
+
+/// A window of title memory holding `[address, end)`, shared by views a
+/// [`SPAN`] apart (see [`find_reaching`]).
+fn loose_span(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let start = address & !(SPAN - 1);
+    let len = (end - start).max(2 * SPAN).checked_next_multiple_of(SPAN)?;
+    loose_window(address, end, start, len)
 }
 
 /// The copy of the innermost title buffer holding `[address, end)` (made
@@ -1032,6 +1055,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let end = end.max(address.saturating_add(64 << 10));
     let len = end.checked_next_multiple_of(WINDOW)? - start;
+    loose_window(address, end, start, len)
+}
+
+/// The window copy holding `[address, end)`: one made already, else a new
+/// one over `[start, start + len)`.
+fn loose_window(address: u64, end: u64, start: u64, len: u64) -> Option<Arc<Shadow>> {
     let now = LOOSE_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a

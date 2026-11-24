@@ -541,10 +541,10 @@ impl State {
         if address == 0 {
             return None;
         }
-        let shadow = if reach > 0 {
+        let (shadow, window) = if reach > 0 {
             crate::shadow::find_reaching(address, reach)?
         } else {
-            crate::shadow::find(address, 1)?
+            (crate::shadow::find(address, 1)?, false)
         };
         let gpu = shadow.gpu(address);
         if !gpu.is_multiple_of(4) {
@@ -582,8 +582,14 @@ impl State {
                 first
             }
         };
-        // A view reaching far needs only what its program reads fresh.
-        shadow.refresh(list, address, if reach > 0 { len.min(reach) } else { len });
+        if window {
+            // Shared by the views of a model pool: refreshed whole, so the
+            // other views' ranges are inside a range refreshed already.
+            let (start, all) = shadow.span();
+            shadow.refresh(list, start, all);
+        } else {
+            shadow.refresh(list, address, len);
+        }
         if uav {
             shadow.gpu_writes(list, address, len);
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
