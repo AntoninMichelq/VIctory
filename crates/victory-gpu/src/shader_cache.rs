@@ -342,6 +342,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, u32::from(s.memory_table));
     out
 }
 
@@ -400,6 +401,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
+    let memory_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -410,6 +412,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         stride_table,
         root_uavs,
+        memory_table,
     })
 }
 
@@ -438,6 +441,7 @@ mod tests {
             root_srvs: vec![0, 3],
             stride_table: true,
             root_uavs: vec![1],
+            memory_table: true,
         }
     }
 

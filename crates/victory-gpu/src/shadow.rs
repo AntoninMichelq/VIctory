@@ -212,6 +212,11 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// The title range the copy holds: start and length.
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -865,6 +870,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
     entry.shadow.clone()
+}
+
+/// Every copy of title memory made so far (buffers and loose windows),
+/// for the memory table: a program that loads an address from memory and
+/// reads through it may land in any of them.
+pub(crate) fn live() -> Vec<Arc<Shadow>> {
+    let mut all: Vec<Arc<Shadow>> = buffers()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

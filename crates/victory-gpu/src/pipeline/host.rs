@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -347,6 +349,8 @@ pub(crate) struct Stage {
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Root parameter of the memory table (`t0`, [`MEMORY_SPACE`]).
+    pub(crate) memory_table: Option<u32>,
 }
 
 impl Stage {
@@ -436,6 +440,9 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
+        // Stages reading the memory table, and their visibility: its root
+        // SRV goes in after root views become tables (it stays a root view).
+        let mut memory_tables: Vec<(usize, D3D12_SHADER_VISIBILITY)> = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -445,6 +452,7 @@ impl HostPipeline {
                 root_srvs: Vec::new(),
                 stride_table: None,
                 root_uavs: Vec::new(),
+                memory_table: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -517,6 +525,9 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
+            if t.memory_table {
+                memory_tables.push((bound.len(), visibility));
+            }
             bound.push(stage);
         }
         // Root SRVs and UAVs become one-descriptor tables: a root view has no
@@ -564,6 +575,20 @@ impl HostPipeline {
                     pDescriptorRanges: range,
                 },
             };
+        }
+        for &(stage, visibility) in &memory_tables {
+            bound[stage].memory_table = Some(params.len() as u32);
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: MEMORY_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
         }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {

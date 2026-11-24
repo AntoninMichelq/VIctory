@@ -117,7 +117,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, STRIDE_TABLE_SLOTS, USER_DATA_SPACE,
+    MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, STRIDE_TABLE_SLOTS,
+    USER_DATA_SPACE,
 };
 
 /// The loop limit without an override: 2^20.
@@ -277,6 +278,11 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// True when the shader reads title memory at addresses no root view
+    /// covers (pointers loaded from memory) through the memory table:
+    /// `t0` in [`MEMORY_SPACE`] and the views it names in the directly
+    /// indexed view heap.
+    pub memory_table: bool,
 }
 
 impl HostShader {
@@ -559,6 +565,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        memory_table: false,
         root_uavs: l.root_uavs,
     })
 }
@@ -1081,6 +1088,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            memory_table: false,
             root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1093,6 +1101,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                memory_table: false,
                 root_uavs: Vec::new(),
             })
         };
@@ -1590,6 +1599,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
+                memory_table: false,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1748,6 +1758,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
+                memory_table: false,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1915,6 +1926,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
+                memory_table: false,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2073,6 +2085,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
+                memory_table: false,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
