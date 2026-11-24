@@ -1710,6 +1710,7 @@ impl<'a> Lower<'a> {
         if let Some(dd) = self.dynamic_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, dd);
         }
+        let off = self.view_offset(&a, off)?;
         let src = Source::Built {
             address: a,
             bits: 0,
@@ -1833,6 +1834,7 @@ impl<'a> Lower<'a> {
             if let Some(d) = self.dynamic_term(&a)? {
                 off = self.s.m.bin(c, Bin::Add, off, d);
             }
+            let off = self.view_offset(&a, off)?;
             let src = Source::Built {
                 address: a,
                 bits: 0,
@@ -1909,6 +1911,9 @@ impl<'a> Lower<'a> {
             } else {
                 0
             };
+            if let Source::Built { address, .. } = src {
+                off = self.view_offset(address, off)?;
+            }
             Some(self.handle((b, i), src, false, (11 | u, 0))?)
         } else if a.param == CODE {
             None
@@ -1926,6 +1931,7 @@ impl<'a> Lower<'a> {
             } else {
                 0
             };
+            off = self.view_offset(&a, off)?;
             Some(self.handle((b, i), &src, false, (11 | u, 0))?)
         };
         let (in_bounds, load_off) = if h.is_some() {
@@ -2787,6 +2793,41 @@ impl<'a> Lower<'a> {
         Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
     }
 
+    /// `off` plus the low four bits of the address of the raw root view
+    /// `a` is in (a root SRV/UAV or a pointer view in root constants):
+    /// the host binds such views at their address rounded down to 16 bytes,
+    /// as D3D12 raw views must start there. Other addresses as they are.
+    fn view_offset(&mut self, a: &Address, off: V) -> Result<V, Why> {
+        let lo = if let Some(index) = crate::resource::pointer_user_data(a.param) {
+            if index & 0x100 != 0 {
+                // Kept shifted right by 8: on 256 bytes.
+                return Ok(off);
+            }
+            let layout = &self.x.native.layout;
+            let Some(param) = (0..layout.len()).find(|&i| {
+                let r = layout[i];
+                r.root == RootType::Constants
+                    && (u32::from(r.user_data)..u32::from(r.user_data) + r.sgprs).contains(&index)
+            }) else {
+                return Err("an address in root constants");
+            };
+            let dword = index - u32::from(layout[param].user_data);
+            self.user(param, dword)
+        } else {
+            match self.x.native.layout.get(a.param) {
+                Some(rp) if rp.root == RootType::Descriptor => self.user_dword(a.param, 0),
+                _ => return Ok(off),
+            }
+        };
+        let Val::I32(lo) = lo else {
+            return Err("a root view's address");
+        };
+        let c = self.cur;
+        let fifteen = self.s.m.i32(15);
+        let bias = self.s.m.bin(c, Bin::And, lo, fifteen);
+        Ok(self.s.m.bin(c, Bin::Add, off, bias))
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -2806,8 +2847,17 @@ impl<'a> Lower<'a> {
             RootType::Descriptor if self.x.res.address_only.contains(&param) => {
                 return Val::I32(self.s.m.i32(0));
             }
+            // The view's address (the host sets it as user data too).
+            RootType::Descriptor => {}
             _ => return Val::Missing("a root descriptor"),
         }
+        self.user_dword(param, dword)
+    }
+
+    /// [`Self::user`] read from the host's user data, whatever the
+    /// parameter.
+    fn user_dword(&mut self, param: usize, dword: u32) -> Val {
+        let rp = self.x.native.layout[param];
         let index = u32::from(rp.user_data) + dword;
         self.user_reads.insert(
             index,
@@ -5782,6 +5832,11 @@ impl<'a> Lower<'a> {
             None => (13, 0x1_0000),
         };
         let h = self.handle(site, src, false, props)?;
+        if props.0 & 0xFFF == 11
+            && let Source::Built { address, .. } = src
+        {
+            addr = self.view_offset(address, addr)?;
+        }
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -5914,7 +5969,13 @@ impl<'a> Lower<'a> {
         if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
-        let constant = a.dynamic.is_none().then_some(a.offset);
+        let mut constant = a.dynamic.is_none().then_some(a.offset);
+        if srv {
+            addr = self.view_offset(&a, addr)?;
+            if !matches!(addr, V::Const(_)) {
+                constant = None;
+            }
+        }
         let words = self.view_dwords(h, srv.then_some(0), addr, constant, count);
         for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
@@ -11415,6 +11476,12 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        if !typed
+            && !used.is_some_and(|u| u.kind == ResourceType::Cbv)
+            && let Source::Built { address, .. } = src
+        {
+            off = self.view_offset(address, off)?;
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             if store || atomic.is_some() {
                 return Err("a write or atomic operation on a constant buffer");
@@ -13988,6 +14055,9 @@ mod tests {
         let used = vec![root_view(ResourceType::Srv, 0, 3)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!((l.root_srvs, l.root_uavs), (vec![], vec![3]));
+        // The host binds the view at its address rounded down to 16 bytes;
+        // the accesses add the address's low bits, read as user data.
+        assert!(l.user_data.iter().any(|u| u.index == 0 && u.dword == 0));
     }
 
     #[test]
@@ -14916,10 +14986,10 @@ mod tests {
     }
 
     #[test]
-    fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
+    fn data_read_through_a_pointer_into_a_root_descriptor_reads_its_address() {
         // A root descriptor's address (s[0:1]) advanced in a loop and read
-        // through, and compared with what is read there: its address is no
-        // value the translation has, so the offset from it is unknown.
+        // through, and compared with what is read there: the host passes
+        // the address as user data, so the pointer's value is known.
         let mut words = [
             0xBE82_0300, // s_mov_b32 s2, s0
             0xBE83_0301, // s_mov_b32 s3, s1
@@ -14936,14 +15006,9 @@ mod tests {
         lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
         assert_eq!(words[6], 0xBF06_8004);
         words[6] = 0xBF06_0204; // s_cmp_eq_u32 s4, s2
-        let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
-            .err()
-            .unwrap();
-        assert!(
-            e.to_string()
-                .contains("an advanced pointer into a root descriptor"),
-            "{e}"
-        );
+        let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
+        let read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
+        assert_eq!(read, [0, 1]);
     }
 
     #[test]
