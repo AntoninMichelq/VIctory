@@ -128,6 +128,14 @@ const KEPT: usize = 4096;
 /// `title`; elsewhere the title's byte stays. `host` and `old` then take
 /// `title`'s bytes. Whether `title` changed. Word by word, without branches per
 /// byte (the world copies back hundreds of MB per frame).
+/// `VICTORY_COPY_BACK_RUNS=1`: copy-back writes only the exact bytes the
+/// GPU changed and marks a page current only if title memory still matches
+/// (upstream #1024's idea). Off by default: slower in world play runs.
+fn exact_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_BACK_RUNS").is_ok_and(|v| v.trim() == "1"))
+}
+
 #[cfg(test)]
 fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
     let mut runs = Vec::new();
@@ -456,11 +464,19 @@ impl Shadow {
                     // writing the whole page put back what a title thread
                     // had before its own write meanwhile (pointers and
                     // fence lists read as -1 in root-UAV runs).
+                    // Off by default (VICTORY_COPY_BACK_RUNS=1): it cost
+                    // 2-5x the copy-back time in world play runs.
                     merge_gpu_runs(title, host, old, &mut runs);
                     if let (Some(&(s, _)), Some(&(_, e))) = (runs.first(), runs.last()) {
-                        crate::watch::writing(start + at + s, e - s);
-                        crate::host::write_runs((start + at) as *mut u8, title.as_ptr(), &runs);
-                        written += runs.iter().map(|(s, e)| e - s).sum::<usize>();
+                        if exact_runs() {
+                            crate::watch::writing(start + at + s, e - s);
+                            crate::host::write_runs((start + at) as *mut u8, title.as_ptr(), &runs);
+                            written += runs.iter().map(|(s, e)| e - s).sum::<usize>();
+                        } else {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -488,7 +504,9 @@ impl Shadow {
                     // SAFETY: a whole page inside the mapping (first..last).
                     let host = unsafe { std::slice::from_raw_parts(self.data.add(at), PAGE) };
                     let title = &mut now_title[..PAGE];
-                    if crate::host::read_into((page * PAGE) as *const u8, title) && title == host {
+                    if !exact_runs()
+                        || crate::host::read_into((page * PAGE) as *const u8, title) && title == host
+                    {
                         copied[page - base] = now;
                     }
                 }
