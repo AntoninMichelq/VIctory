@@ -147,7 +147,13 @@ pub(crate) fn forget(at: usize, len: usize) {
     for p in pages {
         j.written.remove(&p);
     }
-    let _ = ask(&mut j, at, at + len);
+    let end = at + len;
+    let gone: Vec<usize> =
+        j.allocations.range(..end).filter(|(_, (e, _))| *e > at).map(|(&b, _)| b).collect();
+    for b in gone {
+        j.allocations.remove(&b);
+    }
+    let _ = ask(&mut j, at, end);
 }
 
 /// Ends the epoch: asks go to the kernel again.
@@ -841,6 +847,7 @@ pub(crate) mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        forget(p, 8 * PAGE);
         // SAFETY: committed pages of ours.
         unsafe { ((p + 5 * PAGE) as *mut u8).write(1) };
         begin_epoch();
@@ -1044,6 +1051,7 @@ pub(crate) mod tests {
                     PAGE_READWRITE,
                 );
                 if !second.is_null() {
+                    forget(span as usize, watched + unwatched);
                     return (first, Reservation(second));
                 }
             }
