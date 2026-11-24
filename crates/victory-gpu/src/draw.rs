@@ -244,6 +244,23 @@ fn root_uav_copy_back() -> bool {
     })
 }
 
+/// With root-UAV copy-back off: whether this is the first bind of a root
+/// UAV at `address`, its copy at host address `gpu` (it is then
+/// refreshed from the title once). `VICTORY_ROOT_UAV_REFRESH=1` refreshes
+/// at every bind, as before.
+fn root_uav_first_bind(gpu: u64, address: u64) -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::Mutex::new(None);
+    if *ALWAYS.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_REFRESH").is_ok_and(|v| v.trim() == "1")) {
+        return true;
+    }
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((gpu, address))
+}
+
 fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     if address == 0 {
         return None;
@@ -283,9 +300,17 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
                 return None;
             }
             let len = shadow.left(address);
-            shadow.refresh(list, address, len);
             if root_uav_copy_back() {
+                shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
+            } else if root_uav_first_bind(gpu, address) {
+                // Copy-back off: what shaders write here lives only in the
+                // host copy, so it is taken from the title once and then
+                // left to the GPU. Refreshing it at every bind copied up to
+                // 2 GB a frame (the remaining extent of the title's big
+                // heap, mostly not write-watched) and put the title's older
+                // bytes back over what the culling computes wrote.
+                shadow.refresh(list, address, len);
             }
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             Some(gpu)
