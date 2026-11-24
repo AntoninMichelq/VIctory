@@ -11,7 +11,8 @@
 //! the depth (as reversed depth unless `<reversed>` is 0), and outlined
 //! where the depth jumps. An integer texture (R8/R16/R32_UINT, a material
 //! ID target say) is coloured from a palette, one colour per ID (the
-//! most common ID around each pixel), ID 0 black. `<n>` = `busiest` picks
+//! most common ID around each pixel), ID 0 black, and black where the
+//! depth shows nothing drawn this frame (the IDs there are old). `<n>` = `busiest` picks
 //! the matching texture the frame binds most often. Frames without such a texture present as usual.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -87,6 +88,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         float h = frac((float)((m * 2654435761u) >> 8) / 16777216.0);
         float3 hue = saturate(abs(frac(h + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
         colour = m == 0 ? float3(0, 0, 0) : 0.75 * lerp(float3(1, 1, 1), hue, 0.65);
+        // The title does not clear the ID target: where nothing was drawn
+        // this frame (the depth is still cleared) it holds old shots' IDs.
+        if (HasDepth != 0) {
+            float d = Depth.Load(int3(p, 0));
+            if (Reversed != 0 ? d <= 0.0 : d >= 1.0) {
+                colour = float3(0, 0, 0);
+            }
+        }
     } else {
         colour = Albedo.Load(int3(at, 0)).rgb;
     }
