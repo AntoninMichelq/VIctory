@@ -2267,8 +2267,11 @@ mod tests {
         // A dispatch whose root views the title did not set, set to null or
         // set outside mapped memory is dropped (no fallback buffers: a
         // compute pass spinning on zeros hangs the GPU), and writes nothing.
+        // Root views are one-descriptor tables in the bound view heap.
+        let heap = crate::descriptor::test_view_heap(64);
         let list = host.new_list().expect("new_list");
         let mut state = State::default();
+        state.set_heaps(&[heap]);
         state.set_pipeline(pso);
         state.set_view(true, 1, 0);
         state.set_view(true, 2, mid_unmapped);
@@ -2282,6 +2285,7 @@ mod tests {
         //    UAV writing +1.5 MiB) and verify full extent refresh + write-back.
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[heap]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());
@@ -2303,6 +2307,7 @@ mod tests {
         }
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[heap]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());
@@ -2319,5 +2324,8 @@ mod tests {
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
+        drop(state);
+        drop(list);
+        crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
     }
 }

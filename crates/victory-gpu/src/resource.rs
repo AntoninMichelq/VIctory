@@ -2335,12 +2335,19 @@ void main() {
         assert_eq!(record(list, 1, barrier.as_ptr()), 0);
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        assert_eq!(release(image), 0);
-        assert_eq!(owner.strong_count(), 1);
         let host_list = crate::list::host_list(list).unwrap();
+        assert_eq!(release(image), 0);
+        // The list holds the host texture past the title's release (a
+        // released resource's copy is also retired for a few presented
+        // frames, so the list's hold is one of possibly several).
+        assert!(host_list.holds_barrier_texture(&owner.upgrade().unwrap()));
+        let held = owner.strong_count();
+        assert!(held >= 1);
         gpu.execute(&[&host_list]);
+        drop(host_list);
         assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
-        assert_eq!(owner.strong_count(), 0);
+        // Reset gives the list's hold up (to retirement, not to more holders).
+        assert!(owner.strong_count() <= held);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }

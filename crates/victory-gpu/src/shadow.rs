@@ -1423,6 +1423,12 @@ mod tests {
             };
             assert!(!at.is_null());
             let base = at as usize;
+            // Populate the demand-zero pages first: the first read of a
+            // page never touched (the refresh's copy) marks it written once
+            // (seen on Windows CI), which a test would take as a title write.
+            // SAFETY: the allocation is ours and committed.
+            unsafe { at.cast::<u8>().write_bytes(0, 2 * PAGE) };
+            crate::watch::forget(base, 2 * PAGE);
             register(base, base as u64, 2 * PAGE as u64);
             let shadow = find(base as u64, 2 * PAGE as u64).unwrap();
             Some(Watched { base, shadow })

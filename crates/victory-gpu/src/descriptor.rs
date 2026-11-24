@@ -625,6 +625,21 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     (record.tag == tag).then_some(record)
 }
 
+/// Tests: a shader-visible view heap of `count` descriptors, as a title
+/// makes one (root views become one-descriptor tables in the bound heap).
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 },
+        Placement { address: 0, size: 0 },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out), crate::object::S_OK);
+    out
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_heap(
     _: This,

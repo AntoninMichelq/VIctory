@@ -2719,6 +2719,14 @@ impl HostList {
         }
     }
 
+    /// Tests: whether a barrier of this list retains `texture`.
+    #[cfg(test)]
+    pub(crate) fn holds_barrier_texture(&self, texture: &std::sync::Arc<crate::resource::HostTexture>) -> bool {
+        self.deferred()
+            .barrier_textures
+            .contains_key(&(std::sync::Arc::as_ptr(texture) as usize))
+    }
+
     /// Retains the host texture named by an aliasing or UAV barrier.
     pub(crate) fn keep_barrier_texture(&self, texture: std::sync::Arc<crate::resource::HostTexture>) {
         self.deferred()

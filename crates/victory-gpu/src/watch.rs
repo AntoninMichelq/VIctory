@@ -137,6 +137,19 @@ pub(crate) fn begin_epoch() {
     j.allocations.retain(|_, (_, watched)| *watched);
 }
 
+/// Tests: forgets what the journal and the kernel hold for `[at, at + len)`,
+/// a new allocation that may reuse a freed one's addresses (tests run side
+/// by side and share the journal).
+#[cfg(test)]
+pub(crate) fn forget(at: usize, len: usize) {
+    let mut j = journal();
+    let pages: Vec<usize> = j.written.range(at / PAGE..(at + len).div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    for p in pages {
+        j.written.remove(&p);
+    }
+    let _ = ask(&mut j, at, at + len);
+}
+
 /// Ends the epoch: asks go to the kernel again.
 pub(crate) fn end_epoch() {
     EPOCH.with_borrow_mut(|e| *e = None);
@@ -788,6 +801,7 @@ pub(crate) mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        forget(p, 4 * PAGE);
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
