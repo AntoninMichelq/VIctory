@@ -795,10 +795,11 @@ impl HostHeap {
         }
         all.sort_unstable_by_key(|(shadow, address, _)| (Arc::as_ptr(shadow), *address));
         let mut ranges: Vec<(Arc<Shadow>, usize, usize)> = Vec::new();
+        let gap = srv_merge_gap();
         for (shadow, address, end) in all {
             if let Some((last, _, last_end)) = ranges.last_mut()
                 && Arc::ptr_eq(last, &shadow)
-                && address <= (*last_end).next_multiple_of(crate::watch::PAGE)
+                && address <= (*last_end).next_multiple_of(crate::watch::PAGE).saturating_add(gap)
             {
                 *last_end = (*last_end).max(end);
                 continue;
@@ -833,6 +834,23 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// How far apart (bytes) two mirrored SRV ranges of one buffer copy may
+/// be and still be refreshed as one: `VICTORY_SRV_MERGE_GAP_KB`, 16 MiB by
+/// default. A refresh asks the write watch once and copies only the pages
+/// written, so the bytes between cost a page lookup each; ~128k separate
+/// ranges per submission cost a write-watch ask and a lock each (~580 ms
+/// per frame over the world's 19 submissions).
+fn srv_merge_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_SRV_MERGE_GAP_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16 << 10)
+            << 10
+    })
 }
 
 /// Try each possible table start from the cursor, then from slot zero.
