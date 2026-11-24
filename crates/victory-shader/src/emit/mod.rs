@@ -580,7 +580,7 @@ fn emit_program(
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
-    for e in interpolated {
+    for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
@@ -592,6 +592,20 @@ fn emit_program(
             (0, _) => 1,
             _ => 0,
         };
+    }
+    // DXC packs elements of one interpolation mode per register, and an
+    // integer element is constant: a float sharing its register was
+    // declared nointerpolation too (the title's pixel inputs say flat).
+    // DXIL wants one mode per register.
+    let constant_rows: Vec<u32> = interpolated
+        .iter()
+        .filter(|e| e.kind == 0 && e.interp == 1)
+        .filter_map(|e| e.row)
+        .collect();
+    for e in interpolated.iter_mut() {
+        if e.kind == 0 && e.row.is_some_and(|r| constant_rows.contains(&r)) {
+            e.interp = 1;
+        }
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
