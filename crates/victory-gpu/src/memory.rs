@@ -38,7 +38,7 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
+//! there are at most [`COPIES`] of them (4 MiB windows mostly: 16 GiB at
 //! most). Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
@@ -55,8 +55,11 @@ use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// listed frame of the opening cutscene names about 50 windows; the
+/// prison with the structure builder on used up 1023 within minutes (its
+/// root constants that look like addresses name copies too), after which
+/// every new page read zeros and the traced light went dark.
+const COPIES: u32 = 4095;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
