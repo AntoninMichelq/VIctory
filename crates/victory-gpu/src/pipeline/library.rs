@@ -413,8 +413,18 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
 /// last save and `SAVE_EVERY` has passed (or `now`). Periodic saves run
 /// asynchronously on the dedicated saver thread; `now = true` waits for disk
 /// completion.
+/// When the last save started.
+static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Saves without waiting for `SAVE_EVERY` (after a pipeline that took long
+/// to make: a run closed before the next save, by Alt+F4 or a crash, made
+/// it again next time, three minutes for the world's ScreenProbes compute).
+pub(crate) fn save_soon() {
+    *LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    save(false);
+}
+
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let Some(dir) = DIR.get() else { return };
     if !now && !LIBRARY_DIRTY.load(Ordering::Relaxed) && !USED_CHANGED.load(Ordering::Relaxed) {
@@ -424,7 +434,7 @@ pub(crate) fn save(now: bool) {
         return;
     }
     {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }

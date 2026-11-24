@@ -207,6 +207,9 @@ fn progress() {
     let (mut hits, mut misses) = crate::shader_cache::counts();
     loop {
         std::thread::sleep(Duration::from_secs(5));
+        // A library left dirty by the last pipelines made (none made since
+        // to save it) is saved within `SAVE_EVERY` all the same.
+        super::library::save(false);
         let ok = STATS.ok.swap(0, Ordering::Relaxed);
         let failed = STATS.failed.swap(0, Ordering::Relaxed);
         let us = STATS.us.swap(0, Ordering::Relaxed);
@@ -635,9 +638,12 @@ fn next() -> Arc<Pending> {
 
 /// Makes `p`, taken from the queue, and does the bookkeeping.
 fn work(p: &Pending) {
+    let started = Instant::now();
     p.make();
     if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
         drained();
+    } else if started.elapsed() >= Duration::from_secs(5) {
+        super::library::save_soon();
     } else {
         super::library::save(false);
     }
