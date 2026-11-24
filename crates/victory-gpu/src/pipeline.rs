@@ -208,6 +208,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Marks a wait for pipelines (workers run at normal priority meanwhile).
+#[cfg(windows)]
+pub(crate) fn blocked() -> make::Blocked {
+    make::Blocked::new()
+}
+
 /// Host pipelines started early (from the last run's list) not made yet.
 #[cfg(windows)]
 pub(crate) fn early_left() -> u64 {

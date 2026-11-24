@@ -443,6 +443,7 @@ fn wait_made(p: &Pending, limit: Duration) {
         return;
     }
     let limit = limit.min(Duration::from_micros(PER_FRAME_US - spent));
+    let _blocked = Blocked::new();
     let started = Instant::now();
     let mut held = p.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -468,6 +469,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let left = Duration::from_micros(u64::from(reserved_us));
+    let _blocked = Blocked::new();
     let started = Instant::now();
     let mut held = p.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -575,6 +577,57 @@ fn work(p: &Pending) {
     }
 }
 
+/// Frames (or dispatches) blocked waiting for pipelines right now: while
+/// any are, workers run at normal priority. Below normal they starved
+/// while the title loaded on every core: 10 pipelines made per 5 s with
+/// 965 queued, at 133 ms each.
+static BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a wait for pipelines for as long as it lives.
+pub(crate) struct Blocked;
+
+impl Blocked {
+    pub(crate) fn new() -> Blocked {
+        BLOCKED.fetch_add(1, Ordering::Relaxed);
+        Blocked
+    }
+}
+
+impl Drop for Blocked {
+    fn drop(&mut self) {
+        BLOCKED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Workers' priority: `VICTORY_PIPELINE_PRIORITY` (`below`, `normal`,
+/// `above`) if set; else normal while something waits for pipelines and
+/// below normal otherwise (under the title's loading and recording).
+fn set_priority(current: &mut Option<i32>) {
+    use windows::Win32::System::Threading::*;
+    static FORCED: OnceLock<Option<i32>> = OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        let v = std::env::var("VICTORY_PIPELINE_PRIORITY").ok()?;
+        let p = match v.trim() {
+            "below" => THREAD_PRIORITY_BELOW_NORMAL.0,
+            "normal" => THREAD_PRIORITY_NORMAL.0,
+            "above" => THREAD_PRIORITY_ABOVE_NORMAL.0,
+            _ => return None,
+        };
+        tracing::info!(priority = v.trim(), "VICTORY_PIPELINE_PRIORITY");
+        Some(p)
+    });
+    let want = forced.unwrap_or(if BLOCKED.load(Ordering::Relaxed) > 0 {
+        THREAD_PRIORITY_NORMAL.0
+    } else {
+        THREAD_PRIORITY_BELOW_NORMAL.0
+    });
+    if *current != Some(want) {
+        // SAFETY: a plain call on our own thread.
+        let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY(want)) };
+        *current = Some(want);
+    }
+}
+
 /// Hands `p` to the workers (see [`workers`]), started on first use.
 fn queue(p: Arc<Pending>, wanted: u64) {
     static STARTED: OnceLock<usize> = OnceLock::new();
@@ -589,14 +642,11 @@ fn queue(p: Arc<Pending>, wanted: u64) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    let mut current = None;
                     loop {
-                        work(&next());
+                        let p = next();
+                        set_priority(&mut current);
+                        work(&p);
                     }
                 });
             match spawned {

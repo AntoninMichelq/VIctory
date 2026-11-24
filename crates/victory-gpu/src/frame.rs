@@ -114,6 +114,7 @@ fn preload() {
     if budget.is_zero() || crate::pipeline::early_left() == 0 {
         return;
     }
+    let _blocked = crate::pipeline::blocked();
     let started = Instant::now();
     let mut logged = Instant::now();
     loop {
