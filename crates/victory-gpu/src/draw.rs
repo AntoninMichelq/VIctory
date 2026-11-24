@@ -919,6 +919,16 @@ impl State {
                         };
                         *address
                     };
+                    #[cfg(feature = "diagnostics")]
+                    crate::trace::view(
+                        slot,
+                        match kind {
+                            RootView::Cbv => "cbv",
+                            RootView::Srv => "srv",
+                            RootView::Uav => "uav",
+                        },
+                        address,
+                    );
                     if kind != RootView::Cbv && crate::pipeline::host::root_srv_tables() {
                         let table = if pointer && address == 0 {
                             // A null address the program tests before reading.
@@ -1159,6 +1169,14 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let before = DISPATCHED.load(Ordering::Relaxed);
+        self.dispatch_inner(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        self.trace_op("dispatch", &[x.into(), y.into(), z.into()], DISPATCHED.load(Ordering::Relaxed) != before);
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
         let traced = self.trace_dispatch(x, y, z);
         #[cfg(feature = "diagnostics")]
         let pipe = self.pipeline;
@@ -1296,6 +1314,14 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        let before = DRAWN.load(Ordering::Relaxed);
+        self.dispatch_mesh_inner(list, x);
+        #[cfg(feature = "diagnostics")]
+        self.trace_op("mesh", &[x.into()], DRAWN.load(Ordering::Relaxed) != before);
+    }
+
+    fn dispatch_mesh_inner(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         if x > MAX_GROUPS {
@@ -1511,6 +1537,31 @@ impl State {
 
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
+    /// A line of the frame trace ([`crate::trace`]) for the op just
+    /// recorded or refused.
+    #[cfg(feature = "diagnostics")]
+    fn trace_op(&self, kind: &str, args: &[u64], ran: bool) {
+        if crate::trace::active().is_none() {
+            crate::trace::clear();
+            return;
+        }
+        let stages: Vec<String> = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map(|p| p.stages.iter().map(|s| s.shader.hash.to_string()).collect())
+            .unwrap_or_default();
+        let targets: Vec<(usize, u64, u32, i32)> = self
+            .targets
+            .iter()
+            .map(|&(resource, _)| {
+                crate::resource::host_resource(resource as This).map_or((resource, 0, 0, 0), |t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    (resource, d.Width, d.Height, d.Format.0)
+                })
+            })
+            .collect();
+        crate::trace::op(kind, args, ran, self.pipeline, &stages, &targets);
+    }
+
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
@@ -1576,6 +1627,25 @@ impl State {
     }
 
     pub(crate) fn draw(
+        &mut self,
+        list: &HostList,
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    ) {
+        #[cfg(feature = "diagnostics")]
+        let before = DRAWN.load(Ordering::Relaxed);
+        self.draw_inner(list, vertices, instances, first, first_instance);
+        #[cfg(feature = "diagnostics")]
+        self.trace_op(
+            "draw",
+            &[vertices.into(), instances.into(), first.into(), first_instance.into()],
+            DRAWN.load(Ordering::Relaxed) != before,
+        );
+    }
+
+    fn draw_inner(
         &mut self,
         list: &HostList,
         vertices: u32,
@@ -1692,6 +1762,26 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let before = DRAWN.load(Ordering::Relaxed);
+        self.draw_indexed_inner(list, indices, instances, first, base, first_instance);
+        #[cfg(feature = "diagnostics")]
+        self.trace_op(
+            "indexed",
+            &[indices.into(), instances.into(), first.into(), base as u64, first_instance.into()],
+            DRAWN.load(Ordering::Relaxed) != before,
+        );
+    }
+
+    fn draw_indexed_inner(
+        &mut self,
+        list: &HostList,
+        indices: u32,
+        instances: u32,
+        first: u32,
+        base: i32,
+        first_instance: u32,
+    ) {
+        #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
@@ -1789,6 +1879,23 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.execute_indirect_logged(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        self.trace_op(
+            "indirect",
+            &[kind.into(), stride.into(), max.into(), arguments, count.unwrap_or(0)],
+            ran,
+        );
+        ran
+    }
+
+    fn execute_indirect_logged(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
