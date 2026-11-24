@@ -142,8 +142,9 @@ pub fn pointer_views() -> bool {
 }
 
 /// Whether branches on constant conditions become jumps, their dead
-/// blocks left out ([`bitcode::Module::fold_constant_branches`]);
-/// `VICTORY_NO_BRANCH_FOLD=1` turns it off. Part of the translation, so the
+/// blocks left out ([`bitcode::Module::fold_constant_branches`]), and
+/// unused instructions dropped ([`bitcode::Module::drop_unused`]);
+/// `VICTORY_NO_BRANCH_FOLD=1` turns both off. Part of the translation, so the
 /// shader cache keys on it.
 pub fn fold_branches() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
