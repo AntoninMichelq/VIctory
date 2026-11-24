@@ -4378,6 +4378,22 @@ impl<'a> Lower<'a> {
             return Err("a per-lane descriptor loaded under a partial EXEC");
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        if matches!(li.fields, Fields::Buffer { .. }) {
+            // A buffer over the heap or a table: its address (the table's
+            // byte offset, or 0 for a heap) plus each lane's offset.
+            let c = self.cur;
+            let mut at = match self.user(a.param, 0) {
+                Val::I32(x) => x,
+                _ => return Err(WHY),
+            };
+            let k = self.s.m.i32(a.offset.wrapping_add(4 * u32::from(first)));
+            at = self.s.m.bin(c, Bin::Add, at, k);
+            if let Some(d) = self.dynamic_term(&a)? {
+                at = self.s.m.bin(c, Bin::Add, at, d);
+            }
+            let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+            return Ok(self.s.m.bin(c, Bin::LShr, at, shift));
+        }
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
             saddr,
@@ -8843,6 +8859,15 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn waterfall_loops_over_descriptors_from_buffer_loads_sample_with_each_lanes_own() {
+        let words = crate::resource::tests::waterfall_buffer_wave32();
+        let (layout, used) = texture_tables();
+        let l = lower_wave(&words, layout, used, false).unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+        assert!(!l.wave_ops);
     }
 
     #[test]

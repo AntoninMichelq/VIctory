@@ -186,7 +186,16 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                         descriptor(s, Role::Sampler)?;
                     }
                 }
-                Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
+                Fields::Buffer { rsrc, .. } => {
+                    descriptor(rsrc, Role::Resource)?;
+                    // Per-lane descriptors may be fetched from a buffer over
+                    // the heap (see `Tracer::fetched`).
+                    if inst.name().starts_with("buffer_load_dword")
+                        && let Ok(address) = t.buffer_address(inst)
+                    {
+                        out.scalar.push((site, address));
+                    }
+                }
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }
@@ -545,6 +554,66 @@ impl<'a> Tracer<'a> {
 
     /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
     /// pair.
+    /// The address a `buffer_load_dword*` reads in each lane, for a buffer
+    /// whose descriptor is built around an address (a heap or a table, say):
+    /// that address plus the VGPR offset (`offen`), `soffset` and the
+    /// immediate. None of indexed (`idxen`) or formatted loads.
+    fn buffer_address(&self, inst: &Inst) -> Result<Address, &'static str> {
+        const WHY: &str = "a descriptor read from the first lane of a buffer load";
+        let Fields::Buffer {
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format: None,
+            lds: false,
+            tfe: false,
+            ..
+        } = &inst.fields
+        else {
+            return Err(WHY);
+        };
+        if *idxen {
+            return Err(WHY);
+        }
+        let Source::Built { address, .. } = self.descriptor(inst, rsrc)? else {
+            return Err("a descriptor read from the first lane of a buffer of descriptors");
+        };
+        let mut terms = Vec::new();
+        if *offen {
+            let Operand::Vector { reg, .. } = *addr else {
+                return Err(WHY);
+            };
+            terms.push(self.vorigin(inst.read(Reg::V(reg)).ok_or(WHY)?));
+        }
+        match *soffset {
+            Operand::Scalar { code: NULL, .. } => {}
+            Operand::Scalar { code, .. } => {
+                terms.push(self.origin(inst.read(Reg::S(code)).ok_or(WHY)?))
+            }
+            Operand::Const(c) => terms.push(Term::Const(inline(c).ok_or(WHY)?)),
+            _ => return Err(WHY),
+        }
+        let mut a = address;
+        a.offset = a.offset.wrapping_add(u32::from(*offset));
+        for t in terms {
+            let s = self.sum(t);
+            if s.base.is_some() {
+                return Err(WHY);
+            }
+            a.offset = a.offset.wrapping_add(s.offset);
+            if let Some(d) = s.dynamic {
+                if a.dynamic.is_some() {
+                    return Err("an address with two computed terms");
+                }
+                a.dynamic = Some(d);
+            }
+        }
+        Ok(a)
+    }
+
     fn flat_address(
         &self,
         inst: &Inst,
@@ -1338,7 +1407,9 @@ impl<'a> Tracer<'a> {
             let Term::Value(v) = *w else { return None };
             let site = self.defs[v.0 as usize]?;
             let inst = self.inst(site);
-            if !inst.name().starts_with("global_load_dword") {
+            if !inst.name().starts_with("global_load_dword")
+                && !inst.name().starts_with("buffer_load_dword")
+            {
                 return None;
             }
             let k = inst
@@ -1353,6 +1424,9 @@ impl<'a> Tracer<'a> {
         };
         let address = |site: Site| {
             let inst = self.inst(site);
+            if matches!(inst.fields, Fields::Buffer { .. }) {
+                return self.buffer_address(inst);
+            }
             let Fields::Flat {
                 addr,
                 saddr,
@@ -2171,6 +2245,28 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
+    /// [`WATERFALL_FETCHED_WAVE32`] with each lane's descriptor read by
+    /// `buffer_load_dwordx4` (offen) through a buffer descriptor built
+    /// around the table at s0, in place of the global loads.
+    pub(crate) fn waterfall_buffer_wave32() -> Vec<u32> {
+        let mut words = vec![
+            0xBE98_0300, // s_mov_b32 s24, s0
+            0xBE99_0380, // s_mov_b32 s25, 0
+            0xBE9A_03C1, // s_mov_b32 s26, -1
+            0xBE9B_03FF,
+            0x3101_6FAC, // s_mov_b32 s27, 0x31016fac
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+            0xE038_1000,
+            0x8006_0401, // buffer_load_dwordx4 v[4:7], v1, s[24:27], 0 offen
+            0xE038_1010,
+            0x8006_0801, // buffer_load_dwordx4 v[8:11], v1, s[24:27], 0 offen offset:16
+        ];
+        words.extend_from_slice(&WATERFALL_FETCHED_WAVE32[9..]);
+        words
+    }
+
     /// [`WATERFALL_FETCHED_WAVE32`] in wave64: 64-bit lane masks.
     pub(crate) const WATERFALL_FETCHED_WAVE64: &[u32] = &[
         0xBE84_0300, // s_mov_b32 s4, s0
@@ -2539,6 +2635,23 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(offsets, [0, 0x20]);
+        assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_buffer_loads_over_a_table_are_fetched() {
+        let r = waterfall(&waterfall_buffer_wave32(), false).unwrap();
+        let image = &r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        let Source::Fetched { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0, false));
+        assert!(a.dynamic.is_some());
         assert_eq!(r.waterfall.compares.len(), 4);
     }
 
