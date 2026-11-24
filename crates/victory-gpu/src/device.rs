@@ -378,6 +378,48 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
 /// `ID3D12Device9` to `ID3D12Device11`, whose console layout is unknown.
 /// Every slot exists so that a call to one we have not written logs it.
+/// Device methods 0x1c8 and 0x218, unknown (Grand Theft Auto VI calls
+/// both): logs their first calls' arguments, and the words behind those
+/// that point into title memory, to learn what they are.
+extern "system" fn unknown_device_method<const SLOT: usize>(
+    _: This,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    let n = CALLS[usize::from(SLOT != 57)].fetch_add(1, Ordering::Relaxed);
+    if n < 12 {
+        let words = |p: u64| -> String {
+            #[cfg(windows)]
+            let readable = p >= 0x10000 && crate::texture::committed(p as *const u8, 64);
+            #[cfg(not(windows))]
+            let readable = false;
+            if !readable {
+                return String::new();
+            }
+            // SAFETY: 64 committed bytes.
+            let w = unsafe { (p as *const [u32; 16]).read_unaligned() };
+            format!(" [{}]", w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" "))
+        };
+        tracing::warn!(
+            slot = format_args!("{:#x}", SLOT * 8),
+            call = n,
+            "unknown device method args {a:#x}{} {b:#x}{} {c:#x}{} {d:#x}{} {e:#x} {f:#x}",
+            words(a),
+            words(b),
+            words(c),
+            words(d),
+        );
+    }
+    // As before: unknown, so not implemented.
+    E_NOTIMPL
+}
+
 static FUNCTIONS: Table<160> = {
     let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
     f[0] = query_interface as *const (); // 0x00
@@ -409,8 +451,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = unknown_device_method::<57> as *const (); // 0x1c8 unknown
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = unknown_device_method::<67> as *const (); // 0x218 unknown
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
