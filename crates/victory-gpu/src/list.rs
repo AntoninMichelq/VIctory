@@ -830,6 +830,16 @@ extern "system" fn copy_buffer_region(
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
+    // A host copy that leaves levels off (`crate::resource::mip_skip`)
+    // matches only another cut the same way.
+    let cut = crate::resource::skipped_mips(dst) != crate::resource::skipped_mips(src);
+    if cut {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy between textures whose host copies leave different levels off skipped (VICTORY_TEXTURE_HALF)")
+        });
+        return true;
+    }
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -952,7 +962,9 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        // Subresources and boxes name the title's levels; a host copy that
+        // leaves levels off has other ones (`crate::resource::mip_skip`).
+        if unlike(dst.resource, src.resource) || crate::resource::skipped_mips(dst.resource) > 0 {
             return;
         }
         let mut from = src;
@@ -1065,6 +1077,9 @@ fn read_back(
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
+    }
+    if crate::resource::skipped_mips(src.resource) > 0 {
+        return Err("a texture whose host copy leaves levels off (VICTORY_TEXTURE_HALF)");
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;

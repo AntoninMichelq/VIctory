@@ -1614,6 +1614,74 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Levels left off the top of the host copy of a texture described by
+/// `desc` (`VICTORY_TEXTURE_HALF=n`: n levels, so a quarter of the memory
+/// per level; off by default). Only for 2D textures the title fills
+/// (sampled, never written by the host) whose level 0 is at least
+/// `VICTORY_TEXTURE_HALF_MIN` texels (default 512) on its shorter side and
+/// that keep a level after the cut. An 8 GB card filled with the title's
+/// textures left thousands of those that shaders pick by index without a
+/// host copy (drawn black: the skin and clothes of characters).
+/// shortcut: a shader reading texels by coordinates (not sampling) reads
+/// the smaller level; copies to or from such a texture are dropped.
+#[cfg(windows)]
+pub(crate) fn mip_skip(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static CUT: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let (n, min) = *CUT.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_HALF")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0u32)
+            .min(4);
+        let min = std::env::var("VICTORY_TEXTURE_HALF_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512u64)
+            .max(16);
+        (n, min)
+    });
+    if n == 0 || desc.dimension != TEXTURE_2D || !fills(desc) || desc.sample_count > 1 {
+        return 0;
+    }
+    let (w, h) = (desc.width, u64::from(desc.height));
+    if w.min(h) < min {
+        return 0;
+    }
+    // Levels: 0 is the whole chain.
+    let full = 64 - w.max(h).leading_zeros();
+    let levels = if desc.mip_levels == 0 {
+        full
+    } else {
+        u32::from(desc.mip_levels)
+    };
+    if levels <= n {
+        return 0;
+    }
+    // Block formats keep whole blocks at the new level 0.
+    let Some((_, texels)) = element(desc.format) else {
+        return 0;
+    };
+    let unit = texels << n;
+    if w % unit != 0 || h % unit != 0 {
+        return 0;
+    }
+    n
+}
+
+/// Host textures made with levels left off ([`mip_skip`]).
+#[cfg(windows)]
+pub(crate) static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`mip_skip`] of title texture `this`.
+#[cfg(windows)]
+pub(crate) fn skipped_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    mip_skip(&resource(this).desc)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -1632,6 +1700,15 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    let skip = mip_skip(desc);
+    if skip > 0 {
+        d.width >>= skip;
+        d.height >>= skip;
+        if d.mip_levels != 0 {
+            d.mip_levels -= skip as u16;
+        }
+        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour

@@ -1405,6 +1405,44 @@ macro_rules! once {
     }};
 }
 
+/// Moves the levels a texture view names up by `skip`, for a host copy
+/// that leaves that many off the top (`crate::resource::mip_skip`): the
+/// first level and the lowest level of detail move up (to the new top at
+/// least), and the count shrinks by the levels cut off it.
+fn skip_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
+    let fix = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        let first = most.saturating_sub(skip);
+        if *levels != u32::MAX {
+            let end = most.saturating_add(*levels).saturating_sub(skip);
+            *levels = end.saturating_sub(first).max(1);
+        }
+        *most = first;
+        *clamp = (*clamp - skip as f32).max(0.0);
+    };
+    // SAFETY: the union member the view's dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                fix(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                fix(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                fix(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                fix(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -1934,6 +1972,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A host copy that starts some levels down: the view's
+                // levels move up with it.
+                let skip = crate::resource::skipped_mips(resource);
+                if skip > 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    skip_levels(d, skip);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
