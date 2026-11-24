@@ -514,6 +514,30 @@ impl State {
         Some(host.gpu_handle(first))
     }
 
+    /// A one-descriptor table holding a null raw SRV (reads return 0), for
+    /// pointer views whose address is null.
+    fn null_srv_table(&mut self) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let key = (std::ptr::from_ref(heap) as usize, 0, 0, 0);
+        let first = match self.root_srv_slots.get(&key) {
+            Some(&first) => first,
+            None => {
+                let first = host.dynamic(1)?;
+                self.dynamic.push((key.0, first, 1));
+                host.null_raw_srv_at(first);
+                self.root_srv_slots.insert(key, first);
+                first
+            }
+        };
+        Some(host.gpu_handle(first))
+    }
+
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
             .iter()
@@ -714,14 +738,40 @@ impl State {
                         }
                         bound_params |= 1u64 << param;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, ?kind, "a shader reads a root view the title did not set");
-                        return false;
+                    let pointer = slot >= victory_shader::emit::POINTER_SLOT
+                        && matches!(kind, RootView::Srv);
+                    let address = if pointer {
+                        // An address the program keeps in root constants.
+                        let index = u32::from(slot - victory_shader::emit::POINTER_SLOT);
+                        let word = |i: u32| {
+                            t.host
+                                .user_data
+                                .iter()
+                                .find(|u| u.index == i)
+                                .map(|u| self.user_value(compute, u.slot, u.root, u.dword))
+                        };
+                        let (Some(lo), Some(hi)) = (word(index), word(index + 1)) else {
+                            once!(slot, "a pointer view without its user data");
+                            return false;
+                        };
+                        u64::from(hi) << 32 | u64::from(lo)
+                    } else {
+                        let Some(Root::View(address)) =
+                            self.roots_ref(compute).get(usize::from(slot))
+                        else {
+                            once!(slot, ?kind, "a shader reads a root view the title did not set");
+                            return false;
+                        };
+                        *address
                     };
-                    let address = *address;
                     if kind == RootView::Srv && crate::pipeline::host::root_srv_tables() {
-                        let Some(table) = self.root_srv_table(list, address) else {
+                        let table = if pointer && address == 0 {
+                            // A null address the program tests before reading.
+                            self.null_srv_table()
+                        } else {
+                            self.root_srv_table(list, address)
+                        };
+                        let Some(table) = table else {
                             once!(
                                 slot,
                                 address = format_args!("{address:#x}"),
@@ -740,7 +790,12 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(gpu) = root_view(list, address, kind) else {
+                    // A null address the program tests before reading: any
+                    // buffer will do.
+                    let null = (pointer && address == 0)
+                        .then(|| list.scratch(256).map(|(gpu, _)| gpu))
+                        .flatten();
+                    let Some(gpu) = null.or_else(|| root_view(list, address, kind)) else {
                         once!(
                             slot,
                             ?kind,

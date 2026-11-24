@@ -550,6 +550,31 @@ impl HostHeap {
         };
     }
 
+    /// Slot `index` as a null raw buffer SRV: reads return 0.
+    pub(crate) fn null_raw_srv_at(&self, index: u32) {
+        self.keep(index, None);
+        self.set_stride(index, 0);
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 1,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(None, Some(&desc), self.cpu(index))
+        };
+    }
+
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a live shader-visible heap.

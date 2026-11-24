@@ -5328,12 +5328,13 @@ impl<'a> Lower<'a> {
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             if let Some(a) = self.scalar.get(&site).copied()
-                && self
-                    .x
-                    .native
-                    .layout
-                    .get(a.param)
-                    .is_some_and(|p| p.root == RootType::Descriptor)
+                && (crate::resource::pointer_user_data(a.param).is_some()
+                    || self
+                        .x
+                        .native
+                        .layout
+                        .get(a.param)
+                        .is_some_and(|p| p.root == RootType::Descriptor))
             {
                 return self.root_smem(inst, site, a);
             }
@@ -5510,9 +5511,10 @@ impl<'a> Lower<'a> {
             bits: 0,
             words: [0, 0],
         };
-        let srv = self
-            .used_kind(&src)
-            .is_some_and(|u| u.kind == ResourceType::Srv);
+        let srv = crate::resource::pointer_user_data(a.param).is_some()
+            || self
+                .used_kind(&src)
+                .is_some_and(|u| u.kind == ResourceType::Srv);
         let props = if srv { (11, 0) } else { (13, 0x1_0000) };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -6251,6 +6253,32 @@ impl<'a> Lower<'a> {
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::Built { address, .. }
+                if let Some(index) = crate::resource::pointer_user_data(address.param) =>
+            {
+                // An address in root constants: a root SRV the host binds
+                // at the address its two dwords hold, read as user data.
+                if props.0 != 11 {
+                    return Err("a write or typed view through an address in root constants");
+                }
+                let slot = u8::try_from(index)
+                    .ok()
+                    .filter(|&i| i < 128)
+                    .ok_or("an address in root constants past user data 127")?;
+                let layout = &self.x.native.layout;
+                let param = (0..layout.len())
+                    .find(|&i| {
+                        let r = layout[i];
+                        r.root == RootType::Constants
+                            && (u32::from(r.user_data)..u32::from(r.user_data) + r.sgprs)
+                                .contains(&index)
+                    })
+                    .ok_or("an address in root constants")?;
+                let dword = index - u32::from(layout[param].user_data);
+                let _ = self.user(param, dword);
+                let _ = self.user(param, dword + 1);
+                Ok(self.s.root_srv_handle(super::POINTER_SLOT + slot))
+            }
             Source::Built { address, .. } => {
                 let rp = *self
                     .x
@@ -13480,6 +13508,47 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// A 64-bit address kept in two dwords of root constants (s2:s3 of
+    /// constants s0..s3), read by global and scalar loads, with and without
+    /// a per-lane offset: a raw view the host binds at that address.
+    #[test]
+    fn addresses_in_root_constants_lower_to_pointer_views() {
+        let words = [
+            0x7E00_0202, // v_mov_b32_e32 v0, s2
+            0x7E02_0203, // v_mov_b32_e32 v1, s3
+            0xDC30_8004,
+            0x027D_0000, // global_load_dword v2, v[0:1], off offset:4
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xF400_0201,
+            0xFA00_0008, // s_load_dword s8, s[2:3], 0x8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E06_0208, // v_mov_b32_e32 v3, s8
+            0xD834_0004,
+            0x0000_0300, // ds_write_b32 v0, v3 offset:4
+            0x3408_0A82, // v_lshlrev_b32_e32 v4, 2, v5
+            0xD70F_6A06,
+            0x0002_0802, // v_add_co_u32 v6, vcc_lo, s2, v4
+            0xD528_6A07,
+            0x01A9_0003, // v_add_co_ci_u32_e64 v7, vcc_lo, s3, 0, vcc_lo
+            0xDC30_8000,
+            0x087D_0006, // global_load_dword v8, v[6:7], off
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0008,
+            0x0000_0800, // ds_write_b32 v0, v8 offset:8
+            S_ENDPGM,
+        ];
+        let mut constants = root(RootType::Constants, 0, 0);
+        constants.sgprs = 4;
+        let l = lower_with(&words, vec![constants], vec![]).unwrap();
+        // One view at user data 2 (its dwords 2 and 3 read as user data).
+        assert_eq!(l.root_srvs, [crate::emit::POINTER_SLOT + 2]);
+        let mut read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
+        read.sort_unstable();
+        assert_eq!(read, [2, 3]);
     }
 
     #[test]

@@ -121,6 +121,22 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, STRIDE_TABLE_SLOTS
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// The first register (`t<POINTER_SLOT + i>` in [`ROOT_CBV_SPACE`]) of the
+/// raw views of addresses programs keep in root constants: `i` is the
+/// user-data index of the address's low dword, which with the next one the
+/// shader also reads as user data ([`HostShader::user_data`]); the host
+/// binds a root SRV at the address they hold.
+pub const POINTER_SLOT: u8 = 128;
+
+/// Whether addresses kept in root constants become root SRVs
+/// ([`POINTER_SLOT`]); `VICTORY_NO_POINTER_VIEWS=1` turns it off (such
+/// programs then stop at "an address in an SGPR that is no root parameter",
+/// as before). Part of the translation, so the shader cache keys on it.
+pub fn pointer_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_NO_POINTER_VIEWS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Whether shaders may write or read through root UAVs (`VICTORY_ROOT_UAVS=1`).
 /// Off by default: a root view has no bounds checks on the host, and the
 /// first world run with them on an RX 7600 page-faulted the GPU 47 s in.
