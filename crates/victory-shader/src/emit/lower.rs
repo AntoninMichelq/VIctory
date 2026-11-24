@@ -273,6 +273,10 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// 16-bit elements travelling two per dword on the host too
+    /// ([`host_halves`]): element id (pixel inputs, or vertex or mesh
+    /// outputs) -> its channels on the console.
+    host_halves: HashMap<usize, u8>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -1225,6 +1229,48 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// Signatures whose 16-bit elements travel two per dword on the host too:
+/// the generic elements take at least this many scalars, which past the
+/// position is more than a mesh program of 128 vertices may output
+/// (D3D12's 32 KiB; the title's fire and decal pedestrian meshes take 66).
+const HOST_HALVES_SCALARS: u32 = 61;
+
+/// Declares each 16-bit generic element of a signature this large
+/// ([`HOST_HALVES_SCALARS`]) as uints holding two of its channels each
+/// (channel 2k low, 2k + 1 high), constant: the program before writes the
+/// halves, the pixel program interpolates them itself (`attributeAtVertex`).
+/// Decided on the signature alone, so the stages on both sides agree. The
+/// other generic elements of their registers go constant too (DXIL wants
+/// one mode per register). Returns element id -> channels on the console.
+fn host_halves(elements: &mut [SigElement]) -> HashMap<usize, u8> {
+    let scalars: u32 = elements
+        .iter()
+        .filter(|e| e.kind == 0 && e.row.is_some())
+        .map(|e| u32::from(e.cols))
+        .sum();
+    let mut out = HashMap::new();
+    if scalars < HOST_HALVES_SCALARS {
+        return out;
+    }
+    let mut rows = Vec::new();
+    for (id, e) in elements.iter_mut().enumerate() {
+        if !e.half || e.kind != 0 || e.row.is_none() {
+            continue;
+        }
+        out.insert(id, e.cols);
+        rows.extend(e.row);
+        e.cols = e.cols.div_ceil(2);
+        e.comp = 5;
+        e.half = false;
+    }
+    for e in elements.iter_mut() {
+        if e.kind == 0 && e.row.is_some_and(|r| rows.contains(&r)) {
+            e.interp = 1;
+        }
+    }
+    out
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1241,6 +1287,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let host_halves = if std::env::var_os("VICTORY_NO_HOST_HALVES").is_some() {
+            HashMap::new()
+        } else if x.native.stage == HwStage::Ps {
+            host_halves(&mut s.inputs)
+        } else {
+            host_halves(&mut s.outputs)
+        };
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1529,6 +1582,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            host_halves,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -2277,9 +2331,10 @@ impl<'a> Lower<'a> {
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
         self.s.inputs.iter().enumerate().find_map(|(id, e)| {
             let r = e.row?;
+            let cols = self.host_halves.get(&id).copied().unwrap_or(e.cols);
             // `then`, not `then_some`: the channel is only past `col` when
             // the condition holds.
-            (r == u32::from(row) && channel >= e.col && channel < e.col + e.cols)
+            (r == u32::from(row) && channel >= e.col && channel < e.col + cols)
                 .then(|| (id, channel - e.col))
         })
     }
@@ -8785,10 +8840,56 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Channel `col` of 16-bit input `id` travelling two per dword
+    /// ([`host_halves`]), evaluated as `eval` says from the three vertices'
+    /// dwords: a float.
+    fn host_half(&mut self, id: usize, col: u8, eval: Eval) -> Result<V, Why> {
+        self.s.inputs[id].interp = 1;
+        let at = |l: &mut Self, k: u8| -> V {
+            let v = l.vertex_input(id, col / 2, k);
+            let x = l.as_int(v);
+            let c = l.cur;
+            let x = if col % 2 == 1 {
+                let k16 = l.s.m.i32(16);
+                l.s.m.bin(c, Bin::LShr, x, k16)
+            } else {
+                x
+            };
+            let f32t = l.s.t.f32;
+            l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+        };
+        let v0 = at(self, 0);
+        let (p0, i, j) = match eval {
+            Eval::Mode(1) => return Ok(v0),
+            Eval::Mode(_) => return Err("a packed 16-bit input without its weights"),
+            Eval::Weights { p0, i, j } => (p0, i, j),
+        };
+        let c = self.cur;
+        let mut acc = p0.then_some(v0);
+        for (k, w) in [(1, i), (2, j)] {
+            let Some(w) = w else { continue };
+            let vk = at(self, k);
+            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            acc = Some(match acc {
+                Some(a) => self.fmad(w, d, a),
+                None => self.s.m.bin(c, Bin::Mul, w, d),
+            });
+        }
+        Ok(acc.unwrap_or_else(|| self.s.m.f32(0f32.to_bits())))
+    }
+
     /// Whether the program reads attribute row `row` per vertex (an
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
+        if self.s.pixel
+            && self
+                .host_halves
+                .keys()
+                .any(|&id| self.s.inputs[id].row == Some(u32::from(row)))
+        {
+            return true;
+        }
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
             Interp::Vertex { attribute, vertex } => {
@@ -8814,6 +8915,10 @@ impl<'a> Lower<'a> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        if self.host_halves.contains_key(&id) {
+            let x = self.host_half(id, col, eval)?;
+            return Ok(self.as_int(x));
+        }
         let mode = match eval {
             Eval::Mode(mode) => mode,
             Eval::Weights { .. } => 1,
@@ -10240,9 +10345,11 @@ impl<'a> Lower<'a> {
                     } else {
                         (!high).then_some((row, ch))
                     };
+                    let host_halves = &self.host_halves;
                     let found = src.and_then(|(r, c)| {
-                        outputs.iter().position(|o| {
-                            o.row == Some(u32::from(r)) && c >= o.col && c < o.col + o.cols
+                        outputs.iter().enumerate().position(|(id, o)| {
+                            let cols = host_halves.get(&id).copied().unwrap_or(o.cols);
+                            o.row == Some(u32::from(r)) && c >= o.col && c < o.col + cols
                         })
                     });
                     if let Some(id) = found {
@@ -10358,8 +10465,26 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Halves of outputs travelling two per dword ([`host_halves`]):
+        // (element, host channel) -> (low, high) f16 bits.
+        let mut packed: std::collections::BTreeMap<(usize, u8), [Option<V>; 2]> =
+            Default::default();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            if let Some(high) = half
+                && !primitive
+                && self.host_halves.contains_key(&id)
+            {
+                let c = self.cur;
+                if high {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let mask = self.s.m.i32(0xFFFF);
+                x = self.s.m.bin(c, Bin::And, x, mask);
+                packed.entry((id, col / 2)).or_default()[usize::from(col % 2)] = Some(x);
+                continue;
+            }
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -10404,6 +10529,27 @@ impl<'a> Lower<'a> {
                 opcode,
                 &args,
             );
+        }
+        for ((id, col), [lo, hi]) in packed {
+            let c = self.cur;
+            let z = self.s.m.i32(0);
+            let lo = lo.unwrap_or(z);
+            let hi = match hi {
+                Some(h) => {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::Shl, h, k16)
+                }
+                None => z,
+            };
+            let x = self.s.m.bin(c, Bin::Or, lo, hi);
+            elements(self, primitive)[id].usage |= 1 << col;
+            let mut args = vec![self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), x];
+            if mesh {
+                args.push(self.mesh_thread());
+            }
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, &format!("{name}.i32"), Attr::NoUnwind, void, opcode, &args);
         }
         self.end_guarded(at, &[]);
         Ok(())
@@ -10828,6 +10974,37 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn large_signatures_carry_16_bit_elements_two_per_dword() {
+        use super::super::container::SigElement;
+        use super::host_halves;
+        let el = |row, col, cols, half| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half,
+        };
+        // 15 full rows of 32-bit floats and one 16-bit row: 61 scalars.
+        let mut sig: Vec<SigElement> = (0..15).map(|r| el(r, 0, 4, false)).collect();
+        sig.push(el(15, 0, 1, false));
+        sig.push(el(16, 0, 3, true));
+        let small = sig[..15].to_vec();
+        let mut big = sig.clone();
+        let halves = host_halves(&mut big);
+        assert_eq!(halves, std::collections::HashMap::from([(16, 3)]));
+        assert_eq!((big[16].cols, big[16].comp, big[16].interp), (2, 5, 1));
+        assert_eq!(big[15], sig[15]);
+        let mut small2 = small.clone();
+        assert!(host_halves(&mut small2).is_empty());
+        assert_eq!(small2, small);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
