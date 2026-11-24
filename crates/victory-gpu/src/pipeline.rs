@@ -75,6 +75,36 @@ impl std::fmt::Debug for Shader {
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
+/// `VICTORY_SHADER_DUMP=<folder>` with `VICTORY_SHADER_HASHES=<hash,...>`
+/// (16 hex digits each): writes the container of each listed shader the
+/// title creates to `<folder>/<hash>.bin`, for `victory shader-info` to
+/// describe shaders no game file holds as such (diagnostics; stays local).
+fn dump(hash: &str, bytes: &[u8]) {
+    static SPEC: OnceLock<Option<(std::path::PathBuf, Vec<String>)>> = OnceLock::new();
+    let Some((dir, hashes)) = SPEC.get_or_init(|| {
+        let dir = std::env::var_os("VICTORY_SHADER_DUMP")?;
+        let hashes = std::env::var("VICTORY_SHADER_HASHES").ok()?;
+        let hashes: Vec<String> = hashes
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|h| !h.is_empty())
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
+        tracing::info!(count = hashes.len(), "VICTORY_SHADER_DUMP: dumping listed shaders");
+        Some((dir.into(), hashes))
+    }) else {
+        return;
+    };
+    if !hashes.iter().any(|h| h == hash) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(format!("{hash}.bin"));
+    match std::fs::write(&path, bytes) {
+        Ok(()) => tracing::info!(hash, path = %path.display(), "shader dumped"),
+        Err(e) => tracing::warn!(hash, %e, "shader not dumped"),
+    }
+}
+
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -82,6 +112,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            dump(&full.to_hex()[..16], bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
