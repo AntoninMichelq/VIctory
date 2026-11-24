@@ -935,9 +935,14 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
-            // What the shader stores through root views and raw addresses is
-            // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
+            // What the shader stores through raw addresses is copied back
+            // into title memory afterwards. Only flat and global stores
+            // reach it: a ray-tracing walker that reads structures by
+            // address and writes its results through views (every trace
+            // and shading program) does not have every numbered copy
+            // declared written and compared on the CPU (up to 4 s a frame
+            // with the builder on).
+            let writes = (t.raw_stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
