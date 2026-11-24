@@ -766,10 +766,40 @@ fn com_refs(buffer: &ID3D12Resource) -> u32 {
 /// viewing its buffer, and no GPU writes waiting to go back to title
 /// memory. Title memory then holds all it has: it can be made again.
 fn idle(shadow: &Arc<Shadow>) -> bool {
-    Arc::strong_count(shadow) == 1
-        && com_refs(&shadow.buffer) == 1
-        && shadow.pending.lock().is_ok_and(|p| p.is_empty())
-        && shadow.before.lock().is_ok_and(|b| b.snapshot.is_none())
+    use std::sync::atomic::Ordering::Relaxed;
+    let reason = if Arc::strong_count(shadow) != 1 {
+        0
+    } else if com_refs(&shadow.buffer) != 1 {
+        1
+    } else if !shadow.pending.lock().is_ok_and(|p| p.is_empty()) {
+        2
+    } else if !shadow.before.lock().is_ok_and(|b| b.snapshot.is_none()) {
+        3
+    } else {
+        return true;
+    };
+    LOOSE_HELD[reason].fetch_add(1, Relaxed);
+    false
+}
+
+/// At the last eviction: windows held by a list, by a descriptor slot, by
+/// GPU writes waiting, by a snapshot; and windows released so far.
+static LOOSE_HELD: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static LOOSE_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`LOOSE_HELD`] and [`LOOSE_RELEASED`] say, for the memory log.
+pub(crate) fn loose_eviction() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = LOOSE_HELD.each_ref().map(|a| a.load(Relaxed));
+    format!(
+        "loose released {}, held at last try: list {}, slot {}, gpu writes {}, snapshot {}",
+        LOOSE_RELEASED.load(Relaxed),
+        h[0],
+        h[1],
+        h[2],
+        h[3]
+    )
 }
 
 /// Releases the least recently used idle windows until those kept and
@@ -780,6 +810,9 @@ fn evict_loose(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, more: u64) {
     let kept = || crate::memstat::LOOSE.load(Relaxed);
     if kept() + more <= budget {
         return;
+    }
+    for held in &LOOSE_HELD {
+        held.store(0, Relaxed);
     }
     let mut idle: Vec<(u64, (u64, u64))> = map
         .iter()
@@ -795,6 +828,7 @@ fn evict_loose(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, more: u64) {
         if let Some(shadow) = map.remove(&key) {
             crate::memstat::sub(&crate::memstat::LOOSE, key.1);
             freed += key.1;
+            LOOSE_RELEASED.fetch_add(1, Relaxed);
             crate::host::retire(shadow);
         }
     }
