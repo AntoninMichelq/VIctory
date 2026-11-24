@@ -713,6 +713,65 @@ impl Module {
         }
     }
 
+    /// Instructions nothing uses and that do nothing else (arithmetic,
+    /// reads, and calls of functions that only read) are left out. The
+    /// lowering computes every register a console instruction writes, read
+    /// or not: in one 74k-instruction lighting program, over a quarter of
+    /// the instructions were unused, all of it work for the driver's
+    /// compiler.
+    pub fn drop_unused(&mut self) {
+        let mut live = vec![false; self.insts.len()];
+        let mut work: Vec<u32> = Vec::new();
+        let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                work.push(i);
+            }
+        };
+        for b in &self.blocks {
+            for &i in &b.body {
+                let pure = match &self.insts[i as usize].op {
+                    Op::Bin(..)
+                    | Op::Cast(..)
+                    | Op::Cmp(..)
+                    | Op::Select(..)
+                    | Op::Extract(..)
+                    | Op::Gep(..)
+                    | Op::Load(..)
+                    | Op::Alloca(..)
+                    | Op::Phi(..) => true,
+                    Op::Call(f, _) => matches!(
+                        self.funcs[*f as usize].attr,
+                        Some(Attr::ReadNone | Attr::ReadOnly)
+                    ),
+                    Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => false,
+                };
+                if !pure {
+                    mark(&mut live, &mut work, V::Inst(i));
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = b.term {
+                mark(&mut live, &mut work, c);
+            }
+        }
+        for m in &self.mds {
+            if let MdDef::Value(_, v) = m {
+                mark(&mut live, &mut work, *v);
+            }
+        }
+        while let Some(i) = work.pop() {
+            for_each_operand(&self.insts[i as usize].op, |v| {
+                mark(&mut live, &mut work, v)
+            });
+        }
+        for b in &mut self.blocks {
+            b.body.retain(|&i| live[i as usize]);
+            b.phis.retain(|&i| live[i as usize]);
+        }
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -1388,6 +1447,24 @@ mod tests {
         assert!(m.blocks[b2].body.is_empty());
         let V::Inst(p) = phi else { unreachable!() };
         assert!(matches!(&m.insts[p as usize].op, Op::Phi(inc) if inc == &vec![(x, b1)]));
+        let _ = m.write();
+    }
+
+    #[test]
+    fn unused_pure_instructions_are_dropped() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let b0 = m.new_block();
+        let p = m.alloca(b0, i32t);
+        let x = m.i32(3);
+        let unused = m.bin(b0, Bin::Add, x, x);
+        let used = m.bin(b0, Bin::Mul, x, x);
+        m.store(b0, p, used);
+        m.terminate(b0, Term::Ret);
+        m.drop_unused();
+        let V::Inst(u) = unused else { unreachable!() };
+        assert!(!m.blocks[b0].body.contains(&u));
+        assert_eq!(m.blocks[b0].body.len(), 3);
         let _ = m.write();
     }
 

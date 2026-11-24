@@ -706,6 +706,7 @@ impl Shader {
 
         if super::fold_branches() {
             self.m.fold_constant_branches();
+            self.m.drop_unused();
         }
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
