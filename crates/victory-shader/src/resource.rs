@@ -1825,6 +1825,18 @@ impl<'a> Tracer<'a> {
                 junk: what == NEITHER && constants && words.iter().all(plain),
             });
         };
+        // A dword that is only ever a float the program computes, on every
+        // path and per-lane pick: these words are no descriptor, whatever
+        // the other dwords hold.
+        if words.iter().any(|&w| self.varies(w) && self.computed_word(w)) {
+            if lane_debug() {
+                eprintln!("LANE junk joins={} words={}", joins.len(), self.describe_words(words));
+            }
+            return Err(Fail {
+                what: "a descriptor read from the first lane of computed VGPRs",
+                junk: true,
+            });
+        }
         if let Some(source) = self.lane_phi(words, joins)? {
             return Ok(source);
         }
