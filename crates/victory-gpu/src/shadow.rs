@@ -90,12 +90,20 @@ impl UnchangedPages {
         }
     }
 
-    #[cfg(test)]
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
-        let (start, end) = (self.start, self.end);
-        let unchanged = &mut self.pages[page - start / PAGE];
-        page_differs(unchanged, (start, end), address, current, before)
+        let unchanged = &mut self.pages[page - self.start / PAGE];
+        if *unchanged {
+            return false;
+        }
+        if current != before {
+            return true;
+        }
+        // A later range can touch bytes a partial comparison missed. At
+        // the edges, only bytes covered by the snapshot can be compared.
+        *unchanged = address == (page * PAGE).max(self.start)
+            && address + current.len() == ((page + 1) * PAGE).min(self.end);
+        false
     }
 
     fn clear(&mut self) {
@@ -415,6 +423,7 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
+                at += n;
             }
             give_back(title);
             // Pages made equal to title memory are current in the copy, so
@@ -731,6 +740,8 @@ fn allocate_buffer(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
         add(C::ShadowAllocationUs, started.elapsed().as_micros() as u64);
     }
     Some(allocation)
+}
+
 /// Loose windows copied, and the title memory they cover (less when
 /// windows overlap and copy the same bytes more than once).
 pub(crate) fn loose_cover() -> (usize, u64) {
