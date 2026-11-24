@@ -116,6 +116,21 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// CPU time (microseconds, summed over the recording threads) spent in
+/// draw, dispatch and indirect execution calls since the last
+/// [`take_recording_us`]: what recording costs per frame.
+static RECORDING_US: AtomicU64 = AtomicU64::new(0);
+
+/// Adds the time since `started` to the recording time.
+pub(crate) fn recorded(started: std::time::Instant) {
+    RECORDING_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Microseconds spent recording draws and dispatches since the last call.
+pub(crate) fn take_recording_us() -> u64 {
+    RECORDING_US.swap(0, Ordering::Relaxed)
+}
+
 /// Groups the host runs per dimension of a dispatch (and of a mesh
 /// dispatch). A count past it is undefined behaviour on the host; drivers
 /// may run it for seconds and reset the display driver.

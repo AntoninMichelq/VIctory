@@ -219,7 +219,9 @@ impl Shadow {
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Returns the bytes the snapshot was made of (0 if it held the range
+    /// already).
+    pub(crate) fn writing(&self, address: usize, len: usize) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -237,7 +239,7 @@ impl Shadow {
         if let Some((at, bytes)) = &*before
             && (*at, at + bytes.len()) == (start, end)
         {
-            return;
+            return 0;
         }
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
@@ -251,6 +253,7 @@ impl Shadow {
             None => grown.extend_from_slice(host(start, end)),
         }
         *before = Some((start, grown));
+        end - start
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
