@@ -316,6 +316,7 @@ impl Staging {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
+                near = crate::resource::alias_report(self.memory as u64),
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
