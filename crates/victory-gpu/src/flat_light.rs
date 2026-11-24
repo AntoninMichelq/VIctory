@@ -1,4 +1,4 @@
-//! `VICTORY_FLAT_LIGHT=<width>x<height>:<format>[:<n>[:<strength>[:<sky>]]]`:
+//! `VICTORY_FLAT_LIGHT=<width>x<height>:<format>[:<n>[:<strength>[:<sky>[:<reversed>]]]]`:
 //! a stand-in for lighting the title cannot do yet. At each present, the
 //! `n`-th texture of that size and DXGI format the frame rendered to or
 //! wrote (its G-buffer colours, say; first-use order, default 0) is added
@@ -6,7 +6,10 @@
 //! the bottom of the screen by `sky` (0 flat, 1 half as bright at the
 //! bottom; default 0.5). Surfaces the title's lighting leaves black then
 //! show their shapes and colours, under the lights the image already has.
-//! Frames without such a texture present as usual.
+//! With the frame's first depth buffer of that size, surfaces are also
+//! shaded by a light from above and to the right, with normals taken from
+//! the depth (as reversed depth unless `<reversed>` is 0), and outlined
+//! where the depth jumps. Frames without such a texture present as usual.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -17,7 +20,7 @@ use windows::core::s;
 use crate::host::{Host, HostList, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0))"
+#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0, numDescriptors=3), UAV(u0))"
 cbuffer Constants : register(b0) {
     uint W;
     uint H;
@@ -25,27 +28,60 @@ cbuffer Constants : register(b0) {
     uint AH;
     float K;
     float Sky;
+    uint HasDepth;
+    uint Reversed;
 };
 Texture2D<float4> Scene : register(t0);
 Texture2D<float4> Albedo : register(t1);
+Texture2D<float> Depth : register(t2);
 RWTexture2D<unorm float4> Out : register(u0);
+
+// Distance from the eye, up to a scale: depth is 1/z (reversed) or 1 - 1/z.
+float Distance(int2 p) {
+    p = clamp(p, int2(0, 0), int2(W - 1, H - 1));
+    float d = Depth.Load(int3(p, 0));
+    d = Reversed != 0 ? d : 1.0 - d;
+    return 1.0 / max(d, 1e-6);
+}
+
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= W || id.y >= H) {
         return;
     }
-    float3 lit = Scene.Load(int3(id.xy, 0)).rgb;
+    int2 p = int2(id.xy);
+    float3 lit = Scene.Load(int3(p, 0)).rgb;
     uint2 at = uint2(id.x * AW / W, id.y * AH / H);
     float3 colour = Albedo.Load(int3(at, 0)).rgb;
-    float shade = 1.0 - 0.5 * Sky * (float)id.y / (float)H;
-    Out[id.xy] = float4(saturate(lit + colour * K * shade), 1.0);
+    float light = 1.0 - 0.5 * Sky * (float)id.y / (float)H;
+    if (HasDepth != 0) {
+        float z = Distance(p);
+        float zl = Distance(p - int2(1, 0));
+        float zr = Distance(p + int2(1, 0));
+        float zu = Distance(p - int2(0, 1));
+        float zd = Distance(p + int2(0, 1));
+        // The smaller one-sided step: no false slope across an edge.
+        float dx = abs(zr - z) < abs(z - zl) ? zr - z : z - zl;
+        float dy = abs(zd - z) < abs(z - zu) ? zd - z : z - zu;
+        // A pixel's width at that distance (a 90 degree view, roughly).
+        float pixel = 2.0 * z / (float)H;
+        float3 n = normalize(float3(-dx / pixel, dy / pixel, 1.0));
+        float3 sun = normalize(float3(0.35, 0.8, 0.5));
+        float lambert = saturate(dot(n, sun));
+        float shade = 0.35 + 0.65 * lambert;
+        // Outlines where the distance jumps.
+        float jump = max(abs(zr - zl), abs(zd - zu)) / max(z, 1e-6);
+        shade *= 1.0 - 0.5 * saturate(jump * 10.0 - 0.5);
+        light *= shade;
+    }
+    Out[id.xy] = float4(saturate(lit + colour * K * light), 1.0);
 }
 "#;
 
-/// Strength and sky from the variable, past the target's spec.
-pub(crate) fn settings() -> (f32, f32) {
-    static SETTINGS: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+/// Strength, sky and reversed depth from the variable, past the target's spec.
+pub(crate) fn settings() -> (f32, f32, bool) {
+    static SETTINGS: std::sync::OnceLock<(f32, f32, bool)> = std::sync::OnceLock::new();
     *SETTINGS.get_or_init(|| {
         let v = std::env::var("VICTORY_FLAT_LIGHT").unwrap_or_default();
         let mut parts = v.split(':').skip(3);
@@ -57,7 +93,8 @@ pub(crate) fn settings() -> (f32, f32) {
         };
         let strength = next(0.8);
         let sky = next(0.5);
-        (strength, sky)
+        let reversed = next(1.0) != 0.0;
+        (strength, sky, reversed)
     })
 }
 
@@ -125,7 +162,7 @@ fn compile(host: &Host) -> windows::core::Result<Pass> {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: 3,
+                    NumDescriptors: 4,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })?;
@@ -159,6 +196,22 @@ fn readable(format: DXGI_FORMAT) -> DXGI_FORMAT {
     }
 }
 
+/// The SRV format of a depth buffer's depth, for formats the stand-in
+/// reads.
+pub(crate) fn depth_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format {
+        DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT | DXGI_FORMAT_R32G8X24_TYPELESS => {
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+        }
+        DXGI_FORMAT_D24_UNORM_S8_UINT | DXGI_FORMAT_R24G8_TYPELESS => {
+            DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+        }
+        DXGI_FORMAT_D16_UNORM | DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_UNORM,
+        _ => return None,
+    })
+}
+
 /// The title's image `scene` (in `scene_state`) plus `albedo` (in
 /// `albedo_state`), in a texture of ours left in UNORDERED_ACCESS; both
 /// inputs are back in their states when its list has run. `None` (once
@@ -169,6 +222,7 @@ pub(crate) fn compose(
     scene_state: u32,
     albedo: &ID3D12Resource,
     albedo_state: u32,
+    depth: Option<(&ID3D12Resource, u32)>,
 ) -> Option<ID3D12Resource> {
     let mut pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
     if pass.is_none() {
@@ -177,7 +231,7 @@ pub(crate) fn compose(
         }));
     }
     let p = pass.as_mut()?.as_mut().ok()?;
-    let (strength, sky) = settings();
+    let (strength, sky, reversed) = settings();
     // SAFETY: live resources; our heap, list and output.
     unsafe {
         let sd = scene.GetDesc();
@@ -243,15 +297,44 @@ pub(crate) fn compose(
                 at(i as u32),
             );
         }
-        host.device.CreateUnorderedAccessView(&out, None, None, at(2));
+        let tex2d = |format| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        let depth = depth.and_then(|(t, state)| {
+            let format = depth_format(t.GetDesc().Format)?;
+            Some((t, state, format))
+        });
+        match depth {
+            Some((t, _, format)) => {
+                host.device
+                    .CreateShaderResourceView(t, Some(&tex2d(format)), at(2));
+            }
+            // A null view: the shader does not read it.
+            None => host.device.CreateShaderResourceView(
+                None,
+                Some(&tex2d(DXGI_FORMAT_R32_FLOAT)),
+                at(2),
+            ),
+        }
+        host.device.CreateUnorderedAccessView(&out, None, None, at(3));
         p.list.reset();
         let l = &p.list.list;
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let moves: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES)> = [
-            (scene, D3D12_RESOURCE_STATES(scene_state as i32)),
-            (albedo, D3D12_RESOURCE_STATES(albedo_state as i32)),
+            Some((scene, D3D12_RESOURCE_STATES(scene_state as i32))),
+            Some((albedo, D3D12_RESOURCE_STATES(albedo_state as i32))),
+            depth.map(|(t, state, _)| (t, D3D12_RESOURCE_STATES(state as i32))),
         ]
         .into_iter()
+        .flatten()
         .filter(|&(_, s)| s != read && (s.0 & read.0) != read.0)
         .collect();
         let there: Vec<_> = moves.iter().map(|&(t, s)| transition(t, s, read)).collect();
@@ -261,8 +344,17 @@ pub(crate) fn compose(
         l.SetDescriptorHeaps(&[Some(p.heap.clone())]);
         l.SetComputeRootSignature(&p.root);
         l.SetPipelineState(&p.pso);
-        let constants = [w, h, aw, ah, strength.to_bits(), sky.to_bits()];
-        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        let constants = [
+            w,
+            h,
+            aw,
+            ah,
+            strength.to_bits(),
+            sky.to_bits(),
+            u32::from(depth.is_some()),
+            u32::from(reversed),
+        ];
+        l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, p.heap.GetGPUDescriptorHandleForHeapStart());
         l.Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
         let back: Vec<_> = moves.iter().map(|&(t, s)| transition(t, read, s)).collect();
