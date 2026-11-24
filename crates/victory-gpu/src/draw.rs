@@ -996,7 +996,7 @@ impl State {
     /// pipeline reads expanded into triangles, and the records rewritten
     /// for them, both on the GPU ([`crate::rects`]). Records before the
     /// pipeline is bound (it replaces it). `None` if this draw cannot be
-    /// expanded (indexed, unaligned, too many elements, no pipeline).
+    /// expanded, with the reason (indexed, unaligned, too many elements...).
     #[allow(clippy::type_complexity)]
     fn indirect_rectangles(
         &self,
@@ -1006,14 +1006,14 @@ impl State {
         arguments: u64,
         stride: u32,
         max: u32,
-    ) -> Option<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>)> {
+    ) -> Result<(ID3D12Resource, Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>), &'static str> {
         if kind != 0 {
-            return None;
+            return Err("indexed");
         }
-        let host = crate::host::host()?;
-        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let host = crate::host::host().ok_or("no host")?;
+        let p = crate::pipeline::host_pipeline(self.pipeline as This).ok_or("no host pipeline")?;
         if p.compute || p.mesh {
-            return None;
+            return Err("not a graphics pipeline");
         }
         let mut views = Vec::new();
         for slot in 0..32u32 {
@@ -1028,9 +1028,9 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             if v.address == 0 || v.size == 0 || v.stride == 0 {
-                return None;
+                return Err("no vertex buffer bound");
             }
-            let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
+            let shadow = crate::shadow::find(v.address, u64::from(v.size)).ok_or("vertices outside title buffers")?;
             shadow.refresh(list, v.address, u64::from(v.size));
             let (_, gpu, size) =
                 crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
@@ -1044,7 +1044,7 @@ impl State {
             ));
         }
         let records = crate::rects::records(list, host, &args.buffer, args.gpu(arguments), stride, max)?;
-        Some((records, views))
+        Ok((records, views))
     }
 
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -1111,13 +1111,13 @@ impl State {
         let mut rect_vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)> = Vec::new();
         if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
             match self.indirect_rectangles(list, kind, &args, arguments, stride, max) {
-                Some((a, views)) => {
+                Ok((a, views)) => {
                     rect_args = Some(a);
                     rect_vertices = views;
                 }
-                None => {
+                Err(_reason) => {
                     crate::indirect::done(list, &args.buffer);
-                    why("a rectangle list (not expanded: indexed, unaligned or unknown inputs)");
+                    why(&format!("a rectangle list not expanded: {_reason}"));
                     return false;
                 }
             }
