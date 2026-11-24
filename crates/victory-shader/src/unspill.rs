@@ -223,7 +223,6 @@ pub fn unspill(p: &mut Program, layout: &[RootParam], stage: HwStage) {
 #[cfg(test)]
 mod tests {
     use super::unspill;
-    use crate::ShaderError;
     use crate::native::{HwStage, RootParam, RootType};
     use crate::resource::track;
 
@@ -272,12 +271,13 @@ mod tests {
         ]);
         let layout = spilled_layout();
         let before = program(&words);
-        assert_eq!(
-            track(&before, &layout, HwStage::Cs).unwrap_err(),
-            ShaderError::Unsupported {
-                offset: 0x0c,
-                what: "an address in an SGPR that is no root parameter"
-            }
+        // Without unspilling, the loads chase pointers through the memory
+        // table.
+        let r = track(&before, &layout, HwStage::Cs).unwrap();
+        assert!(
+            r.scalar
+                .iter()
+                .all(|(_, a)| crate::resource::chase_values(a.param).is_some())
         );
         let mut p = before.clone();
         unspill(&mut p, &layout, HwStage::Cs);
