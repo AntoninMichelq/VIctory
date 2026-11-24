@@ -419,4 +419,35 @@ mod tests {
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
+
+    /// Rows go by register, then element order: a later element in an
+    /// earlier column of the same register stays behind (as the title's
+    /// TEXCOORD22 in columns 1-2 and COLOR0 in column 0 of one register).
+    #[test]
+    fn rows_of_one_register_keep_element_order() {
+        let el = |name: &str, row, col, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(
+            &[el("B", 1, 0, 4), el("TEXCOORD", 0, 1, 2), el("COLOR", 0, 0, 1)],
+            true,
+        );
+        let name_of = |row: usize| {
+            let at = u32::from_le_bytes(part[8 + 32 * row + 4..][..4].try_into().unwrap()) as usize;
+            part[at..].split(|&b| b == 0).next().unwrap().to_vec()
+        };
+        assert_eq!(
+            [name_of(0), name_of(1), name_of(2)],
+            [b"TEXCOORD".to_vec(), b"COLOR".to_vec(), b"B".to_vec()]
+        );
+    }
 }
