@@ -87,6 +87,7 @@ impl UnchangedPages {
         }
     }
 
+    #[cfg(test)]
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
         let unchanged = &mut self.pages[page - self.start / PAGE];
