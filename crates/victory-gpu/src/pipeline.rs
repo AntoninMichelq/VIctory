@@ -126,6 +126,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through a raw address (`flat_*` / `global_*`
+    /// stores and atomics, [`raw_stores`]): the only way its code reaches
+    /// title memory by address (`memory.rs`); true when its code is not known.
+    pub(crate) raw_stores: bool,
 }
 
 #[cfg(windows)]
@@ -184,6 +188,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +199,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        raw_stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -333,6 +343,28 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store through a raw 64-bit address: a
+/// flat or global store or atomic, or code that is not all known. Buffer
+/// stores go through descriptors and root views, which the host copies
+/// back on their own; only these reach title memory by address.
+#[cfg(windows)]
+fn raw_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
