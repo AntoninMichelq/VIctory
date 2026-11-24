@@ -1087,10 +1087,11 @@ pub(crate) mod tests {
             assert_eq!(word, 500);
         }
 
-        // A later fallback crossing into the watched allocation invalidates
-        // that page's generation without affecting the remaining pages.
-        assert_eq!(shadow.update(start + watched - 4, 8), 8);
-        assert_eq!(shadow.update(start, watched), PAGE);
+        // A later refresh crossing into the unwatched allocation is taken
+        // region by region: the watched part is asked (unchanged: nothing
+        // copied) and only the unwatched bytes are copied, so the watched
+        // pages stay current.
+        assert_eq!(shadow.update(start + watched - 4, 8), 4);
         assert_eq!(shadow.update(start, watched), 0);
     }
 }
