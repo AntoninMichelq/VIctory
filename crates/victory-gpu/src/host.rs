@@ -2958,13 +2958,24 @@ fn refresh_direct_srvs(
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::DirectSlots, slots as u64);
             let _ = slots;
-            for (shadow, start, end) in ranges.iter() {
-                copied += shadow.update(*start, end - start);
-                merged_count += 1;
-                #[cfg(feature = "diagnostics")]
-                {
-                    requested += end - start;
+            // Ranges come sorted by buffer, then address: each buffer's
+            // ranges are refreshed together (one write-watch ask).
+            let mut at = 0;
+            let mut group: Vec<(usize, usize)> = Vec::new();
+            while at < ranges.len() {
+                let shadow = &ranges[at].0;
+                group.clear();
+                while at < ranges.len() && Arc::ptr_eq(&ranges[at].0, shadow) {
+                    let (_, start, end) = &ranges[at];
+                    group.push((*start, *end));
+                    merged_count += 1;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        requested += end - start;
+                    }
+                    at += 1;
                 }
+                copied += shadow.update_many(&group);
             }
             held.push(ranges);
         }

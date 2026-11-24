@@ -519,6 +519,45 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// [`Shadow::update`] of several ranges of this buffer (sorted by
+    /// address), as indexed SRVs ask for them: one write-watch ask over
+    /// their span answers all of them, instead of one ask (journal lock,
+    /// lookups, answer list) per range; thousands per submission in the
+    /// world. Falls back to range by range where that cannot hold (shaders
+    /// writing the buffer, memory not known to be watched, a span the
+    /// watch cannot answer whole).
+    pub(crate) fn update_many(&self, ranges: &[(usize, usize)]) -> usize {
+        let each = || ranges.iter().map(|&(a, e)| self.update(a, e - a)).sum();
+        if ranges.len() < 2
+            || !batch_asks()
+            || self.watched.load(Ordering::Relaxed) != WATCHED
+            || !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        {
+            return each();
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0).max(start);
+        let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0).min(end);
+        if lo >= hi {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(lo, hi, false) else {
+            return each();
+        };
+        let mut bytes = 0;
+        for &(a, e) in ranges {
+            let (a, e) = (a.max(start), e.min(end));
+            if a >= e {
+                continue;
+            }
+            let first = written.partition_point(|&(page, _)| page < a / PAGE);
+            bytes += self.copy_stale(a, e, now, &written[first..]);
+        }
+        #[cfg(feature = "diagnostics")]
+        add(C::Checked, (hi - lo) as u64);
+        bytes
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
@@ -1048,6 +1087,13 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+/// Whether indexed SRV ranges of one buffer share one write-watch ask:
+/// `VICTORY_SRV_BATCH_ASK=0` turns it off.
+fn batch_asks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SRV_BATCH_ASK").map_or(true, |v| v.trim() != "0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,6 +1473,29 @@ mod tests {
             // SAFETY: allocated with VirtualAlloc in `new`.
             unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
         }
+    }
+
+    /// Several ranges of one buffer refreshed together: a write in one page
+    /// is copied once, unchanged pages are not.
+    #[test]
+    fn ranges_refreshed_together_copy_what_changed() {
+        let Some(t) = Watched::new() else {
+            return;
+        };
+        let (a, b) = (t.base + 16, t.base + PAGE + 16);
+        let ranges = [(a, a + 16), (b, b + 16)];
+        // SAFETY: inside the test's allocation.
+        unsafe { (b as *mut u32).write(7) };
+        // Never copied: both pages.
+        let first = t.shadow.update_many(&ranges);
+        assert_eq!(first, 2 * PAGE);
+        assert_eq!(t.shadow.update_many(&ranges), 0);
+        // SAFETY: inside the test's allocation.
+        unsafe { (b as *mut u32).write(9) };
+        assert_eq!(t.shadow.update_many(&ranges), PAGE);
+        // SAFETY: the copy's mapping covers the allocation.
+        let copied = unsafe { t.shadow.data.add(PAGE + 16).cast::<u32>().read() };
+        assert_eq!(copied, 9);
     }
 
     /// Small ranges in one page (as directly indexed SRVs ask for them): the
