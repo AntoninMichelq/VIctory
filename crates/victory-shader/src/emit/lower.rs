@@ -1183,6 +1183,12 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.s.pixel {
+            settle_position_mode(&mut self.s.inputs);
+            settle_row_modes(&mut self.s.inputs, true).map_err(|w| unsupported(0, w))?;
+        } else {
+            settle_row_modes(&mut self.s.outputs, false).map_err(|w| unsupported(0, w))?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2356,6 +2362,11 @@ impl<'a> Lower<'a> {
         }
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
+        }
+        // The console allows larger outputs than the host; the signatures
+        // link to the title's pixel shader, so none are dropped.
+        if mesh_output_bytes(&self.s.outputs, &self.s.prims, mesh) > MAX_MESH_OUTPUT_BYTES {
+            return Err("mesh outputs beyond the host's 32 KiB");
         }
         let e = self.s.entry;
         let void = self.s.t.void;
@@ -6386,8 +6397,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// interpolation with computed barycentrics, or P10 or P20), or the row
+    /// must be constant for another of its elements: then its elements are
+    /// declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
@@ -6395,7 +6407,49 @@ impl<'a> Lower<'a> {
                 attribute.row == row && vertex != 2 && self.interpolated(row)
             }
             Interp::Interpolated { .. } => false,
-        })
+        }) || self.constant_row(row)
+    }
+
+    /// Whether row `row` holds an element that must be constant (an
+    /// integer, `SV_IsFrontFace`, a provoking-vertex read) next to an
+    /// interpolated one. DXIL wants one interpolation mode per packed row,
+    /// and the row keeps the console's register (the stages link by it), so
+    /// its interpolated elements are weighed from their vertices instead.
+    fn constant_row(&self, row: u8) -> bool {
+        let interps = || {
+            self.x
+                .io
+                .interps
+                .iter()
+                .filter(move |(_, i)| match *i {
+                    Interp::Interpolated { attribute, .. }
+                    | Interp::Vertex { attribute, .. }
+                    | Interp::Weighted { attribute } => attribute.row == row,
+                })
+                .map(|(_, i)| i)
+        };
+        let interpolated = interps().any(|i| matches!(i, Interp::Interpolated { .. }));
+        if !interpolated {
+            return false;
+        }
+        let flat_read = interps().any(|i| matches!(i, Interp::Vertex { vertex: 2, .. }));
+        // The signature rows the hardware row carries (a second one for
+        // packed 16-bit pairs).
+        let rows: Vec<u32> = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs
+                .iter()
+                .filter(|i| i.row == row && i.fp16)
+                .map(|i| u32::from(i.row2))
+                .chain([u32::from(row)])
+                .collect(),
+            _ => vec![u32::from(row)],
+        };
+        let integer = self
+            .x
+            .inputs
+            .iter()
+            .any(|e| e.row.is_some_and(|r| rows.contains(&r)) && e.comp != 9);
+        flat_read || integer
     }
 
     /// Whether the program interpolates attribute row `row` (so the
@@ -6863,6 +6917,10 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The size's dimensions only: an array slice is undef.
+                let mut lc = [fu; 3];
+                let n = lod_dims(kind);
+                lc[..n].copy_from_slice(&cs[..n]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -6871,7 +6929,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lc[0], lc[1], lc[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -7901,6 +7959,97 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// The host's limit on a mesh shader's vertex plus primitive outputs
+/// (DXC's `kMaxMSOutputTotalBytes`).
+const MAX_MESH_OUTPUT_BYTES: u32 = 32768;
+
+/// A mesh shader's output size as the validator counts it: every element's
+/// components times the maximum vertex or primitive count, each rounded up
+/// to 32, four bytes each.
+fn mesh_output_bytes(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    mesh: super::shader::Mesh,
+) -> u32 {
+    let scalars = |els: &[SigElement], n: u32| -> u32 {
+        els.iter().map(|e| u32::from(e.cols)).sum::<u32>() * n.next_multiple_of(32)
+    };
+    4 * (scalars(outputs, mesh.max_vertices) + scalars(prims, mesh.max_primitives))
+}
+
+/// The coordinates `calculateLOD` takes for a texture of DXIL resource
+/// kind `kind` (DXC's `GetNumDimensionsForCalcLOD`): the size's dimensions,
+/// without an array slice. The validator wants the rest undef ("out of
+/// bound coord must be undef").
+fn lod_dims(kind: u32) -> usize {
+    match kind {
+        1 | 6 => 1,
+        2 | 7 => 2,
+        _ => 3,
+    }
+}
+
+/// Gives the elements of each packed row one interpolation mode, as DXIL
+/// requires ("interpolation mode that differs from another element packed
+/// into the same row"). Elements whose mode is fixed (pixel inputs that
+/// are read, integers and `SV_IsFrontFace`, which are constant, and the
+/// position) set the row's mode; the others, floats nobody reads (vertex
+/// outputs: any float), take it. Rows stay where the console put them:
+/// the host links stages by register. A pixel row read two ways is an
+/// error rather than a shader the validator rejects; `per_vertex` makes
+/// rows with a constant element constant beforehand.
+pub(super) fn settle_row_modes(elements: &mut [SigElement], pixel: bool) -> Result<(), Why> {
+    // Packed elements only: barycentrics, sample index and coverage are not.
+    let packed = |e: &SigElement| e.row.is_some() && !matches!(e.kind, 12 | 14 | 15 | 28 | 30);
+    let fixed = |e: &SigElement| e.comp != 9 || e.kind == 3 || (pixel && e.usage != 0);
+    let mut rows: Vec<u32> = elements
+        .iter()
+        .filter(|e| packed(e))
+        .filter_map(|e| e.row)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let in_row = |e: &SigElement| packed(e) && e.row == Some(row);
+        let mut modes: Vec<u8> = elements
+            .iter()
+            .filter(|e| in_row(e) && fixed(e))
+            .map(|e| e.interp)
+            .collect();
+        modes.sort_unstable();
+        modes.dedup();
+        let mode = match modes[..] {
+            [m] => m,
+            // Nothing fixed: the first element's.
+            [] => match elements.iter().find(|e| in_row(e)) {
+                Some(e) => e.interp,
+                None => continue,
+            },
+            _ if pixel => return Err("input elements of one row interpolated two ways"),
+            // Vertex outputs: the host interpolates by the pixel inputs' modes.
+            _ => continue,
+        };
+        for e in elements.iter_mut().filter(|e| in_row(e) && !fixed(e)) {
+            e.interp = mode;
+        }
+    }
+    Ok(())
+}
+
+/// A pixel program under conservative depth declares its position centroid
+/// (`emit`); one that runs per sample (an `SV_SampleIndex` input or a
+/// per-sample interpolation) declares it per sample instead.
+pub(super) fn settle_position_mode(inputs: &mut [SigElement]) {
+    let per_sample = inputs
+        .iter()
+        .any(|e| e.kind == 12 || matches!(e.interp, 6 | 7));
+    for e in inputs.iter_mut().filter(|e| e.kind == 3 && e.interp == 5) {
+        if per_sample {
+            e.interp = 7;
+        }
+    }
+}
+
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,
@@ -7923,6 +8072,51 @@ mod tests {
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Mesh output size as the validator counts it (53 programs were over
+    /// the limit; they now fail as unsupported).
+    #[test]
+    fn mesh_output_size_counts_aligned_maxima() {
+        let el = |cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let mesh = |max_vertices, max_primitives| crate::emit::shader::Mesh {
+            max_vertices,
+            max_primitives,
+            topology: 2,
+        };
+        // 4 + 4 columns of 64 vertices, 1 column of 126 primitives (128).
+        let size = super::mesh_output_bytes(&[el(4), el(4)], &[el(1)], mesh(64, 126));
+        assert_eq!(size, 4 * (8 * 64 + 128));
+        // 32 columns of 256 vertices: exactly the limit; one more is over.
+        let full: Vec<_> = (0..8).map(|_| el(4)).collect();
+        assert_eq!(
+            super::mesh_output_bytes(&full, &[], mesh(256, 1)),
+            super::MAX_MESH_OUTPUT_BYTES
+        );
+        assert!(
+            super::mesh_output_bytes(&full, &[el(1)], mesh(256, 1)) > super::MAX_MESH_OUTPUT_BYTES
+        );
+    }
+
+    /// `calculateLOD` takes the size's dimensions only, as DXC's
+    /// `GetNumDimensionsForCalcLOD` counts them: an array's slice
+    /// coordinate is left undef.
+    #[test]
+    fn level_queries_leave_the_array_slice_undef() {
+        // 1D, 2D, 3D, cube, 1D array, 2D array.
+        let dims: Vec<usize> = [1, 2, 4, 5, 6, 7].map(super::lod_dims).to_vec();
+        assert_eq!(dims, [1, 2, 3, 3, 1, 2]);
+    }
 
     /// VOP3 `op dst, a, b` (GFX10 encoding); `flags` are the clamp, op_sel
     /// and abs bits of the first dword.
