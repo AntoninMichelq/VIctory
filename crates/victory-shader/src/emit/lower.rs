@@ -5627,6 +5627,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(&(offset, dynamic)) = self.described.get(&site) {
+            return self.described_smem(inst, site, offset, dynamic);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             if let Some(a) = self.scalar.get(&site).copied()
                 && (crate::resource::pointer_user_data(a.param).is_some()
@@ -5798,6 +5801,60 @@ impl<'a> Lower<'a> {
     // shortcut: like the console's scalar loads, the host's root views are
     // not bounds-checked, so a read past the view's data is undefined on
     // both.
+    /// `s_load_dword*` at a buffer descriptor's own base (see
+    /// `Resources::described`): that buffer, read raw.
+    fn described_smem(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        offset: u32,
+        dynamic: Option<Value>,
+    ) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar memory read as data")?;
+        let src = self
+            .descriptors
+            .get(&(site, false))
+            .copied()
+            .ok_or("an untracked buffer")?;
+        let used = self.used_kind(src);
+        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+            return Err("a scalar load from a constant buffer's memory");
+        }
+        let u = if used.is_some_and(|u| u.kind == ResourceType::Uav) {
+            0x1000
+        } else {
+            0
+        };
+        let h = self.handle(site, src, false, (11 | u, 0))?;
+        let a = Address {
+            param: 0,
+            offset,
+            dynamic,
+            includes_base: false,
+        };
+        let c = self.cur;
+        let mut addr = self.s.m.i32(offset);
+        if let Some(d) = self.dynamic_term(&a)? {
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        let words = self.view_dwords(h, Some(0), addr, None, count);
+        for (k, x) in words.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
     fn root_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
@@ -14454,6 +14511,27 @@ mod tests {
         }];
         lower_with(
             crate::resource::tests::GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER,
+            layout,
+            used,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scalar_loads_at_a_descriptors_shifted_base_lower_to_its_buffer() {
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(
+            crate::resource::tests::SCALAR_LOAD_IN_A_DESCRIBED_BUFFER,
             layout,
             used,
         )

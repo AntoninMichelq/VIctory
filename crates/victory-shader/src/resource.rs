@@ -292,8 +292,23 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) => {
+                            let Some((source, sum)) = (inst.name().starts_with("s_load_"))
+                                .then(|| t.described_smem(inst, base, *offset, soffset))
+                                .flatten()
+                            else {
+                                return Err(fail(why));
+                            };
+                            out.descriptors.push(Descriptor {
+                                site,
+                                role: Role::Resource,
+                                source,
+                            });
+                            out.described.push((site, sum.offset, sum.dynamic));
+                        }
+                    }
                 }
                 Fields::Flat {
                     addr,
@@ -918,6 +933,105 @@ impl<'a> Tracer<'a> {
         };
         let (site, first) = self.loaded_dword(word0)?;
         if self.loaded_dword(word1)? != (site, first + 1) {
+            return None;
+        }
+        let load = self.inst(site);
+        if !matches!(load.fields, Fields::Smem { .. }) || !load.name().starts_with("s_load_dword") {
+            return None;
+        }
+        extra.offset = extra.offset.wrapping_add(k);
+        Some((
+            Source::Loaded {
+                load: site,
+                first: first as u8,
+            },
+            extra,
+        ))
+    }
+
+    /// A scalar load at a buffer descriptor's own base, the base cut to
+    /// 256 bytes with 64-bit shifts: `((d >> 8) << 8) | k` where `d` is
+    /// the descriptor's first two dwords (the high one masked to 16 bits).
+    /// shortcut: the base is taken to be 256-byte aligned.
+    fn described_smem(
+        &self,
+        inst: &Inst,
+        base: &Operand,
+        offset: i32,
+        soffset: &Operand,
+    ) -> Option<(Source, Sum)> {
+        let Operand::Scalar { code, .. } = *base else {
+            return None;
+        };
+        let lo = self.origin(inst.read(Reg::S(code))?);
+        let hi = self.origin(inst.read(Reg::S(code + 1))?);
+        let mut extra = self.sum(self.term(inst, soffset)?);
+        if extra.base.is_some() {
+            return None;
+        }
+        extra.offset = extra.offset.wrapping_add(offset as u32);
+        let Term::Value(v) = lo else { return None };
+        let (x, k) = match self.sop2(v, &["s_or_b32", "s_add_u32"]) {
+            Some((_, [Term::Value(x), Term::Const(k)] | [Term::Const(k), Term::Value(x)]))
+                if k < 0x100 =>
+            {
+                (x, k)
+            }
+            _ => (v, 0),
+        };
+        // `x` and `hi`: a 64-bit shift left by 8 of `{y, 0}`.
+        let shl = self.def(x)?;
+        if shl.name() != "s_lshl_b64"
+            || shl.writes.first()?.1 != x
+            || hi != Term::Value(shl.writes.get(1)?.1)
+        {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &shl.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code: s0, .. }, amount] = &src[..] else {
+            return None;
+        };
+        if self.term(shl, amount)? != Term::Const(8)
+            || self.origin(shl.read(Reg::S(s0 + 1))?) != Term::Const(0)
+        {
+            return None;
+        }
+        // `y`: the low half of a 64-bit shift right by 8 of the
+        // descriptor's first two dwords.
+        let Term::Value(y) = self.origin(shl.read(Reg::S(*s0))?) else {
+            return None;
+        };
+        let shr = self.def(y)?;
+        if shr.name() != "s_lshr_b64" || shr.writes.first()?.1 != y {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &shr.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code: s1, .. }, amount] = &src[..] else {
+            return None;
+        };
+        if self.term(shr, amount)? != Term::Const(8) {
+            return None;
+        }
+        let Term::Value(w0) = self.origin(shr.read(Reg::S(*s1))?) else {
+            return None;
+        };
+        let w1 = match self.origin(shr.read(Reg::S(s1 + 1))?) {
+            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [Term::Value(w), Term::Const(m)] | [Term::Const(m), Term::Value(w)]))
+                    if m & 0xff == 0xff =>
+                {
+                    w
+                }
+                _ => v,
+            },
+            Term::Const(_) => return None,
+        };
+        let (site, first) = self.loaded_dword(w0)?;
+        if self.loaded_dword(w1)? != (site, first + 1) {
             return None;
         }
         let load = self.inst(site);
@@ -3457,6 +3571,42 @@ pub(crate) mod tests {
         0x0000_0200, // ds_write_b32 v0, v2
         0xBF81_0000, // s_endpgm
     ];
+
+    /// A scalar load at a buffer descriptor's own base, cut to 256 bytes
+    /// with 64-bit shifts, plus 48 and an immediate 4.
+    pub(crate) const SCALAR_LOAD_IN_A_DESCRIBED_BUFFER: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x8709_FF09,
+        0x0000_FFFF, // s_and_b32 s9, s9, 0xffff
+        0x9086_8808, // s_lshr_b64 s[6:7], s[8:9], 8
+        0xBE82_0306, // s_mov_b32 s2, s6
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0x8F82_8802, // s_lshl_b64 s[2:3], s[2:3], 8
+        0x8802_B002, // s_or_b32 s2, s2, 48
+        0xF400_0301,
+        0xFA00_0004, // s_load_dword s12, s[2:3], 0x4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn scalar_loads_at_a_descriptors_shifted_base_read_its_buffer() {
+        let code: Vec<u8> = SCALAR_LOAD_IN_A_DESCRIBED_BUFFER
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (_, offset, dynamic) = r.described[0];
+        assert_eq!((offset, dynamic), (52, None));
+    }
 
     #[test]
     fn global_loads_at_a_descriptors_own_base_read_its_buffer() {
