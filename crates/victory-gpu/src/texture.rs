@@ -958,15 +958,10 @@ pub(crate) fn copy_alias(
             D3D12_RESOURCE_STATES(after),
         )
     };
-    if let Some((texture, before)) = list.transition_copy(from, COPY_SOURCE) {
-        let after = crate::host::legal_state(&texture, COPY_SOURCE);
-        let b = crate::host::transition(
-            &texture,
-            D3D12_RESOURCE_STATES(before as i32),
-            D3D12_RESOURCE_STATES(after as i32),
-        );
+    let barriers = list.transition_copy(from, COPY_SOURCE);
+    if !barriers.is_empty() {
         // SAFETY: an open list and a live texture.
-        unsafe { l.ResourceBarrier(&[b]) };
+        unsafe { l.ResourceBarrier(&barriers) };
     }
     crate::list::ensure_state(list, this, COPY_DEST);
     let location =
