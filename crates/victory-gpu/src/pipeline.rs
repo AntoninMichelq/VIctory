@@ -284,6 +284,20 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// The shaders of `this`, as the pipeline lines log them (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shaders_label(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".to_owned();
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| format!("{} {}", s.stage, s.hash))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Why a draw or dispatch of `this` has no host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn drop_reason(this: This) -> String {
@@ -720,7 +734,6 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
-
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample

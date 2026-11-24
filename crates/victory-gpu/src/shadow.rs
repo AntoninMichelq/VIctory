@@ -134,7 +134,8 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
     let n = title.len().min(host.len()).min(old.len());
     let words = n / 8;
     let mut changed = 0u64;
-    let rd = |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let rd =
+        |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
     for i in 0..words {
         let (t, h, o) = (rd(title, i), rd(host, i), rd(old, i));
         // 0xff in each byte where h != o, 0 elsewhere.
@@ -226,7 +227,8 @@ impl Shadow {
     #[cfg(test)]
     pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
         // SAFETY: inside the mapping; no submission runs while tests read.
-        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }
+            .to_vec()
     }
 
     #[cfg(test)]
@@ -910,7 +912,11 @@ fn idle(shadow: &Arc<Shadow>) -> bool {
         1
     } else if !shadow.pending.lock().is_ok_and(|p| p.is_empty()) {
         2
-    } else if !shadow.before.lock().is_ok_and(|b| b.pages.is_empty() && b.spans.is_empty()) {
+    } else if !shadow
+        .before
+        .lock()
+        .is_ok_and(|b| b.pages.is_empty() && b.spans.is_empty())
+    {
         3
     } else {
         return true;
@@ -1064,8 +1070,14 @@ mod tests {
         for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 1000] {
             for _ in 0..100 {
                 let old: Vec<u8> = (0..len).map(|_| next()).collect();
-                let host: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
-                let title: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let host: Vec<u8> = old
+                    .iter()
+                    .map(|&o| if next() == 0 { next() } else { o })
+                    .collect();
+                let title: Vec<u8> = old
+                    .iter()
+                    .map(|&o| if next() == 0 { next() } else { o })
+                    .collect();
                 let (mut t1, mut h1) = (title.clone(), host.clone());
                 let (mut t2, mut h2) = (title.clone(), host.clone());
                 let mut o1 = old.clone();
@@ -1218,7 +1230,6 @@ mod tests {
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
     }
-
 
     /// Three pages of title memory on page bounds (plain heap memory, so
     /// not write-watched: refreshes copy whole ranges) and their host

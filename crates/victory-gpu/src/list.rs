@@ -1136,8 +1136,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -1278,12 +1283,25 @@ extern "system" fn resolve_queries(
 /// Timestamps go through read-back memory and are put on the title's GPU
 /// clock after the submission (`Written::HostTimestamp`).
 #[cfg(windows)]
-fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *mut u8, bytes: u64) -> Vec<bool> {
+fn host_resolve(
+    this: This,
+    heap: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+    at: *mut u8,
+    bytes: u64,
+) -> Vec<bool> {
     use windows::Win32::Graphics::Direct3D12::*;
-    let (Some(list), Some(host)) = (host_list(this), crate::query::host(heap, kind, first, count)) else {
+    let (Some(list), Some(host)) = (
+        host_list(this),
+        crate::query::host(heap, kind, first, count),
+    ) else {
         return Vec::new();
     };
-    let measured: Vec<bool> = (first..first + count).map(|i| host.measured(i, kind)).collect();
+    let measured: Vec<bool> = (first..first + count)
+        .map(|i| host.measured(i, kind))
+        .collect();
     // Runs of measured queries: (first index from `first`, count).
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
@@ -1304,7 +1322,16 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
         for &(from, n) in &runs {
             // SAFETY: an open list, a live heap, a read-back buffer of `len`
             // bytes.
-            unsafe { list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &back, u64::from(from) * 8) };
+            unsafe {
+                list.list.ResolveQueryData(
+                    &host.heap,
+                    host_kind,
+                    first + from,
+                    n,
+                    &back,
+                    u64::from(from) * 8,
+                )
+            };
         }
         for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
             // SAFETY: both inside their buffers (`i < count`).
@@ -1315,7 +1342,9 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
     }
     let address = at as u64;
     // The host resolves to 8-byte aligned offsets only.
-    let Some(shadow) = crate::shadow::find(address, len).filter(|s| s.offset(address).is_multiple_of(8)) else {
+    let Some(shadow) =
+        crate::shadow::find(address, len).filter(|s| s.offset(address).is_multiple_of(8))
+    else {
         return Vec::new();
     };
     // Title memory first (the stand-in values and the bytes between
@@ -1334,7 +1363,14 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
     unsafe {
         for &(from, n) in &runs {
             let offset = to + u64::from(from) * bytes;
-            list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &shadow.buffer, offset);
+            list.list.ResolveQueryData(
+                &host.heap,
+                host_kind,
+                first + from,
+                n,
+                &shadow.buffer,
+                offset,
+            );
         }
     }
     measured
@@ -1402,7 +1438,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -1415,7 +1454,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1730,7 +1772,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state_timed(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1804,7 +1850,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -2047,10 +2094,18 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        assert!(
+            unsafe { &(*list.cast::<List>()).uploads }
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

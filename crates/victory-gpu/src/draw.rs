@@ -386,7 +386,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -540,7 +545,12 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
-        let key = (std::ptr::from_ref(heap) as usize, 0, 0, u64::from(uav) << 63);
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            0,
+            0,
+            u64::from(uav) << 63,
+        );
         let first = match self.root_srv_slots.get(&key) {
             Some(&first) => first,
             None => {
@@ -789,7 +799,11 @@ impl State {
                         let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(slot))
                         else {
-                            once!(slot, ?kind, "a shader reads a root view the title did not set");
+                            once!(
+                                slot,
+                                ?kind,
+                                "a shader reads a root view the title did not set"
+                            );
                             return false;
                         };
                         *address
@@ -1485,8 +1499,14 @@ impl State {
             shadow.refresh(list, v.address, u64::from(v.size));
             // The expansion binds the source as a root unordered-access view.
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
-            let (_, gpu, size) =
-                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            let (_, gpu, size) = crate::rects::vertices(
+                list,
+                host,
+                shadow.gpu(v.address),
+                u64::from(v.size),
+                v.stride,
+                &elements,
+            )?;
             views.push((
                 slot,
                 D3D12_VERTEX_BUFFER_VIEW {
@@ -1545,7 +1565,10 @@ impl State {
             let outcome = if ran {
                 "RUN".to_owned()
             } else if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
-                format!("DROPPED ({})", crate::pipeline::drop_reason(self.pipeline as This))
+                format!(
+                    "DROPPED ({})",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                )
             } else {
                 "DROPPED (see the why line above)".to_owned()
             };
@@ -1656,6 +1679,18 @@ impl State {
             count_arg,
             (kind, stride, max),
         ) else {
+            #[cfg(feature = "diagnostics")]
+            why(&format!(
+                "not bounded: stride {stride}, max {max}, arguments at +{:#x}{}, {} bytes; {}",
+                args.offset(arguments),
+                counter.as_ref().map_or(String::new(), |(s, at)| format!(
+                    ", count at +{:#x}",
+                    s.offset(*at)
+                )),
+                u64::from(stride) * u64::from(max),
+                crate::pipeline::shaders_label(self.pipeline as This)
+            ));
+            #[cfg(not(feature = "diagnostics"))]
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
@@ -1823,7 +1858,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                     crate::texture::upload(list, *resource as This, t);
                 }
             }
-            let mips = desc.as_ref().and_then(|d| crate::descriptor::host::srv_mips(t, d));
+            let mips = desc
+                .as_ref()
+                .and_then(|d| crate::descriptor::host::srv_mips(t, d));
             crate::list::ensure_mips(list, *resource as This, SHADER_RESOURCE, mips);
             #[cfg(feature = "diagnostics")]
             {
@@ -2166,7 +2203,16 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
+        let shader = victory_shader::emit::emit(
+            &c,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         (shader, used)
     }
 
