@@ -720,7 +720,7 @@ fn idle(shadow: &Arc<Shadow>) -> bool {
     Arc::strong_count(shadow) == 1
         && com_refs(&shadow.buffer) == 1
         && shadow.pending.lock().is_ok_and(|p| p.is_empty())
-        && shadow.before.lock().is_ok_and(|b| b.is_none())
+        && shadow.before.lock().is_ok_and(|b| b.snapshot.is_none())
 }
 
 /// Releases the least recently used idle windows until those kept and
