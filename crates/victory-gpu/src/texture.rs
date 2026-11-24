@@ -918,6 +918,12 @@ pub(crate) fn copy_alias(
     };
     // SAFETY: live resources.
     let (src, dst) = unsafe { (from.texture.GetDesc(), to.GetDesc()) };
+    // Depth and stencil formats copy one plane at a time, in their own
+    // plane formats: left alone.
+    let depth = |f: i32| matches!(f, 19..=22 | 40 | 44..=47 | 55 | 118..=120);
+    if depth(src.Format.0) || depth(dst.Format.0) || dst.MipLevels == 0 {
+        return false;
+    }
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a texture description and outputs for one subresource.
@@ -1002,7 +1008,8 @@ pub(crate) fn copy_alias(
             &location(&buffer, dst.Format),
             None,
         );
-        l.ResourceBarrier(&[buffer_state(COPY_SOURCE as i32, COPY_DEST as i32)]);
+        // Back to common, as it was before (and as each list expects).
+        l.ResourceBarrier(&[buffer_state(COPY_SOURCE as i32, 0)]);
     }
     list.keep(&buffer);
     list.keep(&from.texture);
