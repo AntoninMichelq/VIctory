@@ -1059,6 +1059,19 @@ impl Drop for HostTexture {
         crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
         crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
         // A submission recorded but not yet run may still name it.
+        #[cfg(feature = "diagnostics")]
+        if crate::host::dred_on() {
+            // SAFETY: a live resource.
+            let d = unsafe { self.texture.GetDesc() };
+            tracing::debug!(
+                at = ?windows::core::Interface::as_raw(&self.texture),
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                frame = crate::queue::presented(),
+                "host texture freed (retired)"
+            );
+        }
         crate::host::retire(self.texture.clone());
     }
 }
@@ -1220,9 +1233,16 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
+            // The host object's address too, which the "host texture
+            // freed" line names (a page fault "inside freed" then says
+            // which release freed it).
             format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
+                "texture {}x{} f{} flags {:#x} at {:?}",
+                d.width,
+                d.height,
+                d.format,
+                d.flags,
+                windows::core::Interface::as_raw(t)
             )
         });
     }
