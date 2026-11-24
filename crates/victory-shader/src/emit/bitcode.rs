@@ -279,6 +279,52 @@ impl Module {
         n
     }
 
+    /// Test builds: for each load from an element of the global `table`,
+    /// its block and the blocks of the `dx.op.waveReadLaneFirst` calls its
+    /// index is computed from (through arithmetic, compares, selects and
+    /// casts).
+    #[cfg(test)]
+    pub(crate) fn first_lane_reads_indexing(&self, table: V) -> Vec<(usize, Vec<usize>)> {
+        let block_of = |id: u32| self.blocks.iter().position(|b| b.body.contains(&id));
+        let mut out = Vec::new();
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &id in &block.body {
+                let Op::Load(V::Inst(ptr)) = self.insts[id as usize].op else {
+                    continue;
+                };
+                let Op::Gep(_, base, ref indices) = self.insts[ptr as usize].op else {
+                    continue;
+                };
+                if base != table {
+                    continue;
+                }
+                let mut calls = Vec::new();
+                let mut seen = Vec::new();
+                let mut work: Vec<V> = indices.clone();
+                while let Some(v) = work.pop() {
+                    let V::Inst(i) = v else { continue };
+                    if seen.contains(&i) {
+                        continue;
+                    }
+                    seen.push(i);
+                    match &self.insts[i as usize].op {
+                        Op::Bin(_, x, y) | Op::Cmp(_, x, y) => work.extend([*x, *y]),
+                        Op::Select(c, x, y) => work.extend([*c, *x, *y]),
+                        Op::Cast(_, x) => work.push(*x),
+                        Op::Call(f, _)
+                            if self.funcs[*f as usize].name == "dx.op.waveReadLaneFirst.i32" =>
+                        {
+                            calls.extend(block_of(i));
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((b, calls));
+            }
+        }
+        out
+    }
+
     pub fn void(&mut self) -> Ty {
         self.ty(TypeDef::Void)
     }

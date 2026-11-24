@@ -166,6 +166,13 @@ pub struct Resources {
     /// byte offset in that buffer and the computed term. The descriptor is
     /// in [`Resources::descriptors`] at the same site.
     pub described: Vec<(Site, u32, Option<Value>)>,
+    /// Computed terms ([`Address::dynamic`]) that are a
+    /// `v_readfirstlane_b32` result of an address made in VGPRs, and the
+    /// lane-local offset that address adds (the VGPRs, less the base and
+    /// constant the address names): the first active lane's offset, read
+    /// at that instruction under the EXEC there, serves the access. Only
+    /// where the result is not the offset itself.
+    pub first_lane_offsets: Vec<(Value, Value)>,
 }
 
 /// See [`Resources::first_lane`].
@@ -344,12 +351,46 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
         }
     }
     out.waterfall = waterfall;
+    out.first_lane_offsets = first_lane_offsets(&t, &out);
     out.waterfall.unset = t.unset.take();
     out.pointer_unset = t.pointer_unset.take();
     out.address_only = (0..layout.len())
         .filter(|&i| layout[i].root == RootType::Descriptor && address_only(p, &out, i))
         .collect();
     Ok(out)
+}
+
+/// The [`Resources::first_lane_offsets`] of the addresses in `out`: each
+/// computed term read from the first lane, and those its offset is in turn
+/// read from, whose result is not the offset alone.
+fn first_lane_offsets(t: &Tracer, out: &Resources) -> Vec<(Value, Value)> {
+    let read = t.first_lane_reads.borrow();
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => address.dynamic,
+            _ => None,
+        })
+    });
+    let used = out
+        .scalar
+        .iter()
+        .filter_map(|s| s.1.dynamic)
+        .chain(out.described.iter().filter_map(|d| d.2))
+        .chain(built);
+    let mut found: Vec<(Value, Value)> = Vec::new();
+    for mut v in used {
+        while let Some(&(_, offset, alone)) = read.iter().find(|r| r.0 == v) {
+            if found.iter().any(|f| f.0 == v) {
+                break;
+            }
+            if !alone {
+                found.push((v, offset));
+            }
+            v = offset;
+        }
+    }
+    found.sort_by_key(|f| f.0.0);
+    found
 }
 
 /// A per-lane trace that failed: why, and whether the dwords cannot be a
@@ -402,6 +443,11 @@ struct Tracer<'a> {
     unset: RefCell<Vec<Value>>,
     /// See [`Resources::pointer_unset`].
     pointer_unset: RefCell<Vec<Value>>,
+    /// Address sums through a `v_readfirstlane_b32` (see
+    /// [`Self::sum_uncached`]): the result, the lane-local computed term
+    /// of the sum of the VGPRs it reads, and whether the result is that
+    /// term alone (no base or constant with it).
+    first_lane_reads: RefCell<Vec<(Value, Value, bool)>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -451,6 +497,7 @@ impl<'a> Tracer<'a> {
             lane_joins: RefCell::new(Vec::new()),
             unset: RefCell::new(Vec::new()),
             pointer_unset: RefCell::new(Vec::new()),
+            first_lane_reads: RefCell::new(Vec::new()),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -564,7 +611,8 @@ impl<'a> Tracer<'a> {
 
     /// The VGPR term `t` reads the first lane of, if `t` is a
     /// `v_readfirstlane_b32` (an address made in VGPRs, then made uniform):
-    /// taken as that term, the same in every lane that gets here.
+    /// its base and constant are that term's; its computed term may differ
+    /// between lanes (see [`Self::sum_uncached`]).
     fn through_firstlane(&self, t: Term) -> Term {
         let Term::Value(v) = t else { return t };
         let Some(inst) = self.def(v) else { return t };
@@ -597,8 +645,23 @@ impl<'a> Tracer<'a> {
 
     fn sum_uncached(&self, t: Term) -> Sum {
         let through = self.through_firstlane(t);
-        if through != t {
-            return self.sum(through);
+        if let Term::Value(read) = t
+            && through != t
+        {
+            // The base and constant are the same in every lane; the
+            // computed term is the first active lane's, at the read (EXEC
+            // may name other lanes at the access): the result stands for
+            // it, and the lane-local term is kept to read it from the first
+            // lane there.
+            let mut s = self.sum(through);
+            if let Some(offset) = s.dynamic {
+                let alone = s.base.is_none() && s.offset == 0 && through == Term::Value(offset);
+                self.first_lane_reads
+                    .borrow_mut()
+                    .push((read, offset, alone));
+                s.dynamic = Some(read);
+            }
+            return s;
         }
         let v = match t {
             Term::Const(c) => {
@@ -960,9 +1023,14 @@ impl<'a> Tracer<'a> {
         }
         if s.base.is_none()
             && let Some(d) = s.dynamic
-            && self.phis[d.0 as usize].is_some()
         {
-            return self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi);
+            let pointer = self.lane_local(d);
+            if self.phis[pointer.0 as usize].is_some() {
+                let mut a =
+                    self.pointer_address(pointer, s.offset.wrapping_add(extra.offset), hi)?;
+                a.dynamic = Some(d);
+                return Ok(a);
+            }
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
@@ -1219,8 +1287,21 @@ impl<'a> Tracer<'a> {
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
     }
 
+    /// The lane-local computed term `d` is the first lane's value of (see
+    /// [`Self::sum_uncached`]), or `d`.
+    fn lane_local(&self, mut d: Value) -> Value {
+        let read = self.first_lane_reads.borrow();
+        for _ in 0..MAX_JOINS * 2 {
+            let Some(&(_, offset, _)) = read.iter().find(|r| r.0 == d) else {
+                break;
+            };
+            d = offset;
+        }
+        d
+    }
+
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
-        let Some(v) = dynamic else {
+        let Some(v) = dynamic.map(|d| self.lane_local(d)) else {
             return "a constant address";
         };
         if self.inputs[v.0 as usize].is_some() {
@@ -3309,6 +3390,60 @@ pub(crate) mod tests {
         let (_, a) = r.scalar[0];
         assert_eq!((a.param, a.offset), (CODE, 4 + 8));
         assert!(a.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_first_lane_read_of_an_address_stands_for_the_first_lanes_offset() {
+        let code: Vec<u8> = CODE_TABLE_THROUGH_FIRST_LANE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let written = |name: &str, reg: Reg| {
+            let inst = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.name() == name)
+                .unwrap();
+            inst.writes.iter().find(|w| w.0 == reg).unwrap().1
+        };
+        // The computed term is the read of the low dword (s8: base plus
+        // offset), which stands for the offset in v3 (the index times 4)
+        // of the first lane there.
+        let read = written("v_readfirstlane_b32", Reg::S(8));
+        assert_eq!(r.scalar[0].1.dynamic, Some(read));
+        assert_eq!(
+            r.first_lane_offsets,
+            [(read, written("v_lshlrev_b32", Reg::V(3)))]
+        );
+    }
+
+    #[test]
+    fn a_first_lane_read_of_an_offset_alone_is_that_offset() {
+        let words = [
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x7E10_0503, // v_readfirstlane_b32 s8, v3
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF400_0182,
+            0x1000_0000, // s_load_dword s6, s[4:5], s8
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs).unwrap();
+        let read = p.blocks[0].insts[1].writes[0].1;
+        assert_eq!(
+            r.scalar[0].1,
+            Address {
+                dynamic: Some(read),
+                ..at(0, 0)
+            }
+        );
+        // The read is the first lane's offset itself.
+        assert!(r.first_lane_offsets.is_empty());
     }
 
     /// A descriptor loaded into SGPRs (entry 0 of the table at s0) and
