@@ -26,6 +26,13 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    tracing::info!(
+        dir = %dir.display(),
+        cache_env = ?std::env::var_os("VICTORY_CACHE_DIR"),
+        cwd = ?std::env::current_dir().ok(),
+        pid = std::process::id(),
+        "shader cache folder"
+    );
     let _ = DIR.set(dir.clone());
     match Cache::open(dir) {
         Ok(cache) => {
@@ -107,7 +114,11 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
             }
             done
         }
-        None => translate(container),
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("no shader cache in this process: translating without one"));
+            translate(container)
+        }
     }
 }
 
@@ -160,8 +171,18 @@ fn log_miss(container: &[u8], target: Target) {
     }
     let index = INDEX.get_or_init(|| {
         let mut map = std::collections::HashMap::<String, Vec<(usize, String)>>::new();
-        let Some(dir) = DIR.get() else { return map };
-        let text = std::fs::read_to_string(index_path(dir)).unwrap_or_default();
+        let Some(dir) = DIR.get() else {
+            tracing::info!("shader warm-up index: no cache folder set in this process");
+            return map;
+        };
+        let path = index_path(dir);
+        let text = match std::fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                tracing::info!(path = %path.display(), error = %e, "shader warm-up index not read");
+                String::new()
+            }
+        };
         for line in text.lines() {
             let mut f = line.splitn(4, ' ');
             if let (Some(d), Some(len), Some(hash)) = (f.next(), f.next(), f.next())
@@ -170,7 +191,7 @@ fn log_miss(container: &[u8], target: Target) {
                 map.entry(d.to_owned()).or_default().push((len, hash.to_owned()));
             }
         }
-        tracing::info!(entries = map.len(), "shader warm-up index read");
+        tracing::info!(entries = map.len(), path = %index_path(dir).display(), "shader warm-up index read");
         map
     });
     let header = container
@@ -314,8 +335,12 @@ fn cached(
             } else {
                 (&HITS, "from the cache")
             };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            if n < 3 {
+                tracing::info!(path = %path.display(), "shader {what}");
+            } else {
+                tracing::debug!(path = %path.display(), "shader {what}");
+            }
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
