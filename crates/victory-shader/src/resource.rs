@@ -1807,7 +1807,6 @@ impl<'a> Tracer<'a> {
     /// [`Self::per_lane`], telling apart failures on dwords that cannot be
     /// a descriptor ([`Fail::junk`]).
     fn lane_source(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Source, Fail> {
-        let hard = |what| Fail { what, junk: false };
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
             // Constants with other scalars: no constant descriptor, and
             // nothing loaded or built either (failing here, not in a join
