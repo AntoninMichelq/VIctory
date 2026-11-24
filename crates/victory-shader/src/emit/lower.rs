@@ -2309,6 +2309,18 @@ impl<'a> Lower<'a> {
         if a.param == CODE {
             return Err("an address from a phi");
         }
+        // VGPRs the pointer's phis join before any write are undefined only
+        // if the hardware does not set them.
+        let io = &self.x.io.inputs;
+        if self
+            .x
+            .res
+            .pointer_unset
+            .iter()
+            .any(|u| io.iter().any(|i| i.0 == *u))
+        {
+            return Err("a pointer joined with a VGPR the hardware sets");
+        }
         let base = match self.user(a.param, 0) {
             Val::I32(x) => x,
             _ => return Err("an advanced pointer into a root descriptor"),
@@ -2330,6 +2342,11 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // An address only added to and accessed at: its accesses are
+            // the same at any value of it (`resource::address_only`).
+            RootType::Descriptor if self.x.res.address_only.contains(&param) => {
+                return Val::I32(self.s.m.i32(0));
+            }
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
@@ -11950,6 +11967,26 @@ mod tests {
     }
 
     #[test]
+    fn a_table_read_at_a_hash_of_a_loop_phi_lowers() {
+        // The root descriptor at s[2:3] plus an offset hashed from the
+        // generator state a loop phi carries.
+        let layout = vec![
+            root(RootType::Constants, 0, 0),
+            root(RootType::Constants, 1, 1),
+            root(RootType::Descriptor, 2, 2),
+        ];
+        let used = vec![root_view(ResourceType::Srv, 2, 2)];
+        let words = crate::resource::tests::RANDOM_TABLE_READ_WAVE32;
+        let l = lower_with(&words, layout.clone(), used.clone()).unwrap();
+        assert_eq!(l.root_srvs, vec![2]);
+        // Computed and loaded through in two regions, the address joined
+        // with what the VGPRs held before the loop.
+        let words = crate::resource::tests::RANDOM_TABLE_READ_SPLIT_WAVE32;
+        let l = lower_with(&words, layout, used).unwrap();
+        assert_eq!(l.root_srvs, vec![2]);
+    }
+
+    #[test]
     fn constants_loaded_from_a_root_view() {
         // Two dwords at byte 0x10 of the memory of a root descriptor (in
         // s[0:1]) read with s_load and branched on: read through the root
@@ -12608,9 +12645,9 @@ mod tests {
     #[test]
     fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
         // A root descriptor's address (s[0:1]) advanced in a loop and read
-        // through: its address is no value the translation has, so the
-        // offset from it is unknown.
-        let words = [
+        // through, and compared with what is read there: its address is no
+        // value the translation has, so the offset from it is unknown.
+        let mut words = [
             0xBE82_0300, // s_mov_b32 s2, s0
             0xBE83_0301, // s_mov_b32 s3, s1
             0xF400_0101,
@@ -12621,6 +12658,11 @@ mod tests {
             0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
             S_ENDPGM,
         ];
+        // Only added to and read at, the address is never seen: the offset
+        // from it is the pointer as if the address were 0.
+        lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
+        assert_eq!(words[6], 0xBF06_8004);
+        words[6] = 0xBF06_0204; // s_cmp_eq_u32 s4, s2
         let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
             .err()
             .unwrap();
