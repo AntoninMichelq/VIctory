@@ -69,6 +69,11 @@ fn build() -> &'static [u8; 32] {
         h.update(&spin.to_le_bytes());
         h.update(&[u8::from(victory_shader::emit::root_uavs())]);
         if let Some(list) = victory_shader::emit::root_uavs_only() {
+            tracing::warn!(
+                shaders = list.split(',').count(),
+                list,
+                "VICTORY_ROOT_UAVS_ONLY: root UAVs only for these shaders"
+            );
             h.update(b"root uavs only:");
             h.update(list.as_bytes());
         }
