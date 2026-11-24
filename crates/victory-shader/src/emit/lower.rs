@@ -8318,12 +8318,23 @@ impl<'a> Lower<'a> {
                 };
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
+                // A half no element of the signature holds: the stage
+                // before writes nothing there, and the console reads what
+                // the parameter memory had; 0 here (two pixel shaders of
+                // the world were dropped for it, 2026-11-24).
+                let zero = |l: &mut Self| l.s.m.f32(0f32.to_bits());
                 if name == "v_interp_p1ll_f16" {
                     // An f32 result from 16-bit vertex values.
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let f = match half(self, h)? {
+                        Some(f) => f,
+                        None => zero(self),
+                    };
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let f = match half(self, h)? {
+                        Some(f) => f,
+                        None => zero(self),
+                    };
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
