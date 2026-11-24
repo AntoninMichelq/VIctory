@@ -354,8 +354,10 @@ impl<'a> Tracer<'a> {
             dynamic: Some(v),
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
+            // A root constant is a number the code adds (a byte offset into
+            // a table, say), not a base.
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((i, 0)) if self.layout[i].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -369,6 +371,11 @@ impl<'a> Tracer<'a> {
                 offset: 0,
                 dynamic: None,
             };
+        }
+        if let Some((x, k)) = self.plus_const(v) {
+            let mut s = self.sum(x);
+            s.offset = s.offset.wrapping_add(k);
+            return s;
         }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
@@ -386,6 +393,27 @@ impl<'a> Tracer<'a> {
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
         }
+    }
+
+    /// `v` as another dword plus a constant: `s_addk_i32` (in place, a
+    /// sign-extended immediate) or `s_sub_u32`/`s_sub_i32` of a constant.
+    fn plus_const(&self, v: Value) -> Option<(Term, u32)> {
+        if let Some((_, [x, Term::Const(c)])) = self.sop2(v, &["s_sub_u32", "s_sub_i32"]) {
+            return Some((x, c.wrapping_neg()));
+        }
+        let inst = self.def(v)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            imm: Some(imm),
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        (inst.name() == "s_addk_i32" && inst.writes.first()?.1 == v).then_some((
+            self.origin(inst.read(Reg::S(code))?),
+            i32::from(imm as i16) as u32,
+        ))
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -540,12 +568,16 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// `hi` is `high` (0 for a table), possibly plus a carry or minus a
+    /// borrow.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+            ))
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_subb_u32"]).is_some_and(
+                |(_, [a, b])| a == want && b == Term::Const(0)
             ))
     }
 
@@ -1095,6 +1127,50 @@ mod tests {
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn root_constants_are_offsets_added_to_a_table() {
+        let r = track_words(
+            &[
+                0x8002_0409, // s_add_u32 s2, s9, s4
+                0xB782_0100, // s_addk_i32 s2, 0x100
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0101,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(Constants, 4, 1)],
+            HwStage::Ps,
+        );
+        let constant = r.params.iter().find(|p| p.1 == 1).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 3),
+                Address {
+                    param: 0,
+                    offset: 0x100,
+                    dynamic: Some(constant)
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn constants_subtracted_from_a_root_descriptor_borrow_from_its_high_half() {
+        let r = track_words(
+            &[
+                0x8080_900A, // s_sub_u32 s0, s10, 16
+                0x8281_800B, // s_subb_u32 s1, s11, 0
+                0xF400_0080,
+                0xFA00_0020, // s_load_dword s2, s[0:1], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x10))]);
     }
 
     #[test]
