@@ -1543,6 +1543,9 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let back = {
             let mut batch = Batch::default();
+            // Asks of the write watch in epochs (see `watch::begin_epoch`);
+            // our own title writes below end one and start the next.
+            crate::watch::begin_epoch();
             for list in runs {
                 let uploads = list.run_deferred(&mut batch);
                 firsts.push(lists.len());
@@ -1555,6 +1558,7 @@ impl Host {
             batch.copy_back
         };
         let _direct_srvs = refresh_direct_srvs(runs);
+        crate::watch::end_epoch();
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -2611,7 +2615,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::watch::end_epoch();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::watch::begin_epoch();
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -2633,10 +2639,15 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                    let run = matches!(step, Step::Run(_));
+                    if run {
                         batch.title_written();
+                        crate::watch::end_epoch();
                     }
                     work();
+                    if run {
+                        crate::watch::begin_epoch();
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -3285,7 +3296,7 @@ impl Meter {
         let [submissions, submit_us, wait_us] =
             [0, 1, 2].map(|i| SUBMITTING[i].swap(0, Ordering::Relaxed));
         let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
-        let [asks, ask_us] = crate::watch::take_asks();
+        let [asks, ask_us, kernel_asks] = crate::watch::take_asks();
         let recording_us = crate::draw::take_recording_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
@@ -3299,13 +3310,14 @@ impl Meter {
             );
             tracing::info!(
                 "frame CPU split: recording {:.1} ms; {:.1} submissions: preparing {cpu:.1} ms \
-                 (snapshots {:.1} ms for {:.1} MB declared, {:.0} write-watch asks {:.1} ms), submitting \
+                 (snapshots {:.1} ms for {:.1} MB declared, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms), submitting \
                  {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
                 per(recording_us, 1e3),
                 per(submissions, 1.0),
                 per(snapshot_us, 1e3),
                 per(snapshot_b, 1e6),
                 per(asks, 1.0),
+                per(kernel_asks, 1.0),
                 per(ask_us, 1e3),
                 per(submit_us, 1e3),
                 per(wait_us, 1e3),
