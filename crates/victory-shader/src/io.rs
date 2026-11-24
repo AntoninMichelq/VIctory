@@ -344,6 +344,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     };
     // Only a second interpolation half needs to trace SSA definitions.
     let mut halves = None;
+    // First halves, with their attributes.
+    let mut lone: Vec<(Site, Attribute)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -356,7 +358,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => lone.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -379,7 +381,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 // Only interpolation has an attribute as a VALU source.
                 Fields::Valu(v) if matches!(v.src.first(), Some(Operand::Attr { .. })) => {
                     match inst.name() {
-                        "v_interp_p1ll_f16" => {}
+                        "v_interp_p1ll_f16" => lone.push((site, attribute(inst, &v.src[0])?)),
                         "v_interp_p2_f16" => {
                             let attribute = attribute(inst, &v.src[0])?;
                             let read = |k: usize| match v.src.get(k) {
@@ -437,6 +439,16 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 _ => {}
             }
+        }
+    }
+    // A first half no second half completes (its P0 + i P10 read on its
+    // own): it evaluates as the hardware does.
+    for (site, attribute) in lone {
+        let paired = io.interps.iter().any(|(s, i)| {
+            *s == site || matches!(i, Interp::Interpolated { first, .. } if first.contains(&site))
+        });
+        if !paired {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -703,6 +715,25 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn a_first_half_read_on_its_own_evaluates_alone() {
+        // P0 + i P10 with no second half: v2 is exported as it is.
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0000_0202, // exp mrt0 v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute })]);
     }
 
     #[test]
