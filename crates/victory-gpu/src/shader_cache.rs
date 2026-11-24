@@ -69,6 +69,7 @@ fn build() -> &'static [u8; 32] {
         h.update(&spin.to_le_bytes());
         h.update(&[u8::from(victory_shader::emit::root_uavs())]);
         h.update(&[u8::from(victory_shader::emit::pointer_views())]);
+        h.update(&[u8::from(victory_shader::emit::fold_branches())]);
         *h.finalize().as_bytes()
     })
 }
