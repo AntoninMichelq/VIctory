@@ -144,7 +144,7 @@ impl GraphicsState {
         let (inputs, names) = unsafe { Self::copy_input_layout(desc.InputLayout) };
         let mut rt_formats = desc.RTVFormats;
         for f in &mut rt_formats {
-            f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+            f.0 = crate::resource::target_format(f.0 as u32) as i32;
         }
         let samples = if desc.SampleDesc.Count == 0 {
             DXGI_SAMPLE_DESC {

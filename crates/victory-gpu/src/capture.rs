@@ -287,7 +287,11 @@ fn note_present(resource: crate::object::This) {
     };
     // SAFETY: a live resource.
     let d = unsafe { copy.texture.GetDesc() };
-    if (d.Width, d.Height, d.Format.0) != (w, h, format)
+    // A format the host makes targets in a stand-in for (R9G9B9E5_SHAREDEXP
+    // as R16G16B16A16_FLOAT) matches its stand-in.
+    let stand_in = crate::resource::target_format(format as u32) as i32;
+    if (d.Width, d.Height) != (w, h)
+        || (d.Format.0 != format && d.Format.0 != stand_in)
         || d.SampleDesc.Count > 1
         || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
     {
@@ -464,7 +468,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        87..=93 => {
+        // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
+        87 | 88 | 90..=93 => {
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -473,7 +478,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        23..=25 => (
+        23..=25 | 89 => (
             4,
             Box::new(move |b| {
                 let v = u32_at(b, 0);
@@ -495,9 +500,13 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
                 ]
             }),
         ),
-        9..=11 => (
+        9..=10 => (
             8,
             Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))]),
+        ),
+        11..=14 => (
+            8,
+            Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i)))),
         ),
         33..=34 => (
             4,
@@ -685,5 +694,19 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
+    /// not B8G8R8A8.
+    #[test]
+    fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
+        // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
+        let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
+        assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
+        // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
+        let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
+        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
+        // B8G8R8A8 still swaps to RGBA.
+        assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
 }

@@ -228,8 +228,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        // Render target and depth views: a packed 16-bit target may be
-        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        // Render target and depth views: an R9G9B9E5_SHAREDEXP target is
+        // R16G16B16A16_FLOAT, a packed 16-bit one may be R8G8B8A8_UNORM on
+        // this GPU (`resource::target_format`).
         words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })

@@ -388,6 +388,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
+    // A target made in a stand-in format (R9G9B9E5_SHAREDEXP as
+    // R16G16B16A16_FLOAT): title memory holds texels of another size, which
+    // a raw detile would write as garbage over what the host rendered.
+    // shortcut: not converted; the host's contents stay.
+    if crate::resource::substituted(resource) {
+        once!(?desc, "contents of a texture made in a stand-in format not uploaded");
+        return None;
+    }
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
         once!(

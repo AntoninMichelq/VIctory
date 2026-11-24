@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -1035,6 +1035,40 @@ impl SubDword {
     }
 }
 
+/// The scalar instruction defining an SSA value in this block and its operands.
+fn scalar_def<'a, const N: usize>(
+    block: &'a Block,
+    value: Value,
+    op: &str,
+) -> Option<(&'a Inst, [Operand; N])> {
+    let inst = block
+        .insts
+        .iter()
+        .find(|i| i.writes.iter().any(|w| w.1 == value))?;
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    (inst.name() == op).then_some((inst, src.as_slice().try_into().ok()?))
+}
+
+fn sgpr_operand(inst: &Inst, operand: Operand) -> Option<Value> {
+    match operand {
+        Operand::Scalar {
+            code: code @ 0..=101,
+            dwords: 1,
+        } => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+fn scalar_constant(operand: Operand) -> Option<u32> {
+    match operand {
+        Operand::Const(code) => crate::resource::inline(code),
+        Operand::Literal(value) => Some(value),
+        _ => None,
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
@@ -1618,6 +1652,12 @@ impl<'a> Lower<'a> {
             };
             Some(self.handle((b, i), &src, false, (11 | u, 0))?)
         };
+        let (in_bounds, load_off) = if h.is_some() {
+            let (ok, safe) = self.bound_raw_offset(off);
+            (Some(ok), safe)
+        } else {
+            (None, off)
+        };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
@@ -1627,14 +1667,22 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        let zero = self.s.m.i32(0);
+        // In the block the value ends in: a 16-bit read may branch.
+        let bounded = |l: &mut Self, x: V| match in_bounds {
+            Some(ok) => l.s.m.select(l.cur, ok, x, zero),
+            None => x,
+        };
         if let Some((width, signed, half)) = sub {
-            let x = self.read_subword(off, width, signed, dword)?;
+            let x = self.read_subword(load_off, width, signed, dword)?;
+            let x = bounded(self, x);
             self.write_subword_result(inst, reg, x, half, guard)?;
         } else {
             for k in 0..n {
                 let four = self.s.m.i32(4 * k);
-                let at = self.s.m.bin(c, Bin::Add, off, four);
+                let at = self.s.m.bin(c, Bin::Add, load_off, four);
                 let x = dword(self, at)?;
+                let x = bounded(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
         }
@@ -3218,6 +3266,55 @@ impl<'a> Lower<'a> {
             _ => return Err("a result without a register"),
         }
         Ok(())
+    }
+
+    /// Keeps a raw buffer byte offset strictly below 2 GiB so multi-dword loads
+    /// and 32-bit offset additions cannot wrap past 4 GiB into unmapped GPU
+    /// memory (observed on NVIDIA / vkd3d-proton as an exact +0x1_0000_0000
+    /// ReadInvalid fault). Returns `(in_bounds, safe_offset)`.
+    fn bound_raw_offset(&mut self, off: V) -> (V, V) {
+        let c = self.cur;
+        let limit = self.s.m.i32(0x7FFF_FFC0);
+        let ok = self.s.m.cmp(c, pred::IULT, off, limit);
+        let zero = self.s.m.i32(0);
+        let safe = self.s.m.select(c, ok, off, zero);
+        (ok, safe)
+    }
+
+    /// Keeps a structured buffer `(index, off)` strictly below 2 GiB
+    /// (`index * stride + off + 16 < 2 GiB`) so 32-bit `index * stride`
+    /// cannot wrap modulo 4 GiB past robustness checks.
+    fn bound_structured(&mut self, index: V, off: V, stride: u32) -> (V, V, V) {
+        let c = self.cur;
+        let max_idx = (0x7000_0000u32 / stride.max(1)).max(1);
+        let idx_limit = self.s.m.i32(max_idx);
+        let off_limit = self.s.m.i32(0x0FFF_FFE0);
+        let idx_ok = self.s.m.cmp(c, pred::IULT, index, idx_limit);
+        let off_ok = self.s.m.cmp(c, pred::IULT, off, off_limit);
+        let ok = self.s.m.bin(c, Bin::And, idx_ok, off_ok);
+        let zero = self.s.m.i32(0);
+        let safe_idx = self.s.m.select(c, ok, index, zero);
+        let safe_off = self.s.m.select(c, ok, off, zero);
+        (ok, safe_idx, safe_off)
+    }
+
+    /// Keeps a typed buffer element index below 2^28.
+    fn bound_typed_index(&mut self, index: V) -> (V, V) {
+        let c = self.cur;
+        let limit = self.s.m.i32(0x1000_0000);
+        let ok = self.s.m.cmp(c, pred::IULT, index, limit);
+        let zero = self.s.m.i32(0);
+        let safe = self.s.m.select(c, ok, index, zero);
+        (ok, safe)
+    }
+
+    /// Combines an optional lane guard with a bounds predicate.
+    fn and_guard(&mut self, guard: Option<V>, ok: V) -> Option<V> {
+        let c = self.cur;
+        Some(match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, ok),
+            None => ok,
+        })
     }
 
     /// Starts code only the lanes where `guard` holds run (a store under a
@@ -5005,6 +5102,9 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut out = Vec::new();
         if let Some(stride) = raw {
+            // Below 2 GiB (`bound_raw_offset`): lanes past it read 0.
+            let (in_bounds, addr) = self.bound_raw_offset(addr);
+            let zero = self.s.m.i32(0);
             let not3 = self.s.m.i32(!3);
             let addr = self.s.m.bin(c, Bin::And, addr, not3);
             let st = (stride != 0).then(|| self.s.m.i32(stride));
@@ -5029,7 +5129,8 @@ impl<'a> Lower<'a> {
                     &[h, idx, elem_off, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
-                out.push(self.as_int(x));
+                let x = self.as_int(x);
+                out.push(self.s.m.select(c, in_bounds, x, zero));
             }
             return out;
         }
@@ -5566,6 +5667,8 @@ impl<'a> Lower<'a> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
+        let (in_bounds, safe_off) = self.bound_raw_offset(off);
+        let zero = self.s.m.i32(0);
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
@@ -5580,20 +5683,21 @@ impl<'a> Lower<'a> {
             (0..n)
                 .map(|k| {
                     let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
+                    let x = l.as_int(x);
+                    l.s.m.select(c, in_bounds, x, zero)
                 })
                 .collect()
         };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let at = self.s.m.bin(c, Bin::And, safe_off, not3);
             let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let byte = self.s.m.bin(c, Bin::And, safe_off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            load(self, safe_off, total / 32)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -10305,23 +10409,32 @@ impl<'a> Lower<'a> {
             let val = if wide { self.join64(vals[0], vals[1]) } else { vals[0] };
             let ty = self.s.m.type_of(val);
             let zero = self.s.m.int_const(ty, 0);
-            let (h, coords) = match index {
+            // Every address is kept below 2 GiB (`bound_raw_offset`,
+            // `bound_structured`); lanes past it do not access memory.
+            let (h, in_bounds, coords) = match index {
                 Some(index) => {
                     if stride >= 4 && stride.is_multiple_of(4) {
                         if wide && !stride.is_multiple_of(8) {
                             return Err("a 64-bit buffer atomic without an eight-byte-aligned stride");
                         }
                         let h = self.handle(site, src, false, (12 | u, stride))?;
-                        (h, [index, off, iu])
+                        let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
+                        (h, ok, [safe_idx, safe_off, iu])
                     } else {
                         if wide {
                             return Err("a 64-bit buffer atomic through a structured buffer of unknown stride");
                         }
                         let byte = self.runtime_stride_offset(src, index, off)?;
-                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        let (ok, safe) = self.bound_raw_offset(byte);
+                        (h, ok, [safe, iu, iu])
                     }
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (ok, safe) = self.bound_raw_offset(off);
+                    (h, ok, [safe, iu, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10335,6 +10448,7 @@ impl<'a> Lower<'a> {
             } else {
                 guard
             };
+            let active = self.and_guard(active, in_bounds);
             let at = self.begin_guarded(active);
             let r = if op == "cmpswap" {
                 // cmpswap: data is (new, compare).
@@ -10389,7 +10503,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
-            let (op, name) = if typed {
+            let (op, name, in_bounds) = if typed {
                 // shortcut: typed stores are taken to write a float format.
                 // The channels the opcode leaves out are written as 0: the
                 // validator has typed stores write all four.
@@ -10397,39 +10511,49 @@ impl<'a> Lower<'a> {
                     return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let idx = index.unwrap_or(self.s.m.i32(0));
+                let (ok, safe_idx) = self.bound_typed_index(idx);
+                args.extend([safe_idx, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
                 args.resize(3 + 4, self.s.m.f32(0));
-                (69, "bufferStore.f32")
+                (69, "bufferStore.f32", ok)
             } else {
-                match index {
+                let ok = match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride >= 4 && stride.is_multiple_of(4) {
                             args.push(self.handle(site, src, false, (12 | u, stride))?);
-                            args.extend([index, off]);
+                            let (ok, safe_idx, safe_off) =
+                                self.bound_structured(index, off, stride);
+                            args.extend([safe_idx, safe_off]);
+                            ok
                         } else {
                             let byte = self.runtime_stride_offset(src, index, off)?;
                             args.push(self.handle(site, src, false, (11 | u, 0))?);
-                            args.extend([byte, iu]);
+                            let (ok, safe) = self.bound_raw_offset(byte);
+                            args.extend([safe, iu]);
+                            ok
                         }
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
+                        let (ok, safe_off) = self.bound_raw_offset(off);
+                        args.extend([safe_off, iu]);
+                        ok
                     }
-                }
+                };
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
+                (140, "rawBufferStore.i32", ok)
             };
             args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let store_guard = self.and_guard(guard, in_bounds);
+            let at = self.begin_guarded(store_guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -10452,7 +10576,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let r = if typed {
+        let (r, in_bounds) = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
@@ -10461,59 +10585,53 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
+            let (ok, safe_idx) = self.bound_typed_index(index);
+            let r = self.s.op(
                 c,
                 "bufferLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 68,
-                &[h, index, iu],
-            )
+                &[h, safe_idx, iu],
+            );
+            (r, ok)
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            match index {
+            let (h, ok, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride >= 4 && stride.is_multiple_of(4) {
                         let h = self.handle(site, src, false, (12 | u, stride))?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, index, off, mask, align],
-                        )
+                        let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
+                        (h, ok, [safe_idx, safe_off])
                     } else {
                         let byte = self.runtime_stride_offset(src, index, off)?;
                         let h = self.handle(site, src, false, (11 | u, 0))?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, byte, iu, mask, align],
-                        )
+                        let (ok, safe) = self.bound_raw_offset(byte);
+                        (h, ok, [safe, iu])
                     }
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
+                    let (ok, safe_off) = self.bound_raw_offset(off);
+                    (h, ok, [safe_off, iu])
                 }
-            }
+            };
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, coords[0], coords[1], mask, align],
+            );
+            (r, ok)
         };
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        let zero = self.s.m.i32(0);
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
@@ -10533,13 +10651,15 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let x = self.s.m.select(c, in_bounds, x.expect("a channel"), zero);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = self.s.m.select(c, in_bounds, x, zero);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -11435,6 +11555,171 @@ impl<'a> Lower<'a> {
             })
     }
 
+    /// An unguarded indexed write replaces the incoming value before a
+    /// consumer can observe it, either on this edge or in a counted loop.
+    fn overwritten_movreld_edge(&self, b: usize, phi: &Phi, edge: usize) -> Option<()> {
+        let Reg::V(reg) = phi.reg else { return None };
+        let p = self.x.p;
+        let block = &p.blocks[b];
+        if self.sections.contains_key(&b)
+            || self.sections.contains_key(&block.preds[edge])
+            || p.blocks
+                .iter()
+                .flat_map(|bb| &bb.phis)
+                .any(|ph| ph.args.contains(&phi.value))
+        {
+            return None;
+        }
+        let mut uses = p.blocks.iter().enumerate().flat_map(|(bb, block)| {
+            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                inst.reads
+                    .iter()
+                    .any(|r| r.1 == phi.value)
+                    .then_some((bb, i, inst))
+            })
+        });
+        let (bb, i, mov) = uses.next()?;
+        if uses.next().is_some()
+            || bb != b
+            || self.x.st.guards[b][i].is_some()
+            || mov.name() != "v_movreld_b32"
+            || mov.read(phi.reg) != Some(phi.value)
+        {
+            return None;
+        }
+        let Fields::Valu(v) = &mov.fields else {
+            return None;
+        };
+        let (
+            Some(Operand::Vector {
+                reg: base,
+                dwords: 1,
+            }),
+            [
+                Operand::Vector {
+                    reg: src,
+                    dwords: 1,
+                },
+            ],
+        ) = (v.dst, v.src.as_slice())
+        else {
+            return None;
+        };
+        if v.dpp.is_some()
+            || v.sdwa.is_some()
+            || mov.read(Reg::V(*src))? == phi.value
+            || mov.write(phi.reg).is_none()
+        {
+            return None;
+        }
+        let index = u32::from(reg.checked_sub(base)?);
+        // Follow M0 to a copy of a scalar phi in this block, then the
+        // constant written on the corresponding predecessor.
+        let (copy, [src]) = scalar_def(block, mov.read(Reg::S(crate::ir::M0))?, "s_mov_b32")?;
+        let scalar = sgpr_operand(copy, src)?;
+        let index_phi = block.phis.iter().find(|ph| ph.value == scalar)?;
+        let (_, [initial]) = scalar_def(
+            &p.blocks[block.preds[edge]],
+            index_phi.args[edge],
+            "s_mov_b32",
+        )?;
+        let known = scalar_constant(initial)?;
+        if index == known {
+            return Some(());
+        }
+        if index < known {
+            return None; // Reaching this slot would require the index to wrap.
+        }
+        self.counted_movreld_index(b, edge, phi, index_phi, mov, index)
+    }
+
+    /// An unguarded move fills one more register on every iteration.
+    /// Values from before the loop can only survive in slots the index skips.
+    fn counted_movreld_index(
+        &self,
+        b: usize,
+        edge: usize,
+        phi: &Phi,
+        indices: &Phi,
+        mov: &Inst,
+        slot: u32,
+    ) -> Option<()> {
+        let p = self.x.p;
+        let st = self.x.st;
+        let block = &p.blocks[b];
+        let LaneExit::Branch {
+            when,
+            taken: latch,
+            not_taken: exit,
+        } = st.exits[b]
+        else {
+            return None;
+        };
+        let back = block.preds.iter().position(|&q| q == latch)?;
+        if block.preds.len() != 2
+            || back == edge
+            || b == latch
+            || b == exit
+            || exit == latch
+            || self.sections.contains_key(&latch)
+            || st.exits[latch] != LaneExit::Jump(b)
+            || p.blocks[latch].preds != [b]
+            || p.blocks[exit].preds != [b]
+            || st.exits[exit] != LaneExit::End
+            || self.rpo[b] >= self.rpo[latch]
+            || self.rpo[block.preds[edge]] >= self.rpo[b]
+        {
+            return None;
+        }
+        // The indexed result may only go around the loop as its own old
+        // value or be consumed in the normal exit block.
+        let result = mov.write(phi.reg)?;
+        if phi.args[back] != result {
+            return None;
+        }
+        for (bb, block) in p.blocks.iter().enumerate() {
+            if bb != exit
+                && block
+                    .insts
+                    .iter()
+                    .any(|inst| inst.reads.iter().any(|r| r.1 == result))
+            {
+                return None;
+            }
+            if block.phis.iter().any(|other| {
+                other
+                    .args
+                    .iter()
+                    .enumerate()
+                    .any(|(n, &arg)| arg == result && (other.value != phi.value || n != back))
+            }) {
+                return None;
+            }
+        }
+        // Follow the latch copy to the unit increment, then require that
+        // this very increment is compared for equality to the exit bound.
+        let (copy, [src]) = scalar_def(&p.blocks[latch], indices.args[back], "s_mov_b32")?;
+        let next = sgpr_operand(copy, src)?;
+        let (increment, [from, step]) = scalar_def(block, next, "s_add_i32")?;
+        if sgpr_operand(increment, from)? != indices.value || scalar_constant(step)? != 1 {
+            return None;
+        }
+        let (Atom::Uniform(scc), Bool::TRUE, Bool::FALSE) = st.bools.node(when)? else {
+            return None;
+        };
+        let branch = block.insts.last()?;
+        if branch.name() != "s_cbranch_scc0" || branch.read(Reg::Scc) != Some(scc) {
+            return None;
+        }
+        let (cmp, [tested, bound]) = scalar_def(block, scc, "s_cmp_eq_u32")?;
+        if sgpr_operand(cmp, tested)? != next {
+            return None;
+        }
+        let limit = scalar_constant(bound)?;
+        // The initial index is below this slot. The loop must pass it before exit.
+        (slot < limit).then_some(())
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         self.fill_paths().map_err(|w| unsupported(0, w))?;
         let p = self.x.p;
@@ -11477,6 +11762,14 @@ impl<'a> Lower<'a> {
                             ) =>
                     {
                         self.s.m.i32(0)
+                    }
+                    // An input the program overwrites before any use
+                    // (`overwritten_movreld_edge`): its value is not needed.
+                    (Some(Val::Missing(_)), false)
+                        if self.read_phis.contains(&phi.value)
+                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
