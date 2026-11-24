@@ -80,6 +80,12 @@ static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The number of the submission started last (the one being prepared or
+/// run: one runs at a time).
+pub(crate) fn submission() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
 /// submissions, so finishing the submissions running when it was retired
@@ -796,6 +802,7 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        crate::shadow::prune_kept(this_submission);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -2336,6 +2343,7 @@ impl Meter {
         let [submissions, submit_us, wait_us] =
             [0, 1, 2].map(|i| SUBMITTING[i].swap(0, Ordering::Relaxed));
         let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
+        let [reused_b, resynced_b] = crate::shadow::take_snapshot_stats();
         let [asks, ask_us, kernel_asks] = crate::watch::take_asks();
         let recording_us = crate::draw::take_recording_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
@@ -2350,12 +2358,15 @@ impl Meter {
             );
             tracing::info!(
                 "frame CPU split: recording {:.1} ms; {:.1} submissions: preparing {cpu:.1} ms \
-                 (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms), submitting \
+                 (snapshots {:.1} ms {:.1} MB, {:.1} MB kept from the submission before, {:.1} MB \
+                 re-synced after copy-back; {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms), submitting \
                  {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
                 per(recording_us, 1e3),
                 per(submissions, 1.0),
                 per(snapshot_us, 1e3),
                 per(snapshot_b, 1e6),
+                per(reused_b, 1e6),
+                per(resynced_b, 1e6),
                 per(asks, 1.0),
                 per(kernel_asks, 1.0),
                 per(ask_us, 1e3),

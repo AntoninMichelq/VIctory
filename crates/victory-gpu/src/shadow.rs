@@ -42,13 +42,77 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
+    /// Numbers the copy for [`KEPT`].
+    id: u64,
+    /// Bit per page (as `copied`): refreshed since the snapshot last looked
+    /// (its bytes there may be older than the copy's).
+    refreshed: Mutex<Vec<u64>>,
 }
 
 #[derive(Default)]
 struct Before {
-    snapshot: Option<(usize, Vec<u8>)>,
+    snapshot: Option<Snapshot>,
     unchanged: UnchangedPages,
+    /// Title pages copy-back made equal to title memory (the copy's bytes
+    /// changed) in this submission.
+    synced: Vec<usize>,
 }
+
+/// The copy's bytes before a submission, over whole title pages (cut to
+/// the buffer) from offset `at` on.
+struct Snapshot {
+    at: usize,
+    bytes: Vec<u8>,
+    /// Per title page from `at`'s on: the submission for which it holds the
+    /// copy's bytes (taken in it, or equal to the copy after the previous
+    /// one's copy-back).
+    ok: Vec<u64>,
+}
+
+/// Snapshots kept after a submission's copy-back for the next submission,
+/// by copy: where the copy did not change since, the next snapshot takes
+/// their bytes instead of the copy's (the world's ~40 submissions per
+/// frame snapshot the same big ranges, 1.9 GB per frame). Only the
+/// previous submission's are kept: a submission in between may have let
+/// the GPU write the copy.
+/// Entries: (copy's id, the submission it is for, snapshot).
+static KEPT: Mutex<Vec<(u64, u64, Snapshot)>> = Mutex::new(Vec::new());
+
+/// Before submission `now`: kept snapshots not for it go back to the pool.
+pub(crate) fn prune_kept(now: u64) {
+    let old: Vec<Snapshot> = {
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.iter().all(|&(_, of, _)| of == now) {
+            return;
+        }
+        let (keep, old): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *kept).into_iter().partition(|&(_, of, _)| of == now);
+        *kept = keep;
+        old.into_iter().map(|(_, _, s)| s).collect()
+    };
+    for s in old {
+        give_back(s.bytes);
+    }
+}
+
+/// Whether snapshots are kept across submissions; `VICTORY_KEEP_SNAPSHOTS=0`
+/// takes each submission's afresh.
+fn keep_snapshots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SNAPSHOTS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Since the last [`take_snapshot_stats`]: snapshot bytes taken from a
+/// kept snapshot instead of the copy, and bytes copied into kept snapshots
+/// after copy-back (pages it changed).
+static SNAPSHOT_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+pub(crate) fn take_snapshot_stats() -> [u64; 2] {
+    [0, 1].map(|i| SNAPSHOT_STATS[i].swap(0, Ordering::Relaxed))
+}
+
+static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Pages already compared in full against this submission's snapshot.
 #[derive(Default)]
@@ -259,6 +323,48 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            id: IDS.fetch_add(1, Ordering::Relaxed),
+            refreshed: Mutex::new(vec![0; (pages as usize).div_ceil(64)]),
+        }
+    }
+
+    /// The copy's offsets of title page `page` (cut to the buffer).
+    fn page_span(&self, page: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        ((page * PAGE).max(start) - start, ((page + 1) * PAGE).min(end) - start)
+    }
+
+    /// Notes copy offsets `[from, to)` refreshed: snapshots no longer hold
+    /// the copy's bytes there.
+    fn refreshed(&self, from: usize, to: usize) {
+        let base = self.start as usize / PAGE;
+        let start = self.start as usize;
+        let mut bits = self.refreshed.lock().unwrap_or_else(|e| e.into_inner());
+        for page in (start + from) / PAGE..(start + to).div_ceil(PAGE) {
+            let i = page - base;
+            bits[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    /// Takes the pages refreshed since the last call: `snapshot`'s bytes
+    /// there are no longer the copy's.
+    fn forget_refreshed(&self, mut snapshot: Option<&mut Snapshot>) {
+        let base = self.start as usize / PAGE;
+        let start = self.start as usize;
+        let mut bits = self.refreshed.lock().unwrap_or_else(|e| e.into_inner());
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut set = std::mem::take(word);
+            let Some(snapshot) = snapshot.as_mut() else {
+                continue;
+            };
+            let first = (start + snapshot.at) / PAGE;
+            while set != 0 {
+                let page = base + w * 64 + set.trailing_zeros() as usize;
+                set &= set - 1;
+                if let Some(ok) = page.checked_sub(first).and_then(|i| snapshot.ok.get_mut(i)) {
+                    *ok = 0;
+                }
+            }
         }
     }
 
@@ -288,8 +394,11 @@ impl Shadow {
     /// one snapshot per copy and submission, grown to cover every range the
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    /// Returns the bytes the snapshot was made of (0 if it held the range
+    /// ~2.3 million page faults per world frame). Whole title pages are
+    /// taken; pages the previous submission's snapshot still holds (see
+    /// [`KEPT`]) are not taken again, nor pages taken already in this
+    /// submission and not refreshed since.
+    /// Returns the bytes copied into the snapshot (0 if it held the range
     /// already).
     pub(crate) fn writing(&self, address: usize, len: usize) -> usize {
         self.pending
@@ -297,33 +406,83 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if from >= to {
+            return 0;
+        }
+        let start = self.start as usize;
+        // Whole title pages, cut to the buffer.
+        let lo = ((start + from) / PAGE * PAGE).max(start) - start;
+        let hi = (start + to).next_multiple_of(PAGE).min(start + self.len as usize) - start;
         // SAFETY: inside the mapping.
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let pages = |a: usize, b: usize| {
+            if a < b { (start + b).div_ceil(PAGE) - (start + a) / PAGE } else { 0 }
+        };
+        let now = crate::host::submission();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return 0;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        let mut from_kept = false;
+        if before.is_none() && keep_snapshots() {
+            // The previous submission's, if it is for this one.
+            let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = kept.iter().position(|&(id, of, _)| id == self.id && of == now) {
+                *before = Some(kept.swap_remove(i).2);
+                from_kept = true;
             }
-            None => grown.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
-        end - start
+        self.forget_refreshed(before.as_mut());
+        if from_kept && let Some(snapshot) = before.as_ref() {
+            // What the previous submission's snapshot still holds (for logs).
+            let held = snapshot.ok.iter().filter(|&&ok| ok == now).count();
+            SNAPSHOT_STATS[0].fetch_add((held * PAGE) as u64, Ordering::Relaxed);
+        }
+        let mut taken = 0;
+        let snapshot = match before {
+            Some(snapshot) => {
+                let (at, end) = (snapshot.at, snapshot.at + snapshot.bytes.len());
+                if lo < at || hi > end {
+                    // Parts newly covered from the copy, the rest as it was.
+                    let (lo, hi) = (lo.min(at), hi.max(end));
+                    let mut grown = pooled(hi - lo);
+                    grown.extend_from_slice(host(lo, at));
+                    grown.extend_from_slice(&snapshot.bytes);
+                    grown.extend_from_slice(host(end, hi));
+                    let mut ok = Vec::with_capacity(pages(lo, hi));
+                    ok.resize(pages(lo, at), now);
+                    ok.extend_from_slice(&snapshot.ok);
+                    ok.resize(ok.len() + pages(end, hi), now);
+                    give_back(std::mem::replace(&mut snapshot.bytes, grown));
+                    (snapshot.at, snapshot.ok) = (lo, ok);
+                    taken += hi - lo;
+                }
+                snapshot
+            }
+            None => {
+                let mut bytes = pooled(hi - lo);
+                bytes.extend_from_slice(host(lo, hi));
+                taken += hi - lo;
+                before.insert(Snapshot {
+                    at: lo,
+                    bytes,
+                    ok: vec![now; pages(lo, hi)],
+                })
+            }
+        };
+        // Pages the snapshot does not hold for this submission: from the copy.
+        let first = (start + snapshot.at) / PAGE;
+        for page in (start + lo) / PAGE..(start + hi).div_ceil(PAGE) {
+            let (a, b) = self.page_span(page);
+            let ok = &mut snapshot.ok[page - first];
+            if *ok == now {
+                continue;
+            }
+            *ok = now;
+            let at = snapshot.at;
+            snapshot.bytes[a - at..b - at].copy_from_slice(host(a, b));
+            taken += b - a;
+        }
+        taken
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -338,11 +497,16 @@ impl Shadow {
         let Before {
             snapshot,
             unchanged,
+            synced: synced_all,
         } = &mut *before;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some(Snapshot {
+            at: taken,
+            bytes: before,
+            ..
+        }) = &*snapshot
             && *taken <= from
             && to <= taken + before.len()
             && from < to
@@ -436,6 +600,7 @@ impl Shadow {
                     synced.extend(s);
                 }
             }
+            synced_all.extend_from_slice(&synced);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -457,12 +622,61 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
+            && let Some(snapshot) = snapshot.take()
         {
+            if keep_snapshots() {
+                self.keep(snapshot, unchanged, synced_all);
+            } else {
+                give_back(snapshot.bytes);
+            }
             unchanged.clear();
-            give_back(bytes);
+            synced_all.clear();
         }
         written
+    }
+
+    /// After the submission's last copy-back: keeps `snapshot` for the
+    /// next submission where it holds the copy's bytes now, i.e. pages
+    /// copy-back compared in full and found unchanged (it leaves those
+    /// alone), and pages it changed (`synced`), copied into it again.
+    /// Elsewhere (pages not compared in full) the GPU may have written the
+    /// copy unseen; those are taken again.
+    fn keep(&self, mut snapshot: Snapshot, unchanged: &UnchangedPages, synced: &mut Vec<usize>) {
+        let next = crate::host::submission() + 1;
+        let start = self.start as usize;
+        let first = (start + snapshot.at) / PAGE;
+        if !unchanged.pages.is_empty() {
+            let from = unchanged.start / PAGE;
+            for (k, &same) in unchanged.pages.iter().enumerate() {
+                if same
+                    && let Some(ok) = (from + k).checked_sub(first).and_then(|i| snapshot.ok.get_mut(i))
+                {
+                    *ok = next;
+                }
+            }
+        }
+        synced.sort_unstable();
+        synced.dedup();
+        let mut copied = 0;
+        for &page in synced.iter() {
+            let Some(i) = page.checked_sub(first).filter(|&i| i < snapshot.ok.len()) else {
+                continue;
+            };
+            let (a, b) = self.page_span(page);
+            let at = snapshot.at;
+            // SAFETY: inside the mapping; the submission has run.
+            let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+            snapshot.bytes[a - at..b - at].copy_from_slice(host);
+            snapshot.ok[i] = next;
+            copied += b - a;
+        }
+        SNAPSHOT_STATS[1].fetch_add(copied as u64, Ordering::Relaxed);
+        // Refreshes before now are in the copy the pages above were
+        // compared with.
+        self.forget_refreshed(None);
+        KEPT.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.id, next, snapshot));
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -567,6 +781,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.refreshed(from - start, to - start);
         to - from
     }
 }
