@@ -82,17 +82,17 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
-#[cfg(test)]
-mod memory_tests;
-#[cfg(all(test, windows))]
-mod image_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
-mod lds_tests;
+mod image_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+#[cfg(all(test, windows))]
+mod lds_tests;
 mod lower;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod opcode_audit;
 #[cfg(all(test, windows))]
@@ -116,7 +116,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, STRIDE_TABLE_SLOTS, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, STRIDE_TABLE_SLOTS, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -135,7 +137,12 @@ pub fn root_uavs() -> bool {
         _ => {
             let on = std::env::var("VICTORY_ROOT_UAVS").is_ok_and(|v| v.trim() == "1");
             // A test's forced value wins over the variable.
-            let _ = ROOT_UAVS.compare_exchange(0, 1 + u8::from(on), Ordering::Relaxed, Ordering::Relaxed);
+            let _ = ROOT_UAVS.compare_exchange(
+                0,
+                1 + u8::from(on),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             ROOT_UAVS.load(Ordering::Relaxed) == 2
         }
     }
@@ -387,9 +394,7 @@ fn emit_program(
     // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) require centroid or sample
     // interpolation on `SV_Position`.
     let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
-    let psv_modes = c
-        .part(FourCC::PSV0)
-        .and_then(|p| psv_interp(p.data, pixel));
+    let psv_modes = c.part(FourCC::PSV0).and_then(|p| psv_interp(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated.iter_mut() {
         e.interp = match (e.kind, e.comp) {
@@ -409,9 +414,9 @@ fn emit_program(
             _ => 0,
         };
         if let Some(modes) = &psv_modes
-            && let Some(&(_, _, _, m)) = modes
-                .iter()
-                .find(|&&(row, col, kind, m)| row == e.row && col == e.col && kind == e.kind && m != 0)
+            && let Some(&(_, _, _, m)) = modes.iter().find(|&&(row, col, kind, m)| {
+                row == e.row && col == e.col && kind == e.kind && m != 0
+            })
         {
             e.interp = if e.kind == 3 && conservative_depth && m == 4 {
                 5
@@ -1151,7 +1156,8 @@ mod tests {
             let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let out = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+            let out =
+                super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
@@ -2165,6 +2171,45 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    /// A primitive-ordered (POPS) section: the program reads the collision
+    /// SGPR (s2 here, an input no parameter names), sets the POPS packer,
+    /// compares `src_pops_exiting_wave_id` and sleeps until it may enter.
+    /// The host enters at once: the collision SGPR reads zero and the
+    /// program translates. Without the POPS instructions, reading s2 stays
+    /// "a hardware SGPR input".
+    #[test]
+    fn a_pops_section_is_entered_at_once() {
+        let pops = |setreg: bool, exiting: bool| -> Vec<u32> {
+            let mut w = vec![
+                0x9381_FF02,
+                0x0002_001C, // s_bfe_u32 s1, s2, 0x2001c
+                0x9000_9F02, // s_lshr_b32 s0, s2, 31
+                0x8F01_8101, // s_lshl_b32 s1, s1, 1
+            ];
+            if setreg {
+                w.push(0xB981_1019); // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
+            }
+            w.extend([
+                // s_add_i32 s3, src_pops_exiting_wave_id (or s4), s0
+                if exiting { 0x8103_00EF } else { 0x8103_0004 },
+                0xBF06_8003, // s_cmp_eq_u32 s3, 0
+                0xBF85_0001, // s_cbranch_scc1 +1
+                0xBF8E_0001, // s_sleep 1
+            ]);
+            w.extend(exp_mrt0(0));
+            w.extend([0xBF90_0007, 0xBF81_0000]); // s_sendmsg MSG_ORDERED_PS_DONE; s_endpgm
+            w
+        };
+        let s = pixel(&pops(true, true), PERSP_CENTER).unwrap();
+        validate(&s);
+        let s = pixel(&pops(false, true), PERSP_CENTER).unwrap();
+        validate(&s);
+        let e = pixel(&pops(false, false), PERSP_CENTER)
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("hardware SGPR input"), "{e}");
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
@@ -3127,7 +3172,8 @@ mod pr306_tests {
         let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let emitted = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+        let emitted =
+            super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
 
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(

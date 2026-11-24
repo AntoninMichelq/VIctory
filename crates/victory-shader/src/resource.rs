@@ -571,11 +571,10 @@ impl<'a> Tracer<'a> {
         if inst.name() != "v_readfirstlane_b32" {
             return t;
         }
-        let Fields::Valu(f) = &inst.fields else { return t };
-        f.src
-            .first()
-            .and_then(|o| self.vterm(inst, o))
-            .unwrap_or(t)
+        let Fields::Valu(f) = &inst.fields else {
+            return t;
+        };
+        f.src.first().and_then(|o| self.vterm(inst, o)).unwrap_or(t)
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -1200,7 +1199,9 @@ impl<'a> Tracer<'a> {
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = self.through_firstlane(hi) else { return false };
+        let Term::Value(v) = self.through_firstlane(hi) else {
+            return false;
+        };
         if v == high {
             return true;
         }
@@ -3248,62 +3249,70 @@ pub(crate) mod tests {
     /// VGPRs (`s_getpc_b64` plus the index), made uniform by
     /// `v_readfirstlane_b32`.
     pub(crate) const CODE_TABLE_THROUGH_FIRST_LANE: &[u32] = &[
-            0xBE84_1F00, // s_getpc_b64 s[4:5]
-            0x7E02_0280, // v_mov_b32 v1, 0
-            0x3406_0282, // v_lshlrev_b32 v3, 2, v1
-            0xD70F_6A04,
-            0x0002_0604, // v_add_co_u32 v4, vcc_lo, s4, v3
-            0x7E0C_0205, // v_mov_b32 v6, s5
-            0x500A_0C80, // v_add_co_ci_u32 v5, vcc_lo, 0, v6, vcc_lo
-            0x7E10_0504, // v_readfirstlane_b32 s8, v4
-            0x7E12_0505, // v_readfirstlane_b32 s9, v5
-            0xF400_0184,
-            0xFA00_0008, // s_load_dword s6, s[8:9], 0x8
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
-            0x7D88_0286, // v_cmp_gt_u32 vcc_lo, 6, v1
-            0xBF87_FFF6, // s_cbranch_vccnz -10
-            0x7E04_0206, // v_mov_b32 v2, s6
-            0xBF81_0000, // s_endpgm
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x3406_0282, // v_lshlrev_b32 v3, 2, v1
+        0xD70F_6A04,
+        0x0002_0604, // v_add_co_u32 v4, vcc_lo, s4, v3
+        0x7E0C_0205, // v_mov_b32 v6, s5
+        0x500A_0C80, // v_add_co_ci_u32 v5, vcc_lo, 0, v6, vcc_lo
+        0x7E10_0504, // v_readfirstlane_b32 s8, v4
+        0x7E12_0505, // v_readfirstlane_b32 s9, v5
+        0xF400_0184,
+        0xFA00_0008, // s_load_dword s6, s[8:9], 0x8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x7D88_0286, // v_cmp_gt_u32 vcc_lo, 6, v1
+        0xBF87_FFF6, // s_cbranch_vccnz -10
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0xBF81_0000, // s_endpgm
     ];
 
     /// A global load at byte 48 of the buffer the descriptor at table
     /// byte 0x80 describes, its address made of the descriptor's words.
     pub(crate) const GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER: &[u32] = &[
-            0xBE84_0300, // s_mov_b32 s4, s0
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0202,
-            0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-            0x870C_FF08,
-            0xFFFF_FF00, // s_and_b32 s12, s8, 0xffffff00
-            0x880C_B00C, // s_or_b32 s12, s12, 48
-            0x870D_FF09,
-            0x0000_00FF, // s_and_b32 s13, s9, 0xff
-            0x7E02_0280, // v_mov_b32 v1, 0
-            0xDC30_8000,
-            0x020C_0001, // global_load_dword v2, v1, s[12:13]
-            0xBF8C_3F70, // s_waitcnt vmcnt(0)
-            0xD834_0000,
-            0x0000_0200, // ds_write_b32 v0, v2
-            0xBF81_0000, // s_endpgm
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x870C_FF08,
+        0xFFFF_FF00, // s_and_b32 s12, s8, 0xffffff00
+        0x880C_B00C, // s_or_b32 s12, s12, 48
+        0x870D_FF09,
+        0x0000_00FF, // s_and_b32 s13, s9, 0xff
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xDC30_8000,
+        0x020C_0001, // global_load_dword v2, v1, s[12:13]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
     ];
 
     #[test]
     fn global_loads_at_a_descriptors_own_base_read_its_buffer() {
-        let code: Vec<u8> = GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let code: Vec<u8> = GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
         let (site, offset, dynamic) = r.described[0];
         assert_eq!((offset, dynamic), (48, None));
         let d = r.descriptors.iter().find(|d| d.site == site).unwrap();
-        let Source::Loaded { load, first: 0 } = d.source else { panic!("{:?}", d.source) };
+        let Source::Loaded { load, first: 0 } = d.source else {
+            panic!("{:?}", d.source)
+        };
         assert!(r.scalar.iter().any(|s| s.0 == load && s.1 == at(0, 0x80)));
     }
 
     #[test]
     fn addresses_made_in_vgprs_and_read_from_the_first_lane_are_traced() {
-        let code: Vec<u8> = CODE_TABLE_THROUGH_FIRST_LANE.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let code: Vec<u8> = CODE_TABLE_THROUGH_FIRST_LANE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
         let (_, a) = r.scalar[0];
