@@ -1436,9 +1436,27 @@ impl<'a> Tracer<'a> {
     /// `global_load_dwordx4`).
     fn fetched(&self, words: &[Term]) -> Result<Option<Source>, &'static str> {
         let at = |w: &Term| -> Option<(Site, usize)> {
-            let Term::Value(v) = *w else { return None };
-            let site = self.defs[v.0 as usize]?;
-            let inst = self.inst(site);
+            let Term::Value(mut v) = *w else { return None };
+            let mut site = self.defs[v.0 as usize]?;
+            let mut inst = self.inst(site);
+            // A loaded word a VALU op changes with uniform operands (masked,
+            // or bits set): taken as the loaded word, as the heap's copy
+            // has it.
+            for _ in 0..4 {
+                if inst.name().starts_with("global_load_dword")
+                    || inst.name().starts_with("buffer_load_dword")
+                    || !inst.name().starts_with("v_")
+                {
+                    break;
+                }
+                let mut lanes = inst.reads.iter().filter(|r| matches!(r.0, Reg::V(_)));
+                let (Some(&(_, from)), None) = (lanes.next(), lanes.next()) else {
+                    return None;
+                };
+                v = from;
+                site = self.defs[v.0 as usize]?;
+                inst = self.inst(site);
+            }
             if !inst.name().starts_with("global_load_dword")
                 && !inst.name().starts_with("buffer_load_dword")
             {
@@ -2711,6 +2729,22 @@ pub(crate) mod tests {
         let mut words = waterfall_buffer_wave32();
         let at = words.iter().position(|&w| w == 0x8006_0801).unwrap() + 1;
         words.splice(at..at, [0x7E0E_02FF, 0x3101_6FAC]);
+        let r = waterfall(&words, false).unwrap();
+        let image = &r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        assert!(matches!(image.source, Source::Fetched { first: 0, .. }), "{:?}", image.source);
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_buffer_loads_with_a_masked_word_are_fetched() {
+        // waterfall_buffer_wave32 with dword 2 masked after the loads:
+        // v_and_b32 v6, 0xffff, v6.
+        let mut words = waterfall_buffer_wave32();
+        let at = words.iter().position(|&w| w == 0x8006_0801).unwrap() + 1;
+        words.splice(at..at, [0x360C_0CFF, 0x0000_FFFF]);
         let r = waterfall(&words, false).unwrap();
         let image = &r
             .descriptors
