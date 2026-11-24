@@ -915,6 +915,7 @@ fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTextu
         return None;
     }
     const USES: i32 = 0x7; // render target, depth, unordered access
+    const DENY_SHADER_RESOURCE: i32 = 0x8;
     let own = pc_format(desc.format);
     let mips = u32::from(desc.mip_levels).max(1).min(mip_count(desc));
     let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
@@ -929,6 +930,8 @@ fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTextu
             && u32::from(d.MipLevels) >= mips
             && (d.Format.0 as u32 == own || d.Format.0 as u32 == family(own))
             && d.Flags.0 & USES & desc.flags as i32 == desc.flags as i32 & USES
+            // Not denied shader access the new one may need.
+            && (d.Flags.0 & DENY_SHADER_RESOURCE == 0 || desc.flags as i32 & DENY_SHADER_RESOURCE != 0)
     })?;
     #[cfg(feature = "diagnostics")]
     tracing::debug!(
