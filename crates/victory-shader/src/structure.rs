@@ -903,6 +903,21 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
+                // A pair whose halves are each a plain copy (`s_mov_b32`, as a
+                // lane mask parked in two lanes comes back when its lanes are
+                // not always saved together) holds what the copied pair holds.
+                let copied = |d: Option<(usize, usize)>, v: Value| {
+                    def(d).filter(|i| i.name() == "s_mov_b32" && i.reads.len() == 1).and_then(|i| {
+                        (i.writes.len() == 1 && i.writes[0].1 == v && matches!(i.reads[0].0, Reg::S(_)))
+                            .then_some(i.reads[0].1)
+                    })
+                };
+                let source = match (lo, hi) {
+                    (Some(a), Some(b)) if a != b && p.wave64 => {
+                        copied(lo, k.0).zip(copied(hi, k.1))
+                    }
+                    _ => None,
+                };
                 let m = match (lo, hi) {
                     (Some(at), Some(hi)) if at == hi => def(lo)
                         .and_then(|i| self.sop(i))
@@ -910,6 +925,15 @@ impl<'a> Lanes<'a> {
                         .map(|d| d.1),
                     _ => None,
                 };
+                if m.is_none()
+                    && let Some(from) = source
+                    && from != k
+                {
+                    let (m, derived) = self.mask(from);
+                    let cache = if derived { &mut self.masks } else { &mut self.other };
+                    cache.insert(k, m);
+                    return (m, derived);
+                }
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
