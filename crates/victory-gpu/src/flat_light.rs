@@ -9,7 +9,9 @@
 //! With the frame's first depth buffer of that size, surfaces are also
 //! shaded by a light from above and to the right, with normals taken from
 //! the depth (as reversed depth unless `<reversed>` is 0), and outlined
-//! where the depth jumps. Frames without such a texture present as usual.
+//! where the depth jumps. An integer texture (R8/R16/R32_UINT, a material
+//! ID target say) is coloured from a palette, one muted colour per ID, ID
+//! 0 black. Frames without such a texture present as usual.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -20,7 +22,7 @@ use windows::core::s;
 use crate::host::{Host, HostList, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0, numDescriptors=3), UAV(u0))"
+#define RS "RootConstants(num32BitConstants=9, b0), DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))"
 cbuffer Constants : register(b0) {
     uint W;
     uint H;
@@ -30,10 +32,12 @@ cbuffer Constants : register(b0) {
     float Sky;
     uint HasDepth;
     uint Reversed;
+    uint Palette;
 };
 Texture2D<float4> Scene : register(t0);
 Texture2D<float4> Albedo : register(t1);
 Texture2D<float> Depth : register(t2);
+Texture2D<uint> Ids : register(t3);
 RWTexture2D<unorm float4> Out : register(u0);
 
 // Distance from the eye, up to a scale: depth is 1/z (reversed) or 1 - 1/z.
@@ -53,7 +57,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     int2 p = int2(id.xy);
     float3 lit = Scene.Load(int3(p, 0)).rgb;
     uint2 at = uint2(id.x * AW / W, id.y * AH / H);
-    float3 colour = Albedo.Load(int3(at, 0)).rgb;
+    float3 colour;
+    if (Palette != 0) {
+        // A material ID: a muted colour of its own (0, the sky or nothing,
+        // stays black).
+        uint m = Ids.Load(int3(at, 0));
+        uint hash = m * 2654435761u;
+        float3 hue = float3(hash & 255, (hash >> 8) & 255, (hash >> 16) & 255) / 255.0;
+        colour = m == 0 ? float3(0, 0, 0) : 0.3 + 0.5 * hue;
+    } else {
+        colour = Albedo.Load(int3(at, 0)).rgb;
+    }
     float light = 1.0 - 0.5 * Sky * (float)id.y / (float)H;
     if (HasDepth != 0) {
         float z = Distance(p);
@@ -162,7 +176,7 @@ fn compile(host: &Host) -> windows::core::Result<Pass> {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: 4,
+                    NumDescriptors: 5,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })?;
@@ -280,7 +294,36 @@ pub(crate) fn compose(
         let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: cpu.ptr + (i * p.step) as usize,
         };
+        // An integer target (material IDs) is read at t3 and coloured from
+        // a palette; t1 then holds a null view, and the other way round.
+        let ids = matches!(
+            ad.Format,
+            DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R32_UINT
+        );
+        let null = |format, i: u32| {
+            host.device.CreateShaderResourceView(
+                None,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MipLevels: 1,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                at(i),
+            );
+        };
+        if ids {
+            null(DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+        } else {
+            null(DXGI_FORMAT_R8_UINT, 3);
+        }
         for (i, (texture, desc)) in [(scene, &sd), (albedo, &ad)].into_iter().enumerate() {
+            let i = if i == 1 && ids { 3 } else { i };
             host.device.CreateShaderResourceView(
                 texture,
                 Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -324,7 +367,7 @@ pub(crate) fn compose(
                 at(2),
             ),
         }
-        host.device.CreateUnorderedAccessView(&out, None, None, at(3));
+        host.device.CreateUnorderedAccessView(&out, None, None, at(4));
         p.list.reset();
         let l = &p.list.list;
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -353,8 +396,9 @@ pub(crate) fn compose(
             sky.to_bits(),
             u32::from(depth.is_some()),
             u32::from(reversed),
+            u32::from(ids),
         ];
-        l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, p.heap.GetGPUDescriptorHandleForHeapStart());
         l.Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
         let back: Vec<_> = moves.iter().map(|&(t, s)| transition(t, read, s)).collect();
