@@ -6466,45 +6466,12 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
-            Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+            Source::Phi { .. } | Source::Select { .. } => {
+                // A uniform choice: each predecessor computes its heap
+                // index at its end (a condition picks between two), and
+                // the join picks one with a phi.
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
-            }
-            Source::Select { scc, args } => {
-                // The heap index of each choice, picked by SCC (uniform).
-                let [
-                    Source::Loaded { load: a, first: fa },
-                    Source::Loaded { load: b, first: fb },
-                ] = args[..]
-                else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
-                let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.uniform_heap_index(src, sampler, &mut Vec::new())?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::Paths { .. } => {
@@ -6752,28 +6719,72 @@ impl<'a> Lower<'a> {
     fn heap_slot(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Phi { .. } => self.uniform_heap_index(src, sampler, &mut Vec::new()),
+            // A descriptor chosen per lane or by SCC: its index in each lane.
+            _ => self.lane_heap_index(src, sampler),
+        }
+    }
+
+    /// The heap index of a descriptor chosen uniformly: loaded from a table
+    /// (`Loaded`), at a join of such choices (`Phi`, each predecessor's
+    /// computed at its end, nested joins at their own block) or picked by
+    /// SCC (`Select`). `open` are the joins being built (a loop back to one
+    /// takes its phi).
+    fn uniform_heap_index(
+        &mut self,
+        src: &Source,
+        sampler: bool,
+        open: &mut Vec<(usize, V)>,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
             Source::Phi { block, args } => {
+                if let Some(&(_, phi)) = open.iter().find(|o| o.0 == *block) {
+                    return Ok(phi);
+                }
+                if open.len() >= 8 {
+                    return Err(WHY);
+                }
+                let join = self.block[*block].ok_or(WHY)?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                open.push((*block, phi));
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
+                    let Some(tail) = self.tail[q] else {
+                        return Err(WHY);
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = match arg {
+                        // A path no access is reached from: any index.
+                        Source::Unset | Source::NoDescriptor => Ok(self.s.m.i32(0)),
+                        Source::Carried { block: b } if b == block => Ok(phi),
+                        a => self.uniform_heap_index(a, sampler, open),
+                    };
                     self.cur = here;
                     incoming.push((index?, at));
                 }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
+                open.pop();
                 self.s.m.set_phi(phi, incoming);
                 Ok(phi)
             }
-            // A descriptor chosen per lane or by SCC: its index in each lane.
-            _ => self.lane_heap_index(src, sampler),
+            Source::Select { scc, args } => {
+                let [a, b] = &args[..] else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.uniform_heap_index(a, sampler, open)?;
+                let clear = self.uniform_heap_index(b, sampler, open)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            _ => Err(WHY),
         }
     }
 
@@ -14110,6 +14121,49 @@ mod tests {
             ),
             "{e:?}"
         );
+    }
+
+    /// A buffer descriptor loaded from one of three table entries, joined
+    /// twice (a join inside one branch, then the other branch's): heap
+    /// indexes joined by nested phis.
+    #[test]
+    fn descriptors_joined_twice_by_control_flow_take_nested_heap_indexes() {
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0008, // s_cbranch_scc1 B
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1
+            0xBF85_0003, // s_cbranch_scc1 A
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0
+            0xBF82_0002, // s_branch J1
+            0xF408_0101,
+            0xFA00_0010, // A: s_load_dwordx4 s[4:7], s[2:3], 0x10
+            0xBF82_0002, // J1: s_branch J2
+            0xF408_0101,
+            0xFA00_0020, // B: s_load_dwordx4 s[4:7], s[2:3], 0x20
+            0xBF8C_C07F, // J2: s_waitcnt lgkmcnt(0)
+            0xF420_0202,
+            0xFA00_0000, // s_buffer_load_dword s8, s[4:7], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0208, // v_mov_b32_e32 v1, s8
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
     }
 
     #[test]
