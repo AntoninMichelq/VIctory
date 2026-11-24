@@ -536,9 +536,42 @@ pub(crate) fn probe_view_limit() {
         if made.is_err() {
             tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
             victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+            return;
+        }
+        drop(made);
+        // A host that takes more (AMD, resource binding tier 3): a heap of
+        // WIDE_VIEWS slots whatever the title's count, its last slot null,
+        // and every view index clamped to it. Unclamped, an index read
+        // from memory the host has not got yet ran past the heap's end and
+        // the RX 7600 removed the device at world load (a page fault
+        // 16,777,088 slots past a 1,507,328-slot heap, 2026-11-24).
+        // SAFETY: as above.
+        let wide: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: WIDE_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        };
+        if wide.is_ok() {
+            tracing::info!("view heaps get {WIDE_VIEWS} slots: view indices are clamped to the last, a null view");
+            WIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+            victory_shader::emit::set_view_heap_limit(WIDE_VIEWS - 1);
         }
     });
 }
+
+/// View heap slots on a host that takes more than [`PORTABLE_VIEWS`]
+/// ([`probe_view_limit`]).
+const WIDE_VIEWS: u32 = 1 << 21;
+/// Whether view heaps are made [`WIDE_VIEWS`] long.
+static WIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Slots of every sampler heap: shaders clamp a sampler index to the last
+/// (`victory_shader::emit::shader::heap_handle`), so a smaller heap is
+/// read past its end (a fault on AMD).
+const SAMPLER_SLOTS: u32 = 2048;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -555,6 +588,8 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        // The view limit is decided before the first heap is made.
+        probe_view_limit();
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -574,8 +609,22 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
+        let wide = !sampler && WIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if wide && count + extra >= WIDE_VIEWS {
+            tracing::warn!(count, "view heap past {WIDE_VIEWS}: views past it read the last slot, a null view");
+        }
+        let count = if wide { count.min(WIDE_VIEWS - extra - 1) } else { count };
+        // Made longer than asked: the slots past the title's and ours are
+        // null, and shaders clamp indices to the last one.
+        let asked = if sampler {
+            count.max(SAMPLER_SLOTS)
+        } else if wide {
+            WIDE_VIEWS
+        } else {
+            count + extra
+        };
+        let (heap, count, size) = match make(asked) {
+            Ok(heap) => (heap, count, asked),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. The heap's last slot stays null, and shaders read it for
