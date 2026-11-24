@@ -177,6 +177,9 @@ pub fn merge_repeats() -> bool {
 /// translation, so the shader cache keys on it.
 pub fn root_uavs() -> bool {
     use std::sync::atomic::Ordering;
+    if EXCEPT_THIS.with(std::cell::Cell::get) {
+        return false;
+    }
     if root_uavs_only().is_some() && ROOT_UAVS.load(Ordering::Relaxed) == 0 {
         // Only the listed shaders: the one being translated decides.
         return ONLY_THIS.with(std::cell::Cell::get);
@@ -220,10 +223,45 @@ pub fn root_uavs_only() -> Option<&'static str> {
     .as_deref()
 }
 
+/// Shaders that never get root UAVs, even with `VICTORY_ROOT_UAVS=1` or
+/// listed in [`root_uavs_only`]: 16 hex digits of the container hash.
+///
+/// The default is the title's two BVH builders (box16 and box32 nodes,
+/// parent links stored at offsets taken from their input lists). With
+/// root UAVs, their input lists hold garbage on PC (an upstream pass still
+/// fails), so the parent-link stores land all over the shared GPU heap:
+/// copied back, they overwrite CPU data and crash the title at world load;
+/// not copied back, they overwrite vertex data and explode the geometry
+/// (patterns/d13z4-crash.txt, bisect of 2026-11-24). Nothing on the host
+/// traces those BVHs, and without root UAVs their dispatches are dropped
+/// as before.
+pub const ROOT_UAVS_EXCEPT_DEFAULT: &str = "28918b7150a7aad5,caa78b8ca62bc3d6";
+
+/// `VICTORY_ROOT_UAVS_EXCEPT=<hash>,...` replaces
+/// [`ROOT_UAVS_EXCEPT_DEFAULT`] (`none` or empty: no exception). Sorted and
+/// deduplicated; part of the translation, so the shader cache keys on it.
+pub fn root_uavs_except() -> &'static str {
+    static LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let v = std::env::var("VICTORY_ROOT_UAVS_EXCEPT")
+            .unwrap_or_else(|_| ROOT_UAVS_EXCEPT_DEFAULT.to_owned());
+        let mut hashes: Vec<String> = v
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        hashes.join(",")
+    })
+}
+
 thread_local! {
     /// Whether the shader this thread is translating is listed in
     /// [`root_uavs_only`].
     static ONLY_THIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether it is listed in [`root_uavs_except`].
+    static EXCEPT_THIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`root_uavs`]: 0 not read yet, 1 off, 2 on.
@@ -405,16 +443,20 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
 
 /// [`translate_for`] for the shader `hash` names (16 hex digits of its
 /// container's BLAKE3, as the runtime logs it): with
-/// [`root_uavs_only`], it gets root UAVs only if listed.
+/// [`root_uavs_only`], it gets root UAVs only if listed, and never when
+/// listed in [`root_uavs_except`].
 pub fn translate_named(
     container: &[u8],
     target: Target,
     hash: &str,
 ) -> Result<HostShader, ShaderError> {
     let listed = root_uavs_only().is_some_and(|list| list.split(',').any(|h| h == hash));
+    let except = root_uavs_except().split(',').any(|h| h == hash);
     ONLY_THIS.with(|c| c.set(listed));
+    EXCEPT_THIS.with(|c| c.set(except));
     let out = translate_inner(container, target);
     ONLY_THIS.with(|c| c.set(false));
+    EXCEPT_THIS.with(|c| c.set(false));
     out
 }
 

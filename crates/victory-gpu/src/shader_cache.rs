@@ -77,6 +77,15 @@ fn build() -> &'static [u8; 32] {
             h.update(b"root uavs only:");
             h.update(list.as_bytes());
         }
+        let except = victory_shader::emit::root_uavs_except();
+        if except != victory_shader::emit::ROOT_UAVS_EXCEPT_DEFAULT {
+            tracing::warn!(
+                list = except,
+                "VICTORY_ROOT_UAVS_EXCEPT: never root UAVs for these shaders"
+            );
+        }
+        h.update(b"root uavs except:");
+        h.update(except.as_bytes());
         h.update(&[u8::from(victory_shader::emit::pointer_views())]);
         h.update(&[u8::from(victory_shader::emit::pointer_chase())]);
         h.update(&[u8::from(victory_shader::emit::fold_branches())]);
