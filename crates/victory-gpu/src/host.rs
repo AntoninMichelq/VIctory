@@ -1305,10 +1305,17 @@ impl Host {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
+        let mut copied_back = 0u64;
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            copied_back += shadow.copy_back(address, len) as u64;
+        }
+        COPY_BACK[1].fetch_add(copied_back, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::CopyBackBytes, copied_back);
+            add(C::CopyBackUs, copying.elapsed().as_micros() as u64);
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
@@ -2302,6 +2309,11 @@ pub(crate) fn test_submission_counters() -> (u64, u64) {
     )
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_submission_copy_bytes() -> u64 {
+    PREPARING[1].load(Ordering::Relaxed)
+}
+
 /// Refresh live mirrored SRVs after deferred title writes and before
 /// GPU work. Retain the resources until the submission has finished.
 fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host::SrvRange)> {
@@ -2326,15 +2338,22 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     ranges.sort_unstable_by_key(|(_, r)| (Arc::as_ptr(&r.shadow), r.address));
     let mut copied = 0usize;
     let mut merged_count = 0u64;
+    #[cfg(feature = "diagnostics")]
+    let mut requested = 0usize;
     crate::descriptor::with_live_views(|live| {
         let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
         for (key, range) in &ranges {
             if !live(*key) || range.address == range.end {
                 continue;
             }
+            // Ranges of one buffer that start in the page where the last one
+            // ends (or at its end) are one update: each update asks the
+            // kernel for that page's writes, and the world has close to a
+            // million such ranges per frame. The bytes between them are
+            // under a page; pending ranges are still left out by `update`.
             if let Some((shadow, _, end)) = &mut pending
                 && Arc::ptr_eq(shadow, &range.shadow)
-                && range.address <= *end
+                && range.address <= (*end).next_multiple_of(crate::watch::PAGE)
             {
                 *end = (*end).max(range.end);
                 continue;
@@ -2344,11 +2363,19 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
             {
                 copied += shadow.update(start, end - start);
                 merged_count += 1;
+                #[cfg(feature = "diagnostics")]
+                {
+                    requested += end - start;
+                }
             }
         }
         if let Some((shadow, start, end)) = pending {
             copied += shadow.update(start, end - start);
             merged_count += 1;
+            #[cfg(feature = "diagnostics")]
+            {
+                requested += end - start;
+            }
         }
     });
     let elapsed = started.elapsed().as_micros() as u64;
@@ -2356,6 +2383,7 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     {
         use crate::copystat::{C, add};
         add(C::DirectRanges, merged_count);
+        add(C::DirectRequested, requested as u64);
         add(C::DirectBytes, copied as u64);
         add(C::DirectUs, elapsed);
     }
@@ -2431,7 +2459,20 @@ impl Batch {
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                use crate::copystat::{C, add, range};
+                range(
+                    std::sync::Arc::as_ptr(&shadow) as usize,
+                    from,
+                    to - from,
+                    copied,
+                    us,
+                );
+                add(C::ConventionalRanges, 1);
+                add(C::ConventionalRequested, (to - from) as u64);
+                add(C::ConventionalBytes, copied as u64);
+                add(C::ConventionalUs, us);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -2817,6 +2858,9 @@ struct Meter {
     frames: u32,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frame denominator for diagnostics retained between log lines.
+    #[cfg(feature = "diagnostics")]
+    diagnostic_frames: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -2829,6 +2873,8 @@ impl Meter {
             frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            #[cfg(feature = "diagnostics")]
+            diagnostic_frames: 0,
             caption: None,
         }
     }
@@ -2847,6 +2893,10 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diagnostic_frames += u64::from(self.frames);
+        }
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -2876,7 +2926,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(frames);
+                crate::copystat::log(std::mem::take(&mut self.diagnostic_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

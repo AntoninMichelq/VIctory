@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+#[cfg(feature = "diagnostics")]
+use crate::copystat::{C, add};
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -37,7 +39,7 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Whether the memory is write-watched: unknown, yes, no.
+    /// Whether the memory is write-watched: unknown, yes, or wholly unwatched.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
@@ -138,6 +140,8 @@ fn give_back(buffers: impl IntoIterator<Item = Box<[u8]>>) {
     }
 }
 
+const WATCH_UNKNOWN: u8 = 0;
+const WATCHED: u8 = 1;
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -205,7 +209,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
-            watched: AtomicU8::new(0),
+            watched: AtomicU8::new(WATCH_UNKNOWN),
             pending: Mutex::default(),
             before: Mutex::default(),
         }
@@ -259,6 +263,8 @@ impl Shadow {
         // The parts no earlier range of the submission declared: their
         // refresh was free to bring the title's bytes into the copy (a
         // refresh leaves declared ranges alone), and may just have.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let fresh = outside(from, to, before.spans.clone());
         let (mut a, mut b) = (from, to);
         before.spans.retain(|&(x, y)| {
@@ -303,6 +309,11 @@ impl Shadow {
             }
             at += hi - lo;
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::SnapshotBytes, (to - from) as u64);
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+        }
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -331,6 +342,8 @@ impl Shadow {
             && let Some((taken, end)) = extent
         {
             unchanged.begin(start + taken, start + end);
+            #[cfg(feature = "diagnostics")]
+            add(C::CopyBackCompared, (to - from) as u64);
             // By title page: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -447,19 +460,42 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        let watched = self.watched.load(Ordering::Relaxed);
+        if watched != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+                self.watched.store(WATCHED, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
-                    use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    add(C::WatchBytes, copied as u64);
                 }
                 return copied;
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::watch_failed(self as *const Self as usize, to - from);
+            // Views of a single shadow can cover distinct title allocations.
+            // Cache the first negative result only when one region contains
+            // the shadow and the query could not have crossed a boundary.
+            let start = self.start as usize;
+            if watched == WATCH_UNKNOWN
+                && crate::watch::private_region_covers(start, start + self.len as usize)
+            {
+                self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            } else {
+                // Fallback can zero unreadable bytes. Ask again if a later
+                // watched request reaches any page this fallback touched.
+                let base = start / PAGE;
+                self.copied.lock().unwrap_or_else(|e| e.into_inner())
+                    [from / PAGE - base..=(to - 1) / PAGE - base]
+                    .fill(0);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::UnwatchedRanges, 1);
+            add(C::UnwatchedBytes, (to - from) as u64);
         }
         self.copy(from, to);
         to - from
@@ -480,6 +516,8 @@ impl Shadow {
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
+        #[cfg(feature = "diagnostics")]
+        let (mut initial, mut dirty) = (0, 0);
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -490,6 +528,12 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                #[cfg(feature = "diagnostics")]
+                if *at == 0 {
+                    initial += 1;
+                } else {
+                    dirty += 1;
+                }
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -504,6 +548,12 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::WatchPages, (last + 1 - from / PAGE) as u64);
+            add(C::WatchInitialPages, initial);
+            add(C::WatchDirtyPages, dirty);
         }
         bytes
     }
@@ -612,7 +662,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let (buffer, data) = allocate_buffer(len.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -644,6 +694,19 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+fn allocate_buffer(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let allocation = host()?.shared_buffer(width)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        add(C::ShadowAllocations, 1);
+        add(C::ShadowAllocationBytes, width);
+        add(C::ShadowAllocationUs, started.elapsed().as_micros() as u64);
+    }
+    Some(allocation)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let end = end.max(address.saturating_add(64 << 10));
@@ -663,7 +726,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = allocate_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
