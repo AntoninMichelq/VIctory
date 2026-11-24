@@ -1165,12 +1165,14 @@ impl Host {
     /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
     /// immediately.
     pub(crate) fn recycle_list(&self, list: HostList) {
-        list.release_kept();
         // What its submission needed (copies of title memory, texture
-        // staging) is not held while the list waits in the pool: up to 64
-        // idle lists kept gigabytes of loose memory copies from being
-        // released (2026-11-24).
-        *list.deferred() = Deferred::default();
+        // staging, textures, buffers it named) is not held while the list
+        // waits in the pool: up to 64 idle lists kept gigabytes of loose
+        // memory copies from being released (2026-11-24). It is retired, not
+        // dropped: the submission may still be running (a page fault inside
+        // a freed 256x256 texture after pooled lists cleared their holds).
+        list.retire_held();
+        list.release_kept();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < LIST_POOL_CAP {
             pool.push(list);
@@ -1862,10 +1864,12 @@ impl HostList {
     /// may read them (a page fault inside a freed rectangle records buffer,
     /// 2026-11-24).
     fn retire_held(&self) {
-        let kept = std::mem::take(&mut self.deferred().kept);
-        if !kept.is_empty() {
-            retire(kept);
-        }
+        // The whole recording's holds: buffers it named, texture staging
+        // and buffer copies its copies read.
+        let deferred = std::mem::take(&mut *self.deferred());
+        retire(deferred);
+        let buffers = std::mem::take(&mut *self.buffers.lock().unwrap_or_else(|e| e.into_inner()));
+        retire(buffers);
         let states = std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
         if !states.is_empty() {
             retire(states);
