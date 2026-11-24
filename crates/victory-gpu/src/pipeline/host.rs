@@ -512,21 +512,26 @@ impl HostPipeline {
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
         if mesh.is_some() {
+            // "triangles": the stream names its topology since it did not
+            // load from the library without one (see `MeshStream`); a
+            // new name keeps such entries, stored before, from being
+            // looked up again.
             let name = super::library::name(
-                "mesh",
+                "mesh triangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            // The stream names a triangle topology (see `MeshStream`).
+            let ms = || MeshStream::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms(), code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms(), code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -656,6 +661,54 @@ struct VertexStream {
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
 }
 
+/// A mesh pipeline's stage subobjects: the mesh shader and a triangle
+/// topology, which D3D12 does not need for a mesh shader: without it the
+/// pipeline library refuses to load a stored pipeline with the very stream
+/// it was made from (`E_INVALIDARG`; debug layer message 972, "does not
+/// match the one used to create the PSO"), so every mesh pipeline was
+/// compiled again, and its store then refused (970, "already exists"). The
+/// translation makes triangle mesh shaders only (`mesh_prologue` refuses
+/// others), and the debug layer wants the two to agree (1323).
+#[repr(C)]
+struct MeshStream {
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+impl MeshStream {
+    fn new(ms: D3D12_SHADER_BYTECODE) -> Self {
+        Self {
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        }
+    }
+}
+
+/// A mesh pipeline from the title's graphics state with its plain depth
+/// state: the pipeline-state stream form (no input layout).
+#[cfg(test)]
+fn mesh_pipeline(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    ms: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    stream_pipeline(
+        device,
+        root,
+        MeshStream::new(ms),
+        ps,
+        g,
+        Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+        name,
+    )
+}
+
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
 fn stream_pipeline<S, D>(
     device: &ID3D12Device,
@@ -762,5 +815,86 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    /// A triangle mesh shader of our own and a pixel shader for it.
+    const MS: &str = "struct V { float4 p : SV_Position; };
+        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+        void main(out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].p = float4(0, 0, 0, 1);
+            v[1].p = float4(1, 0, 0, 1);
+            v[2].p = float4(0, 1, 0, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
+    const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
+    fn dxc() -> Option<PathBuf> {
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => PathBuf::from(p),
+            None => victory_shader::emit::validator::Validator::default_path()?
+                .with_file_name("dxc.exe"),
+        };
+        dxc.exists().then_some(dxc)
+    }
+
+    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+        let (hlsl, out) = (
+            dir.join(format!("{profile}.hlsl")),
+            dir.join(format!("{profile}.dxil")),
+        );
+        std::fs::write(&hlsl, src).unwrap();
+        let status = std::process::Command::new(dxc)
+            .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .status()
+            .unwrap();
+        assert!(status.success(), "dxc failed for {profile}");
+        std::fs::read(out).unwrap()
+    }
+
+    fn code(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
+        D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// A mesh pipeline made once is loaded from the library the next time,
+    /// not compiled again (a stream without a topology never loads).
+    #[test]
+    fn a_mesh_pipeline_loads_from_the_library() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        assert!(
+            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
+            "the mesh pipeline was compiled again instead of loaded from the library"
+        );
     }
 }
