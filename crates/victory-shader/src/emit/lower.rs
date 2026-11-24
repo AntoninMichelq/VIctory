@@ -2044,9 +2044,10 @@ impl<'a> Lower<'a> {
     /// lane whose number differs in one bit, step by step; two host waves of 32 then exchange
     /// their halves' sums for the last addition. The high half of the result is lane 0's,
     /// which no `v_add_f16` writes.
-    /// That needs every lane of a full wave there to be read: refused where not every lane
-    /// runs, in a thread group that does not fill its waves, and for each half-wave on its
-    /// own (half a sum is no sum).
+    /// That needs every lane of a full wave there to be read: refused in a thread group that
+    /// does not fill its waves, for each half-wave on its own (half a sum is no sum), and
+    /// where not every lane runs on two host waves of 32; one host wave of 64 sums the
+    /// running lanes in f32 there instead (see below).
     fn half_sum(&mut self, x: V) -> Result<V, Why> {
         const WHERE: Why = "a wave sum of 16-bit floats where not every lane runs";
         let threads = self.s.threads.ok_or("a wave sum of 16-bit floats outside compute")?;
@@ -2070,8 +2071,26 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+                return Err(WHERE);
             }
-            return Err(WHERE);
+            // One host wave of 64 where only some lanes run: the host's own sum of the
+            // running lanes' terms, widened to f32 and rounded to 16 bits once. Not the
+            // console's order of 16-bit additions, so the last bit can differ (by one
+            // step of the half's precision), but the sum's lanes are the same.
+            // shortcut: rounded once, not at each addition.
+            let c = self.cur;
+            let (f32t, low) = (self.s.t.f32, self.s.m.i32(0xFFFF));
+            let h = self.s.m.bin(c, Bin::And, x, low);
+            let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+            let (k, u) = (self.s.m.i8(0), self.s.m.i8(0));
+            let total = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, u]);
+            let sum = self.f16_nearest(total);
+            let c = self.cur;
+            let (high, low, zero) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(0));
+            let first = self.read_lane(x, zero);
+            let first = self.s.m.bin(c, Bin::And, first, high);
+            let sum = self.s.m.bin(c, Bin::And, sum, low);
+            return Ok(self.s.m.bin(c, Bin::Or, first, sum));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
