@@ -167,7 +167,10 @@ fn make() -> windows::core::Result<Expand> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("rectangle expansion: {}", String::from_utf8_lossy(text));
         }
@@ -176,7 +179,8 @@ fn make() -> windows::core::Result<Expand> {
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),

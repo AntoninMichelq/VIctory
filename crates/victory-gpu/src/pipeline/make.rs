@@ -124,7 +124,11 @@ impl Pending {
         }
         STATS.us.fetch_add(us, Ordering::Relaxed);
         STATS.max_us.fetch_max(us, Ordering::Relaxed);
-        let counter = if made.is_some() { &STATS.ok } else { &STATS.failed };
+        let counter = if made.is_some() {
+            &STATS.ok
+        } else {
+            &STATS.failed
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         if self.early.swap(false, Ordering::Relaxed) {
             EARLY_LEFT.fetch_sub(1, Ordering::Relaxed);
@@ -136,7 +140,8 @@ impl Pending {
 
 /// Pipelines being made right now: when each started and its shaders
 /// (the progress line names those running long).
-static MAKING: Mutex<Option<std::collections::HashMap<usize, (Instant, String)>>> = Mutex::new(None);
+static MAKING: Mutex<Option<std::collections::HashMap<usize, (Instant, String)>>> =
+    Mutex::new(None);
 /// A make this long (or failing) is logged with its shaders.
 const SLOW_MAKE_US: u64 = 10_000_000;
 
@@ -438,10 +443,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// for it while no worker has started on it, so it moves to the front.
 fn start(p: &Arc<Pending>, wanted: u64) {
     if !p.queued.swap(true, Ordering::Relaxed) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
         p.wanted.fetch_max(wanted, Ordering::Relaxed);
         queue(p.clone(), wanted);
-    } else if !p.taken.load(Ordering::Relaxed) && p.wanted.fetch_max(wanted, Ordering::Relaxed) < wanted {
+    } else if !p.taken.load(Ordering::Relaxed)
+        && p.wanted.fetch_max(wanted, Ordering::Relaxed) < wanted
+    {
         queue(p.clone(), wanted);
     }
 }
@@ -521,7 +531,11 @@ fn wait_made(p: &Pending, limit: Duration) {
             tracing::warn!(key = %p.key, "a pipeline not made within its wait; its draw or dispatch dropped");
             break;
         }
-        held = p.wait_done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = p
+            .wait_done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
     let us = started.elapsed().as_micros() as u64;
@@ -607,7 +621,9 @@ impl PartialOrd for Entry {
 }
 impl Ord for Entry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.wanted.cmp(&other.wanted).then(other.seq.cmp(&self.seq))
+        self.wanted
+            .cmp(&other.wanted)
+            .then(other.seq.cmp(&self.seq))
     }
 }
 

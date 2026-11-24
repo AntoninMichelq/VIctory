@@ -269,6 +269,56 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     }
 }
 
+/// How far past a mesh program's root SRV it reads. The console's mesh
+/// programs (`MS_VS_Transform*`) keep a table of vertex streams at the
+/// view's start: dwords whose bits 7-24 are a stream's byte offset from
+/// the view (up to 32 MiB), read at that offset plus vertex index times
+/// stride (at most 60 bytes, so under 4 MiB more). The largest offset in
+/// the first 32 dwords plus 4 MiB covers every stream; dwords that are not
+/// offsets only make the copy longer. 0 (the copy ends with the title
+/// buffer, as before) when the view is short enough anyway or
+/// `VICTORY_MESH_VIEW_REACH=0`.
+fn mesh_view_reach(address: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_MESH_VIEW_REACH").map_or(true, |v| v.trim() != "0");
+        if !on {
+            tracing::info!(
+                "mesh root views end with their title buffer (VICTORY_MESH_VIEW_REACH=0)"
+            );
+        }
+        on
+    }) {
+        return 0;
+    }
+    const WORDS: usize = 32;
+    if address == 0
+        || !address.is_multiple_of(4)
+        || !crate::texture::committed(address as *const u8, WORDS * 4)
+    {
+        return 0;
+    }
+    let far = (0..WORDS)
+        .map(|i| {
+            // SAFETY: committed title memory, checked just above; the title
+            // may write it meanwhile, which only changes the value read.
+            let d = unsafe { (address as *const u32).add(i).read_volatile() };
+            u64::from((d >> 7) & 0x01ff_fffc)
+        })
+        .max()
+        .unwrap_or(0);
+    let reach = far + (4 << 20);
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            reach_mb = reach >> 20,
+            "mesh root view: stream table reach"
+        );
+    }
+    reach
+}
+
 fn emit_uav_barrier(list: &HostList) {
     let barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -386,7 +436,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -474,16 +529,23 @@ impl State {
     /// one-descriptor table in the bound view heap: a raw view to the end
     /// of the title buffer, so reads past it return zero and writes past it
     /// are dropped (a root view reaches whatever host memory is there).
+    /// `reach`: how far past `address` the program reads (0: to the end
+    /// of the title buffer holding it, as before).
     fn root_srv_table(
         &mut self,
         list: &HostList,
         address: u64,
         uav: bool,
+        reach: u64,
     ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         if address == 0 {
             return None;
         }
-        let shadow = crate::shadow::find(address, 1)?;
+        let shadow = if reach > 0 {
+            crate::shadow::find_reaching(address, reach)?
+        } else {
+            crate::shadow::find(address, 1)?
+        };
         let gpu = shadow.gpu(address);
         if !gpu.is_multiple_of(4) {
             return None;
@@ -520,7 +582,8 @@ impl State {
                 first
             }
         };
-        shadow.refresh(list, address, len);
+        // A view reaching far needs only what its program reads fresh.
+        shadow.refresh(list, address, if reach > 0 { len.min(reach) } else { len });
         if uav {
             shadow.gpu_writes(list, address, len);
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
@@ -540,7 +603,12 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
-        let key = (std::ptr::from_ref(heap) as usize, 0, 0, u64::from(uav) << 63);
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            0,
+            0,
+            u64::from(uav) << 63,
+        );
         let first = match self.root_srv_slots.get(&key) {
             Some(&first) => first,
             None => {
@@ -789,7 +857,11 @@ impl State {
                         let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(slot))
                         else {
-                            once!(slot, ?kind, "a shader reads a root view the title did not set");
+                            once!(
+                                slot,
+                                ?kind,
+                                "a shader reads a root view the title did not set"
+                            );
                             return false;
                         };
                         *address
@@ -799,7 +871,12 @@ impl State {
                             // A null address the program tests before reading.
                             self.null_srv_table(kind == RootView::Uav)
                         } else {
-                            self.root_srv_table(list, address, kind == RootView::Uav)
+                            let reach = if kind == RootView::Srv && p.mesh && !pointer {
+                                mesh_view_reach(address)
+                            } else {
+                                0
+                            };
+                            self.root_srv_table(list, address, kind == RootView::Uav, reach)
                         };
                         let Some(table) = table else {
                             once!(
@@ -1485,8 +1562,14 @@ impl State {
             shadow.refresh(list, v.address, u64::from(v.size));
             // The expansion binds the source as a root unordered-access view.
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
-            let (_, gpu, size) =
-                crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
+            let (_, gpu, size) = crate::rects::vertices(
+                list,
+                host,
+                shadow.gpu(v.address),
+                u64::from(v.size),
+                v.stride,
+                &elements,
+            )?;
             views.push((
                 slot,
                 D3D12_VERTEX_BUFFER_VIEW {
@@ -1545,7 +1628,10 @@ impl State {
             let outcome = if ran {
                 "RUN".to_owned()
             } else if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
-                format!("DROPPED ({})", crate::pipeline::drop_reason(self.pipeline as This))
+                format!(
+                    "DROPPED ({})",
+                    crate::pipeline::drop_reason(self.pipeline as This)
+                )
             } else {
                 "DROPPED (see the why line above)".to_owned()
             };
@@ -1823,7 +1909,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                     crate::texture::upload(list, *resource as This, t);
                 }
             }
-            let mips = desc.as_ref().and_then(|d| crate::descriptor::host::srv_mips(t, d));
+            let mips = desc
+                .as_ref()
+                .and_then(|d| crate::descriptor::host::srv_mips(t, d));
             crate::list::ensure_mips(list, *resource as This, SHADER_RESOURCE, mips);
             #[cfg(feature = "diagnostics")]
             {
@@ -2166,7 +2254,16 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
+        let shader = victory_shader::emit::emit(
+            &c,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         (shader, used)
     }
 
