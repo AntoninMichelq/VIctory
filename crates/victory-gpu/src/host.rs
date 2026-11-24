@@ -1716,6 +1716,15 @@ impl Host {
             last = now;
         }
         let _ = &firsts;
+        // The argument clamp's counters, now the lists ran.
+        #[cfg(feature = "diagnostics")]
+        if crate::indirect::stats_on() {
+            for list in runs {
+                if let Some(words) = list.indirect_stats() {
+                    crate::indirect::collect(&words);
+                }
+            }
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -2700,13 +2709,36 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            if crate::indirect::stats_on() {
+                // The clamp's counters too, which follow the budget word.
+                // SAFETY: the list's own mapped 256 bytes, written before it
+                // runs.
+                deferred
+                    .copies
+                    .push(Step::Host(Box::new(move || unsafe { std::ptr::write_bytes(at as *mut u8, 0, 256) })));
+            } else {
+                // SAFETY: the list's own mapped word, written before it runs.
+                deferred
+                    .copies
+                    .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            }
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The start of the list's budget buffer (the budget and the clamp's
+    /// counters) once its submission finished, if this recording used it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn indirect_stats(&self) -> Option<[u32; crate::indirect::STATS_WORDS]> {
+        if !self.deferred().budget_zeroed {
+            return None;
+        }
+        let (_, data) = self.budget.get()?.as_ref()?;
+        let words = *data as *const u32;
+        // SAFETY: the list's own mapped 256 bytes, which no submission is
+        // writing (every one was waited for).
+        Some(std::array::from_fn(|i| unsafe { words.add(i).read_volatile() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -3449,6 +3481,9 @@ impl Meter {
             self.diagnostic_frames += u64::from(self.frames);
         }
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        // Every second, unlike the lines below.
+        #[cfg(feature = "diagnostics")]
+        crate::indirect::log_stats(frames);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

@@ -19,11 +19,21 @@
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
+//!
+//! Experiment switches, read once when the clamp is compiled (each is a
+//! define of the shader, so without them it compiles exactly as before):
+//! `VICTORY_MESH_2D=1` keeps a mesh dispatch's y and z (each at most
+//! 65,535 and the whole at most 2^22 groups, the host's limits) instead of
+//! forcing them to 1; `VICTORY_INDIRECT_BUDGET_SHIFT=n` makes the budget
+//! 2^n (n at most 31; 27 by default). With `diagnostics` and
+//! `VICTORY_INDIRECT_STATS=1` the clamp also counts, per kind, what it saw
+//! and did, in the list's budget buffer past its first word, logged per
+//! frame about once a second ([`log_stats`]).
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{PCSTR, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -43,7 +53,20 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+#ifndef BUDGET_SHIFT
+#define BUDGET_SHIFT 27
+#endif
+static const uint BUDGET = 1u << BUDGET_SHIFT;
+#ifdef MESH_2D
+// Groups of one mesh dispatch (the host's limit); y and z shrink first.
+static const uint MESH_GROUPS = 1u << 22;
+#endif
+#ifdef STATS
+// Counters per kind (draws, dispatches, mesh), 8 words each, in the
+// budget buffer from here on: records, all-zero records, records over the
+// budget, records clamped, mesh max y and z seen, launched (low, high).
+static const uint STATS_AT = 64u;
+#endif
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -59,6 +82,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+#ifdef STATS
+    // The counted words as the title wrote them (draws: the first two).
+    uint3 seen = src_args.Load3(src_at);
+#endif
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(src_args.Load(src_at), 1u << 24);
@@ -74,9 +101,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
+#ifdef MESH_2D
+        g = min(g, uint3(65535u, 65535u, 65535u));
+        // All nonzero inside: MESH_GROUPS / g.z is 64 or more.
+        if (g.y != 0 && g.z != 0 && g.x * g.y > MESH_GROUPS / g.z) {
+            g.z = min(g.z, max(1u, MESH_GROUPS / (g.x * g.y)));
+            g.y = min(g.y, max(1u, MESH_GROUPS / (g.x * g.z)));
+            g.x = min(g.x, MESH_GROUPS / (g.y * g.z));
+        }
+#else
+        // Mesh dispatches: the console's are one-dimensional.
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+#endif
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
@@ -97,6 +134,37 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         over = !settled || before >= BUDGET || BUDGET - before < cost;
     }
+#ifdef STATS
+    {
+        uint bucket = kind <= 1 ? 0u : (kind == 2 ? 1u : 2u);
+        uint at = STATS_AT + bucket * 32u;
+        bool zero;
+        bool clamped;
+        uint launched;
+        if (kind <= 1) {
+            zero = seen.x == 0 && seen.y == 0;
+            clamped = any(draw_counts != seen.xy);
+            launched = over ? 0u : draw_counts.x * draw_counts.y;
+        } else {
+            zero = all(seen == uint3(0, 0, 0));
+            clamped = any(groups != seen);
+            launched = over ? 0u : groups.x * groups.y * groups.z;
+        }
+        uint ignored;
+        budget.InterlockedAdd(at, 1u, ignored);
+        if (zero) budget.InterlockedAdd(at + 4u, 1u, ignored);
+        if (over) budget.InterlockedAdd(at + 8u, 1u, ignored);
+        if (clamped) budget.InterlockedAdd(at + 12u, 1u, ignored);
+        if (bucket == 2u) {
+            budget.InterlockedMax(at + 16u, seen.y, ignored);
+            budget.InterlockedMax(at + 20u, seen.z, ignored);
+        }
+        // 64 bits: a carry out of the low word goes to the high one.
+        uint low;
+        budget.InterlockedAdd(at + 24u, launched, low);
+        if (low + launched < low) budget.InterlockedAdd(at + 28u, 1u, ignored);
+    }
+#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -116,6 +184,67 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// The experiment switches (see the module's notes), read once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Config {
+    /// `VICTORY_MESH_2D=1`: mesh dispatches keep y and z.
+    mesh_2d: bool,
+    /// `VICTORY_INDIRECT_BUDGET_SHIFT`: the budget is `1 << budget_shift`.
+    budget_shift: u32,
+    /// `VICTORY_INDIRECT_STATS=1` (diagnostics only): the clamp counts.
+    stats: bool,
+}
+
+/// The default budget's shift: 2^27 vertex instances or threads per list.
+const BUDGET_SHIFT: u32 = 27;
+
+/// Byte offset of the counters in the budget buffer (the shader's
+/// `STATS_AT`), 8 words for each of draws, dispatches and mesh.
+#[cfg(feature = "diagnostics")]
+const STATS_AT: usize = 64;
+
+impl Config {
+    const DEFAULT: Config = Config {
+        mesh_2d: false,
+        budget_shift: BUDGET_SHIFT,
+        stats: false,
+    };
+}
+
+fn config() -> Config {
+    static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let on = |name: &str| std::env::var(name).is_ok_and(|v| v == "1");
+        let c = Config {
+            mesh_2d: on("VICTORY_MESH_2D"),
+            budget_shift: budget_shift(std::env::var("VICTORY_INDIRECT_BUDGET_SHIFT").ok().as_deref()),
+            stats: cfg!(feature = "diagnostics") && on("VICTORY_INDIRECT_STATS"),
+        };
+        if c != Config::DEFAULT {
+            tracing::info!(
+                mesh_2d = c.mesh_2d,
+                budget = format_args!("2^{}", c.budget_shift),
+                stats = c.stats,
+                "indirect argument clamp: experiment switches on"
+            );
+        }
+        c
+    })
+}
+
+/// The budget's shift from `VICTORY_INDIRECT_BUDGET_SHIFT`: at most 31 (a
+/// 32-bit word), the default when unset or not a number.
+fn budget_shift(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(BUDGET_SHIFT, |n| n.min(31))
+}
+
+/// Whether the clamp counts (`VICTORY_INDIRECT_STATS=1`, diagnostics).
+pub(crate) fn stats_on() -> bool {
+    config().stats
+}
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -142,10 +271,41 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+    make_with(device, config())
 }
 
+#[cfg(test)]
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_with(device, Config::DEFAULT)
+}
+
+fn make_with(device: &ID3D12Device, config: Config) -> windows::core::Result<Clamp> {
+    // Defines only for switches that are on: by default the shader compiles
+    // from exactly the source it always did.
+    let shift = format!("{}\0", config.budget_shift);
+    let mut defines = Vec::new();
+    if config.budget_shift != BUDGET_SHIFT {
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("BUDGET_SHIFT"),
+            Definition: PCSTR(shift.as_ptr()),
+        });
+    }
+    if config.mesh_2d {
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("MESH_2D"),
+            Definition: s!("1"),
+        });
+    }
+    if config.stats {
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("STATS"),
+            Definition: s!("1"),
+        });
+    }
+    let defines = (!defines.is_empty()).then(|| {
+        defines.push(D3D_SHADER_MACRO::default());
+        defines
+    });
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -154,7 +314,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("clamp"),
-            None,
+            defines.as_ref().map(|d| d.as_ptr()),
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -326,6 +486,81 @@ fn record_clamp(
         ]);
     }
     true
+}
+
+/// The clamp's counters (`VICTORY_INDIRECT_STATS`) of finished lists
+/// since the last line: per kind bucket (draws, dispatches, mesh) records,
+/// all-zero records, records over the budget, records clamped, launched
+/// (vertex instances or groups); then the lists that counted and those
+/// that used up their budget.
+#[cfg(feature = "diagnostics")]
+static STATS: [std::sync::atomic::AtomicU64; 17] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 17];
+/// The largest mesh y and z the title wrote since the last line.
+#[cfg(feature = "diagnostics")]
+static MESH_MAX: [std::sync::atomic::AtomicU32; 2] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+
+/// Words of the budget buffer [`collect`] reads: the budget and counters.
+#[cfg(feature = "diagnostics")]
+pub(crate) const STATS_WORDS: usize = STATS_AT / 4 + 3 * 8;
+
+/// Adds a finished list's counters: `words` is the start of its budget
+/// buffer, as the submission left it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn collect(words: &[u32; STATS_WORDS]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for bucket in 0..3 {
+        let w = &words[STATS_AT / 4 + bucket * 8..][..8];
+        for (i, &n) in w[..4].iter().enumerate() {
+            STATS[bucket * 5 + i].fetch_add(u64::from(n), Relaxed);
+        }
+        STATS[bucket * 5 + 4].fetch_add(u64::from(w[6]) | u64::from(w[7]) << 32, Relaxed);
+        if bucket == 2 {
+            MESH_MAX[0].fetch_max(w[4], Relaxed);
+            MESH_MAX[1].fetch_max(w[5], Relaxed);
+        }
+    }
+    STATS[15].fetch_add(1, Relaxed);
+    let budget = 1u64 << config().budget_shift;
+    if u64::from(words[0]) >= budget {
+        STATS[16].fetch_add(1, Relaxed);
+    }
+}
+
+/// Logs the counters per frame over `frames` and starts them again, with
+/// `VICTORY_INDIRECT_STATS=1` only.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_stats(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !stats_on() {
+        return;
+    }
+    let c: Vec<f64> = STATS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let [y, z] = [0, 1].map(|i| MESH_MAX[i].swap(0, Relaxed));
+    let c = &c;
+    let bucket = |b: usize| {
+        format!(
+            "{:.0} run, {:.0} all zero, {:.0} over budget, {:.0} clamped, {:.2}M launched",
+            c[b * 5],
+            c[b * 5 + 1],
+            c[b * 5 + 2],
+            c[b * 5 + 3],
+            c[b * 5 + 4] / 1e6
+        )
+    };
+    let switches = config();
+    tracing::info!(
+        "indirect per frame: draws {}; dispatches {}; mesh {} (max y {y}, z {z}); \
+         {:.1} lists, {:.1} of them out of budget (2^{}, mesh {})",
+        bucket(0),
+        bucket(1),
+        bucket(2),
+        c[15],
+        c[16],
+        switches.budget_shift,
+        if switches.mesh_2d { "2D" } else { "1D" },
+    );
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
@@ -595,6 +830,19 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    #[test]
+    fn budget_shift_parses_and_caps() {
+        assert_eq!(budget_shift(None), 27);
+        assert_eq!(budget_shift(Some("")), 27);
+        assert_eq!(budget_shift(Some("x")), 27);
+        assert_eq!(budget_shift(Some("-1")), 27);
+        assert_eq!(budget_shift(Some("20")), 20);
+        assert_eq!(budget_shift(Some(" 30 ")), 30);
+        assert_eq!(budget_shift(Some("31")), 31);
+        assert_eq!(budget_shift(Some("32")), 31);
+        assert_eq!(budget_shift(Some("4294967295")), 31);
     }
 
     #[test]
