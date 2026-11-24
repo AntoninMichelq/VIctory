@@ -69,23 +69,87 @@ impl UnchangedPages {
 
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
-        let unchanged = &mut self.pages[page - self.start / PAGE];
-        if *unchanged {
-            return false;
-        }
-        if current != before {
-            return true;
-        }
-        // A later range can touch bytes a partial comparison missed. At
-        // the edges, only bytes covered by the snapshot can be compared.
-        *unchanged = address == (page * PAGE).max(self.start)
-            && address + current.len() == ((page + 1) * PAGE).min(self.end);
-        false
+        let (start, end) = (self.start, self.end);
+        let unchanged = &mut self.pages[page - start / PAGE];
+        page_differs(unchanged, (start, end), address, current, before)
     }
 
     fn clear(&mut self) {
         self.pages.clear();
     }
+}
+
+/// Whether `current` (the copy at `address`, inside one page) differs
+/// from `before`; a page found equal over all its compared bytes is marked
+/// `unchanged` so later ranges skip it. `bounds`: the snapshot's span.
+fn page_differs(
+    unchanged: &mut bool,
+    (start, end): (usize, usize),
+    address: usize,
+    current: &[u8],
+    before: &[u8],
+) -> bool {
+    if *unchanged {
+        return false;
+    }
+    if current != before {
+        return true;
+    }
+    // A later range can touch bytes a partial comparison missed. At
+    // the edges, only bytes covered by the snapshot can be compared.
+    let page = address / PAGE;
+    *unchanged = address == (page * PAGE).max(start) && address + current.len() == ((page + 1) * PAGE).min(end);
+    false
+}
+
+/// Merges what the GPU wrote into title bytes: where `host` differs from
+/// `old` (its bytes before the submission) the GPU's byte goes into
+/// `title`; elsewhere the title's byte stays. `host` then takes `title`'s
+/// bytes. Whether `title` changed. Word by word, without branches per
+/// byte (the world copies back hundreds of MB per frame).
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    const LO: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let n = title.len().min(host.len()).min(old.len());
+    let words = n / 8;
+    let mut changed = 0u64;
+    let rd = |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    for i in 0..words {
+        let (t, h, o) = (rd(title, i), rd(host, i), rd(old, i));
+        // 0xff in each byte where h != o, 0 elsewhere.
+        let x = h ^ o;
+        let nz = (((x & LO).wrapping_add(LO)) | x) & HI;
+        let mask = (nz >> 7).wrapping_mul(0xff);
+        let merged = (h & mask) | (t & !mask);
+        changed |= merged ^ t;
+        title[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
+        host[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
+    }
+    let mut tail_changed = false;
+    for j in words * 8..n {
+        let (t, h, o) = (title[j], host[j], old[j]);
+        if h != o && t != h {
+            title[j] = h;
+            tail_changed = true;
+        }
+        host[j] = title[j];
+    }
+    changed != 0 || tail_changed
+}
+
+/// Threads for copying back `len` bytes: one below 8 MiB, else up to
+/// half the logical processors (at most 8), `VICTORY_COPY_BACK_THREADS`
+/// overriding (1 turns it off).
+fn copy_back_threads(len: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("VICTORY_COPY_BACK_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 8)))
+            .clamp(1, 32)
+    });
+    if len < 8 << 20 { 1 } else { n.min(len / (1 << 20)).max(1) }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -289,37 +353,88 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
-            let mut title = None;
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PAGE - (start + at) % PAGE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                if unchanged.differs(start + at, host, old)
-                    && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
-                    && crate::host::read_into((start + at) as *const u8, title)
-                {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+            // Page-aligned parts, each on its own thread when the range is
+            // big: pages are independent (own unchanged flag, own bytes).
+            let bounds = (unchanged.start, unchanged.end);
+            let first_page = unchanged.start / PAGE;
+            let data = self.data as usize;
+            let part = |lo: usize, hi: usize, flags: &mut [bool], flags_first: usize| {
+                let mut title: Option<Vec<u8>> = None;
+                let mut synced = Vec::new();
+                let mut written = 0;
+                let mut at = lo;
+                while at < hi {
+                    let n = (PAGE - (start + at) % PAGE).min(hi - at);
+                    // SAFETY: inside the mapping; only the submitting
+                    // thread's copy-back writes it, each page from one part.
+                    let host = unsafe { std::slice::from_raw_parts_mut((data as *mut u8).add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let flag = &mut flags[(start + at) / PAGE - flags_first];
+                    if page_differs(flag, bounds, start + at, host, old)
+                        && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
+                        && crate::host::read_into((start + at) as *const u8, title)
+                    {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        if merge_gpu_writes(title, host, old) {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
                         }
-                        *h = *t;
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                    at += n;
                 }
-                at += n;
+                (written, synced)
+            };
+            let threads = copy_back_threads(to - from);
+            let mut synced = Vec::new();
+            if threads <= 1 {
+                let (w, s) = part(from, to, &mut unchanged.pages, first_page);
+                written += w;
+                synced = s;
+            } else {
+                // Cut at page boundaries of title memory.
+                let pages_total = (start + to).div_ceil(PAGE) - (start + from) / PAGE;
+                let per = pages_total.div_ceil(threads);
+                let mut cuts = vec![from];
+                let mut page = (start + from) / PAGE;
+                loop {
+                    page += per;
+                    let cut = page * PAGE - start;
+                    if cut >= to {
+                        break;
+                    }
+                    cuts.push(cut);
+                }
+                cuts.push(to);
+                // Split the flags the same way (by title page).
+                let mut rest: &mut [bool] = &mut unchanged.pages;
+                let mut rest_first = first_page;
+                let mut jobs = Vec::new();
+                for w in cuts.windows(2) {
+                    let (lo, hi) = (w[0], w[1]);
+                    let end_page = (start + hi).div_ceil(PAGE).max((start + lo) / PAGE + 1);
+                    let take = end_page.saturating_sub(rest_first).min(rest.len());
+                    let (mine, more) = std::mem::take(&mut rest).split_at_mut(take);
+                    jobs.push((lo, hi, mine, rest_first));
+                    rest = more;
+                    rest_first += take;
+                }
+                let results: Vec<(usize, Vec<usize>)> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = jobs
+                        .into_iter()
+                        .map(|(lo, hi, mine, mine_first)| {
+                            let part = &part;
+                            scope.spawn(move || part(lo, hi, mine, mine_first))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+                });
+                for (w, s) in results {
+                    written += w;
+                    synced.extend(s);
+                }
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -610,6 +725,36 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_merge_matches_byte_merge() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 4) as u8
+        };
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 1000] {
+            for _ in 0..100 {
+                let old: Vec<u8> = (0..len).map(|_| next()).collect();
+                let host: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let title: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let (mut t1, mut h1) = (title.clone(), host.clone());
+                let (mut t2, mut h2) = (title.clone(), host.clone());
+                let fast = super::merge_gpu_writes(&mut t1, &mut h1, &old);
+                let mut slow = false;
+                for ((t, h), o) in t2.iter_mut().zip(h2.iter_mut()).zip(&old) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        slow = true;
+                    }
+                    *h = *t;
+                }
+                assert_eq!((fast, &t1, &h1), (slow, &t2, &h2), "len {len}");
+            }
+        }
+    }
     use std::ops::Range;
 
     #[test]
