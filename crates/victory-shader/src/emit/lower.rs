@@ -4805,6 +4805,29 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads `data` from the lane its byte address (plus
+            // the offset) names, modulo the wave size.
+            // shortcut: what an inactive source lane gives is taken from the
+            // host's WaveReadLaneAt, which leaves it undefined.
+            let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
+            if self.split || self.x.native.wave64 && !self.x.target.runs(64) {
+                return Err("a lane permute across the halves of a console wave64");
+            }
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("permute data")?, 1)?[0];
+            let o = self.s.m.i32(offset);
+            let a = self.s.m.bin(c, Bin::Add, a, o);
+            let two = self.s.m.i32(2);
+            let lane = self.s.m.bin(c, Bin::LShr, a, two);
+            let m = self.s.m.i32(wave - 1);
+            let lane = self.s.m.bin(c, Bin::And, lane, m);
+            let r = self.read_lane(x, lane);
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -15548,6 +15571,19 @@ mod tests {
             0x7E00_0206, // v_mov_b32 v0, s6
         ]);
         lowers_valu(&twice).unwrap();
+    }
+
+    /// `ds_bpermute_b32` reads the data of the lane its byte address names:
+    /// a wave read at (address + offset) / 4, not an LDS access (the
+    /// program allocates no LDS).
+    #[test]
+    fn a_backward_permute_reads_the_lane_its_address_names() {
+        lowers_valu(&[
+            0xDACC_0004,
+            0x0000_0201, // ds_bpermute_b32 v0, v1, v2 offset:4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ])
+        .unwrap();
     }
 
     /// Lowers a one-thread compute program that copies four root constants
