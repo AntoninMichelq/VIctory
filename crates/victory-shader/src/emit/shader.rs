@@ -378,7 +378,10 @@ impl Shader {
         };
         // Out-of-bounds indices (garbage from dropped passes) read slot 0,
         // so a heap read cannot page-fault the host GPU past the heap's end.
-        let limit = self.m.i32(if sampler { 2048 } else { 1_000_000 });
+        // Views: a view heap may hold more than 1,000,000 slots on resource
+        // binding tier 3 (title slots plus dynamic ones), so only indices
+        // far past any heap (negative ones, say) are clamped.
+        let limit = self.m.i32(if sampler { 2048 } else { 1 << 22 });
         let zero = self.m.i32(0);
         let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
         let index = self.m.select(block, in_bounds, index, zero);
