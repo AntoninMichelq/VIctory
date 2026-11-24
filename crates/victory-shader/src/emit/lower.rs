@@ -113,6 +113,14 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: per heap index joined per lane by control flow, the
+    /// index each path brings, in predecessor order.
+    #[cfg(test)]
+    pub heap_paths: Vec<Vec<String>>,
+    /// Test builds: heap handles whose index is read from the first lane
+    /// (descriptors read from the first lane outside a waterfall loop).
+    #[cfg(test)]
+    pub first_lane_handles: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -594,6 +602,17 @@ struct Lower<'a> {
     /// Per-lane descriptor joins being lowered: IR block and the heap index
     /// phi there (what [`Source::Carried`] reads).
     lane_paths: Vec<(usize, V)>,
+    /// Heap indexes of descriptors read from the first lane outside a
+    /// waterfall loop, by access and samplerness (see
+    /// [`Self::first_lane_indices`]).
+    /// Each lane's own index, then the first lane's.
+    first_lane_index: HashMap<(Site, bool), Result<(V, V), Why>>,
+    /// See [`Lowered::heap_paths`].
+    #[cfg(test)]
+    heap_paths: Vec<Vec<String>>,
+    /// See [`Lowered::first_lane_handles`].
+    #[cfg(test)]
+    first_lane_handles: u32,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
 }
@@ -1344,6 +1363,11 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             spun: 0,
             lane_paths: Vec::new(),
+            first_lane_index: HashMap::new(),
+            #[cfg(test)]
+            heap_paths: Vec::new(),
+            #[cfg(test)]
+            first_lane_handles: 0,
             pending_paths: Vec::new(),
             dead,
         }
@@ -1948,6 +1972,10 @@ impl<'a> Lower<'a> {
             spin_loops: self.spun,
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
+            #[cfg(test)]
+            heap_paths: std::mem::take(&mut self.heap_paths),
+            #[cfg(test)]
+            first_lane_handles: self.first_lane_handles,
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -3802,6 +3830,83 @@ impl<'a> Lower<'a> {
             r = self.s.m.select(c, is, read, r);
         }
         r
+    }
+
+    /// `x` of the first active lane, as `v_readfirstlane_b32` `inst`
+    /// reads it: under console flow, the console's first lane in the EXEC
+    /// it reads (lane 0 when none).
+    fn read_first_lane(&mut self, inst: &Inst, x: V) -> Result<V, Why> {
+        let c = self.cur;
+        if !self.console_cf {
+            self.s.flags |= flags::WAVE_OPS;
+            return Ok(self.s.op(
+                c,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                118,
+                &[x],
+            ));
+        }
+        let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+            match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
+                Val::I32(x) => Ok(x),
+                _ => Err(LANE_MASK),
+            }
+        };
+        let lo = word(self, EXEC)?;
+        let hi = if self.x.native.wave64 {
+            word(self, EXEC + 1)?
+        } else {
+            self.s.m.i32(0)
+        };
+        let i32t = self.s.t.i32;
+        let flo = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+        let fhi = self.s.m.select(c, none_hi, z, fhi);
+        let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
+        let first = self.s.m.select(c, some_lo, flo, fhi);
+        Ok(self.console_read_lane(x, first))
+    }
+
+    /// At the `v_readfirstlane_b32` `inst` of the first dword of
+    /// descriptors read from the first lane outside a waterfall loop
+    /// ([`resource::Resources::first_lane`]): their heap index, each
+    /// lane's own read from the first active lane there, as the console
+    /// reads the dwords. The handle made at the access takes it.
+    fn first_lane_indices(&mut self, inst: &Inst) -> Result<(), Why> {
+        let Some(&(_, read)) = inst.writes.first() else {
+            return Ok(());
+        };
+        let res = self.x.res;
+        for f in res
+            .first_lane
+            .iter()
+            .filter(|f| f.reads.first() == Some(&read))
+        {
+            let sampler = f.role == Role::Sampler;
+            let Some(d) = res
+                .descriptors
+                .iter()
+                .find(|d| d.site == f.site && d.role == f.role)
+            else {
+                continue;
+            };
+            // A failure here stops the access, at its handle.
+            let index = match self.lane_heap_index(&d.source, sampler) {
+                Ok(own) => self.read_first_lane(inst, own).map(|first| (own, first)),
+                Err(why) => Err(why),
+            };
+            self.first_lane_index.insert((f.site, sampler), index);
+        }
+        Ok(())
     }
 
     /// Console flow: `x` of console lane `lane` (uniform), from whichever
@@ -6067,7 +6172,9 @@ impl<'a> Lower<'a> {
             Source::Fetched { .. } | Source::Lanes { .. } | Source::Paths { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
-                // index, non-uniform.
+                // index, non-uniform. Outside a waterfall loop, the first
+                // lane's serves all: the index read from it at the reads,
+                // uniform.
                 let io = &self.x.io.inputs;
                 if self
                     .x
@@ -6079,10 +6186,36 @@ impl<'a> Lower<'a> {
                 {
                     return Err("a per-lane descriptor joined with a VGPR the hardware sets");
                 }
+                let role = if sampler {
+                    Role::Sampler
+                } else {
+                    Role::Resource
+                };
+                if self
+                    .x
+                    .res
+                    .first_lane
+                    .iter()
+                    .any(|f| f.site == site && f.role == role)
+                {
+                    let (_, index) = *self
+                        .first_lane_index
+                        .get(&(site, sampler))
+                        .ok_or("a descriptor read from the first lane outside a waterfall loop")?
+                        .as_ref()
+                        .map_err(|why| *why)?;
+                    #[cfg(test)]
+                    {
+                        self.first_lane_handles += 1;
+                    }
+                    return Ok(self.s.heap_handle(self.cur, index, sampler, false, props));
+                }
                 let index = self.lane_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
-            Source::Carried { .. } | Source::Unset => Err("a per-lane descriptor out of a join"),
+            Source::Carried { .. } | Source::Unset | Source::NoDescriptor => {
+                Err("a per-lane descriptor out of a join")
+            }
         }
     }
 
@@ -6122,8 +6255,9 @@ impl<'a> Lower<'a> {
                 .find(|p| p.0 == *block)
                 .map(|p| p.1)
                 .ok_or("a per-lane descriptor carried out of its loop"),
-            // Undefined: any index will do.
-            Source::Unset => Ok(self.s.m.i32(0)),
+            // Undefined, or a path no lane takes to the access: any index
+            // will do.
+            Source::Unset | Source::NoDescriptor => Ok(self.s.m.i32(0)),
             _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
         }
     }
@@ -6165,7 +6299,10 @@ impl<'a> Lower<'a> {
             let done = incoming
                 .into_iter()
                 .map(|(q, x)| (x.unwrap(), self.edge_block(q, block)));
-            let done = done.collect();
+            let done: Vec<(V, usize)> = done.collect();
+            #[cfg(test)]
+            self.heap_paths
+                .push(done.iter().map(|d| self.s.m.show(d.0)).collect());
             self.s.m.set_phi(phi, done);
         } else {
             self.pending_paths.push(PendingPath {
@@ -6202,6 +6339,9 @@ impl<'a> Lower<'a> {
                 incoming.push((x, at));
             }
             self.lane_paths = saved;
+            #[cfg(test)]
+            self.heap_paths
+                .push(incoming.iter().map(|d| self.s.m.show(d.0)).collect());
             self.s.m.set_phi(pending.phi, incoming);
         }
         Ok(())
@@ -6388,6 +6528,27 @@ impl<'a> Lower<'a> {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
             self.lane(inst, Some(true));
+            return Ok(());
+        }
+        if let Some(f) = self
+            .x
+            .res
+            .first_lane
+            .iter()
+            .find(|f| f.compares.contains(&(b, i)))
+        {
+            // The first lane's dwords against the lane's own, outside a
+            // waterfall loop: whether the lane's descriptor is the first
+            // lane's, by heap index (dwords in heap memory are no data).
+            let key = (f.site, f.role == Role::Sampler);
+            let (own, first) = *self
+                .first_lane_index
+                .get(&key)
+                .ok_or("a descriptor read from the first lane outside a waterfall loop")?
+                .as_ref()
+                .map_err(|why| *why)?;
+            let r = self.s.m.cmp(self.cur, pred::EQ, own, first);
+            self.lane_bits_for(inst, r);
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
@@ -7363,48 +7524,12 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
-            "v_readfirstlane_b32" if self.console_cf => {
-                // The console's first lane in EXEC (lane 0 when none).
-                let a = s(self, 0)?;
-                let word = |l: &mut Self, r: u8| -> Result<V, Why> {
-                    match l.get(inst.read(Reg::S(r)).ok_or("EXEC")?)? {
-                        Val::I32(x) => Ok(x),
-                        _ => Err(LANE_MASK),
-                    }
-                };
-                let lo = word(self, EXEC)?;
-                let hi = if self.x.native.wave64 {
-                    word(self, EXEC + 1)?
-                } else {
-                    self.s.m.i32(0)
-                };
-                let i32t = self.s.t.i32;
-                let flo = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-                let fhi = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-                let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
-                let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
-                let fhi = self.s.m.select(c, none_hi, z, fhi);
-                let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
-                let first = self.s.m.select(c, some_lo, flo, fhi);
-                let r = self.console_read_lane(a, first);
-                int(self, r)
-            }
             "v_readfirstlane_b32" => {
+                // Before the dword: a descriptor's may be no data (heap
+                // memory), unused once its index is read.
+                self.first_lane_indices(inst)?;
                 let a = s(self, 0)?;
-                self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = self.read_first_lane(inst, a)?;
                 int(self, r)
             }
             n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
@@ -12125,6 +12250,11 @@ mod tests {
         lower(&parts).map(|l| l.dxil)
     }
 
+    #[test]
+    fn code_tables_read_through_an_address_from_the_first_lane_lower() {
+        lowers(crate::resource::tests::CODE_TABLE_THROUGH_FIRST_LANE).unwrap();
+    }
+
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_with(words, vec![], vec![]).map(|_| ())
@@ -13012,6 +13142,71 @@ mod tests {
             ),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn descriptors_joined_with_paths_no_lane_takes_take_heap_index_0_there() {
+        use crate::resource::tests::{PHI_JUNK_UNIFORM_WAVE32, PHI_JUNK_WATERFALL_WAVE32};
+        // Tables of structured buffers of dwords at s0 and s1 (and a root
+        // constant at s2 that picks without the waterfall).
+        let buffers = |user_data, slot| UsedResource {
+            user_data,
+            slot,
+            ..dword_buffers()[0]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+        let used = || vec![buffers(0, 0), buffers(1, 1)];
+        // In the waterfall, lanes through the then branch take entry 0 of
+        // the table at s0 (its address over 32 bytes); the else branch's
+        // vertex data is no descriptor, so heap index 0.
+        let l = lower_with(PHI_JUNK_WATERFALL_WAVE32, layout(), used()).unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+        assert!(!l.wave_ops);
+        let index = |offset| format!("((? Add {offset}) LShr 5)");
+        assert_eq!(l.heap_paths, [vec![index(0), "0".into()]]);
+        // Without the waterfall: entry 0 or 1 when the uniform branch picks
+        // one, heap index 0 on the vertex data path.
+        let mut with_constant = layout();
+        with_constant.push(root(RootType::Constants, 2, 0));
+        let l = lower_with(PHI_JUNK_UNIFORM_WAVE32, with_constant, used()).unwrap();
+        assert_eq!(l.heap_paths.len(), 2);
+        assert!(l.heap_paths.contains(&vec![index(0), index(32)]));
+        assert!(l.heap_paths.iter().any(|p| p.len() == 2 && p[1] == "0"));
+    }
+
+    #[test]
+    fn first_lane_reads_outside_a_waterfall_take_the_first_lanes_heap_index() {
+        use crate::resource::tests::{phi_junk_narrowed, waterfall_without_back_edge};
+        // The fetched waterfall without its back edge: the image's heap
+        // index is each lane's own read from the first lane, one uniform
+        // handle; the compares compare heap indexes.
+        let (layout, used) = texture_tables();
+        let l = lower_wave(&waterfall_without_back_edge(), layout, used, false).unwrap();
+        assert_eq!(l.first_lane_handles, 1);
+        assert_eq!(l.nonuniform_handles, 0);
+        assert!(l.wave_ops);
+        // A per-lane join of two table entries and vertex data, read from
+        // the first lane behind a narrowed EXEC (and the same behind a
+        // uniform branch): the first lane's index of the join.
+        let buffers = |user_data, slot| UsedResource {
+            user_data,
+            slot,
+            ..dword_buffers()[0]
+        };
+        for words in [
+            phi_junk_narrowed(),
+            crate::resource::tests::PHI_JUNK_UNIFORM_WAVE32.to_vec(),
+        ] {
+            let layout = vec![
+                root(RootType::Table, 0, 0),
+                root(RootType::Table, 1, 1),
+                root(RootType::Constants, 2, 0),
+            ];
+            let l = lower_with(&words, layout, vec![buffers(0, 0), buffers(1, 1)]).unwrap();
+            assert_eq!(l.first_lane_handles, 1);
+            assert_eq!(l.nonuniform_handles, 0);
+            assert!(l.wave_ops);
+        }
     }
 
     /// A table at s0 holding structured buffers of dwords.
