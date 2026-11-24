@@ -181,6 +181,10 @@ enum Stop {
 
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
+/// Why a value made from `s_getpc_b64` (the opcode's refusal) is missing:
+/// code addresses are read only through [`Lower::code_dword`].
+const CODE_ADDRESS: Why = "s_getpc_b64";
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     match lower_program(parts, false) {
         Err(ShaderError::Unsupported {
@@ -12690,6 +12694,15 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
+                    // A code address (`s_getpc_b64` plus a table's distance,
+                    // read only through the code table) left in registers
+                    // the program reuses for data: junk on that edge, as a
+                    // dead descriptor dword, assuming the joined value is
+                    // read only after a data edge (lanes the branch that
+                    // skipped the reuse leaves are written on the other).
+                    (Some(Val::Missing(CODE_ADDRESS)), false) if has_data => {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         if why == LANE_MASK {
                             self.lane_mask_note(phi.value, "a join");
@@ -13011,6 +13024,83 @@ mod tests {
             per_lane_only: false,
         };
         lower(&parts).map(|l| l.dxil)
+    }
+
+    /// A per-lane read of a table in the code (the eye shaders' form): the
+    /// index sign-extended to 64 bits and shifted by `v_lshlrev_b64`, then
+    /// added to `s_getpc_b64` plus the table's distance with a 64-bit VALU
+    /// add, and read by `global_load_dword`.
+    const CODE_TABLE_PER_LANE_64: &[u32] = &[
+        0xBE8C_1F00, // s_getpc_b64 s[12:13]
+        0x800C_BC0C, // s_add_u32 s12, s12, 60 (the table, at byte 64)
+        0x820D_800D, // s_addc_u32 s13, s13, 0
+        0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+        0x3004_029F, // v_ashrrev_i32 v2, 31, v1
+        0xD6FF_0002,
+        0x0002_0282, // v_lshlrev_b64 v[2:3], 2, v[1:2]
+        0xD70F_6A02,
+        0x0000_1902, // v_add_co_u32 v2, vcc_lo, v2, s12
+        0x5006_060D, // v_add_co_ci_u32 v3, vcc_lo, s13, v3, vcc_lo
+        0xDC30_8000,
+        0x047D_0002, // global_load_dword v4, v[2:3], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0400, // ds_write_b32 v0, v4
+        0xBF81_0000, // s_endpgm
+        0x11, 0x22, 0x33, 0x44, // the table
+    ];
+
+    #[test]
+    fn code_tables_read_per_lane_through_a_64_bit_index_lower() {
+        lowers(CODE_TABLE_PER_LANE_64).unwrap();
+        // The same with global_load_dwordx2 v[4:5] and both dwords stored.
+        let mut w = CODE_TABLE_PER_LANE_64.to_vec();
+        w[10] = 0xDC34_8000;
+        w[13] = 0xD838_0000; // ds_write_b64 v0, v[4:5]
+        lowers(&w).unwrap();
+        // The index offset by a constant before it is extended (the eye
+        // shaders read an entry's neighbour as `2 * i + 3`).
+        let mut w = CODE_TABLE_PER_LANE_64.to_vec();
+        w[1] = 0x800C_C00C; // s_add_u32 s12, s12, 64 (the table moved a dword)
+        w.insert(4, 0x4A02_0283); // v_add_nc_u32 v1, 3, v1
+        lowers(&w).unwrap();
+    }
+
+    /// A code table's address left in VGPRs the program then reuses for
+    /// data on one side of a branch (the eye shaders' form): the join of
+    /// the address and the data is the data.
+    const CODE_ADDRESS_REUSED: &[u32] = &[
+        0xBE8C_1F00, // s_getpc_b64 s[12:13]
+        0x800C_FF0C,
+        96, // s_add_u32 s12, s12, 96 (the table, at byte 100)
+        0x820D_800D, // s_addc_u32 s13, s13, 0
+        0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+        0x3004_029F, // v_ashrrev_i32 v2, 31, v1
+        0xD6FF_0002,
+        0x0002_0282, // v_lshlrev_b64 v[2:3], 2, v[1:2]
+        0xD70F_6A02,
+        0x0000_1902, // v_add_co_u32 v2, vcc_lo, v2, s12
+        0x5006_060D, // v_add_co_ci_u32 v3, vcc_lo, s13, v3, vcc_lo
+        0xDC30_8000,
+        0x047D_0002, // global_load_dword v4, v[2:3], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0x7E04_0304, // v_mov_b32 v2, v4
+        0x8A7E_7E00, // s_andn2_b32 exec_lo, s0, exec_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
+        0x11, 0x22, 0x33, 0x44, // the table
+    ];
+
+    #[test]
+    fn code_addresses_joined_with_data_are_the_data() {
+        lowers(CODE_ADDRESS_REUSED).unwrap();
     }
 
     #[test]
