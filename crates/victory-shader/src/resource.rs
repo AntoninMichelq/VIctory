@@ -974,25 +974,27 @@ impl<'a> Tracer<'a> {
         self.shifted_base(lo, hi, extra)
     }
 
-    /// `t` through joins and `v_cndmask_b32` whose every input is `t`'s
-    /// one value or the join itself (a value a loop carries or keeps):
-    /// that value. `None` for a join reached again (no value of its own).
-    fn one_value(&self, t: Term, seen: &mut Vec<Value>) -> Option<Term> {
-        let Term::Value(v) = t else { return Some(t) };
-        let args: Vec<Term> = if let Some((block, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return None;
-            }
-            if seen.len() > 16 {
-                return Some(t);
-            }
+    /// The values `t` may hold through joins and `v_cndmask_b32` (a join
+    /// reached again adds nothing).
+    fn join_leaves(&self, t: Term, seen: &mut Vec<Value>, out: &mut Vec<Term>) -> Option<()> {
+        let Term::Value(v) = t else {
+            out.push(t);
+            return Some(());
+        };
+        if seen.contains(&v) {
+            return Some(());
+        }
+        if seen.len() > 32 || out.len() > 32 {
+            return None;
+        }
+        if let Some((block, i)) = self.phis[v.0 as usize] {
             seen.push(v);
-            self.p.blocks[block].phis[i]
-                .args
-                .iter()
-                .map(|&a| self.vorigin(a))
-                .collect()
-        } else if let Some(inst) = self.def(v)
+            for &a in &self.p.blocks[block].phis[i].args {
+                self.join_leaves(self.vorigin(a), seen, out)?;
+            }
+            return Some(());
+        }
+        if let Some(inst) = self.def(v)
             && inst.name() == "v_cndmask_b32"
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
@@ -1000,30 +1002,50 @@ impl<'a> Tracer<'a> {
             && f.sdwa.is_none()
             && f.dpp.is_none()
         {
-            if seen.contains(&v) || seen.len() > 16 {
-                return Some(t);
-            }
             seen.push(v);
-            let (Some(a), Some(b)) = (
-                f.src.first().and_then(|o| self.vterm(inst, o)),
-                f.src.get(1).and_then(|o| self.vterm(inst, o)),
-            ) else {
-                return Some(t);
-            };
-            vec![a, b]
-        } else {
-            return Some(t);
-        };
-        let mut one = None;
-        for a in args {
-            match self.one_value(a, seen) {
-                None => {}
-                Some(x) if one.is_none_or(|o| o == x) => one = Some(x),
-                Some(_) => return Some(t),
+            for o in f.src.iter().take(2) {
+                self.join_leaves(self.vterm(inst, o)?, seen, out)?;
             }
+            return Some(());
         }
-        // A join of nothing but itself is no value: keep `t`.
-        Some(one.unwrap_or(t))
+        out.push(t);
+        Some(())
+    }
+
+    /// The scalar load and first dword of a buffer descriptor whose first
+    /// two dwords (the high one masked) `t`, the low half of an
+    /// `s_lshr_b64` by 8, shifts.
+    fn shifted_dwords(&self, t: Term) -> Option<(Site, usize)> {
+        let Term::Value(y) = t else { return None };
+        let shr = self.def(y)?;
+        if shr.name() != "s_lshr_b64" || shr.writes.first()?.1 != y {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &shr.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code: s1, .. }, amount] = &src[..] else {
+            return None;
+        };
+        if self.term(shr, amount)? != Term::Const(8) {
+            return None;
+        }
+        let Term::Value(w0) = self.origin(shr.read(Reg::S(*s1))?) else {
+            return None;
+        };
+        let w1 = match self.origin(shr.read(Reg::S(s1 + 1))?) {
+            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [Term::Value(w), Term::Const(m)] | [Term::Const(m), Term::Value(w)]))
+                    if m & 0xff == 0xff =>
+                {
+                    w
+                }
+                _ => v,
+            },
+            Term::Const(_) => return None,
+        };
+        let (site, first) = self.loaded_dword(w0)?;
+        (self.loaded_dword(w1)? == (site, first + 1)).then_some((site, first))
     }
 
     /// The two operands of `v` if a plain VOP2/VOP3 `names` wrote it.
@@ -1138,43 +1160,30 @@ impl<'a> Tracer<'a> {
         // `y`: the low half of a 64-bit shift right by 8 of the
         // descriptor's first two dwords (perhaps carried around a loop).
         step.set("the value through joins");
-        let Term::Value(y) = self.one_value(pair[0], &mut Vec::new())? else {
-            return None;
-        };
+        // Each value the joins may bring: the same descriptor dwords
+        // shifted right by 8 (perhaps by several instructions).
+        let mut leaves = Vec::new();
+        self.join_leaves(pair[0], &mut Vec::new(), &mut leaves)?;
         step.set("the right shift");
-        let shr = self.def(y)?;
-        if shr.name() != "s_lshr_b64" || shr.writes.first()?.1 != y {
-            return None;
-        }
-        let Fields::Sop { src, .. } = &shr.fields else {
-            return None;
-        };
-        let [Operand::Scalar { code: s1, .. }, amount] = &src[..] else {
-            return None;
-        };
-        if self.term(shr, amount)? != Term::Const(8) {
-            return None;
-        }
-        step.set("the descriptor's low dword");
-        let Term::Value(w0) = self.origin(shr.read(Reg::S(*s1))?) else {
-            return None;
-        };
-        let w1 = match self.origin(shr.read(Reg::S(s1 + 1))?) {
-            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
-                Some((_, [Term::Value(w), Term::Const(m)] | [Term::Const(m), Term::Value(w)]))
-                    if m & 0xff == 0xff =>
-                {
-                    w
+        let mut found = None;
+        for y in leaves {
+            let Some(at) = self.shifted_dwords(y) else {
+                if std::env::var("VICTORY_DESCRIBED_DEBUG").is_ok_and(|v| v.trim() == "1") {
+                    let name = match y {
+                        Term::Value(v) => self.def(v).map_or("(no instruction)", |i| i.name()),
+                        Term::Const(_) => "(constant)",
+                    };
+                    eprintln!("described base: a joined value from {name}");
                 }
-                _ => v,
-            },
-            Term::Const(_) => return None,
-        };
-        step.set("the loaded dwords");
-        let (site, first) = self.loaded_dword(w0)?;
-        if self.loaded_dword(w1)? != (site, first + 1) {
-            return None;
+                return None;
+            };
+            if found.is_some_and(|f| f != at) {
+                return None;
+            }
+            found = Some(at);
         }
+        step.set("the loaded dwords");
+        let (site, first) = found?;
         let load = self.inst(site);
         if !matches!(load.fields, Fields::Smem { .. }) || !load.name().starts_with("s_load_dword") {
             return None;
