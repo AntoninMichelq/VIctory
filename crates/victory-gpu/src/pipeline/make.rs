@@ -368,7 +368,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         let frame = crate::frame::current();
         start(p, frame.saturating_add(1));
         if p.graphics.is_none() && dispatches_wait() {
-            wait_made(p, Duration::from_secs(30));
+            wait_made(p, Duration::from_secs(5));
         } else {
             wait(p, frame);
         }
@@ -410,7 +410,8 @@ pub(crate) fn early(p: &Arc<Pending>) {
 }
 
 /// `VICTORY_DISPATCH_WAIT=1` (opt-in): a compute dispatch whose pipeline is
-/// not made yet waits for it (up to 30 s) instead of being dropped. A
+/// not made yet waits for it (up to 5 s: the title ends itself after
+/// ~30 s in one frame) instead of being dropped. A
 /// dropped dispatch leaves data later passes read wrong (culling, light
 /// lists, indirect arguments), so geometry built on it goes missing for
 /// as long as it compiles; draws keep the frame budget.
@@ -428,18 +429,34 @@ fn dispatches_wait() -> bool {
 /// Waits for `p` until it is made or `limit` passes, outside the frame
 /// budget (counted as a pipeline wait in the frame CPU split).
 fn wait_made(p: &Pending, limit: Duration) {
+    // At most 10 s of such waits per title frame (summed over dispatches
+    // and threads): the title ends itself after ~30 s in one frame.
+    const PER_FRAME_US: u64 = 10_000_000;
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SPENT_US: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        SPENT_US.store(0, Ordering::Relaxed);
+    }
+    let spent = SPENT_US.load(Ordering::Relaxed);
+    if spent >= PER_FRAME_US {
+        return;
+    }
+    let limit = limit.min(Duration::from_micros(PER_FRAME_US - spent));
     let started = Instant::now();
     let mut held = p.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = limit.saturating_sub(started.elapsed());
         if rest.is_zero() {
-            tracing::warn!(key = %p.key, "a dispatch's pipeline still not made after 30 s; dropped");
+            tracing::warn!(key = %p.key, "a dispatch's pipeline not made within its wait; dropped");
             break;
         }
         held = p.wait_done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    crate::draw::BLOCKED_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    SPENT_US.fetch_add(us, Ordering::Relaxed);
+    crate::draw::BLOCKED_US[0].fetch_add(us, Ordering::Relaxed);
 }
 
 /// Waits for `p` while frame `frame` has budget left, reserving budget

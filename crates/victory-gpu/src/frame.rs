@@ -91,11 +91,14 @@ static OFFSETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// `VICTORY_PRELOAD` (opt-in, seconds; `1` means 300): while pipelines the
 /// last run drew with and the title has just created are still being made,
-/// the next frame waits for them, up to that long in all, so the world's
+/// frames wait for them (5 s at most per frame), up to that long in all, so the world's
 /// first frames (a cutscene that runs on real time) do not start with
-/// hundreds of draws dropped. A title with a watchdog on frame time may
-/// not like long waits. Unset or 0: frames never wait for them.
+/// hundreds of draws dropped. The title ends itself after ~30 s in one
+/// frame, hence the per-frame cap. Unset or 0: frames never wait for them.
 fn preload() {
+    /// Longest wait in one frame: the title raised a deliberate null write
+    /// after 30 s in a single frame wait.
+    const PER_FRAME: Duration = Duration::from_secs(5);
     static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     static SPENT_MS: AtomicU64 = AtomicU64::new(0);
     let budget = *BUDGET.get_or_init(|| {
@@ -116,7 +119,9 @@ fn preload() {
     loop {
         let left = crate::pipeline::early_left();
         let spent = Duration::from_millis(SPENT_MS.load(Ordering::Relaxed)) + started.elapsed();
-        if left == 0 || spent >= budget {
+        // The title ends itself after ~30 s in one frame (a watchdog):
+        // one frame waits at most PER_FRAME, the rest goes to later ones.
+        if left == 0 || spent >= budget || started.elapsed() >= PER_FRAME {
             break;
         }
         if logged.elapsed() >= Duration::from_secs(2) {
