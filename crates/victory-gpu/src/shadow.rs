@@ -47,6 +47,10 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Per 64 KiB page of title memory not write-watched: a hash of what
+    /// the copy last took from it (0: unknown). A refresh that finds the
+    /// same hash leaves the copy alone (see [`Shadow::copy_hashed`]).
+    hashes: Mutex<Vec<u64>>,
     /// Ranges refreshed whole in one watch generation (see
     /// [`crate::watch::generation`]): asked again in it, nothing changed.
     refreshed: Mutex<(u64, Vec<(usize, usize)>)>,
@@ -374,6 +378,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(WATCH_UNKNOWN),
             pending: Mutex::default(),
+            hashes: Mutex::default(),
             refreshed: Mutex::default(),
             before: Mutex::default(),
             used: std::sync::atomic::AtomicU64::new(0),
@@ -409,6 +414,8 @@ impl Shadow {
     /// from the copy as it is now, in reused page buffers (fresh snapshots
     /// cost ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        // The GPU may change the copy there: hashes no longer tell.
+        self.forget_hashes(address, address + len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -749,8 +756,7 @@ impl Shadow {
             add(C::UnwatchedRanges, 1);
             add(C::UnwatchedBytes, (to - from) as u64);
         }
-        self.copy(from, to);
-        to - from
+        self.copy_hashed(from, to)
     }
 
     /// [`Shadow::update_free`] of a range the write watch could not answer
@@ -807,6 +813,7 @@ impl Shadow {
                     if !(whole && *slot == ZEROED) {
                         // SAFETY: inside the mapping (offsets in the buffer).
                         unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+                        self.forget_hashes(a, b);
                         *slot = if whole { ZEROED } else { 0 };
                         #[cfg(feature = "diagnostics")]
                         add(C::Unmapped, (b - a) as u64);
@@ -832,7 +839,73 @@ impl Shadow {
             add(C::UnwatchedRanges, 1);
             add(C::UnwatchedBytes, (to - from) as u64);
         }
-        self.copy(from, to)
+        self.copy_hashed(from, to)
+    }
+
+    /// Forgets the page hashes of title memory `[from, to)`.
+    fn forget_hashes(&self, from: usize, to: usize) {
+        let mut hashes = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if hashes.is_empty() || from >= to {
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        let first = (from / PAGE).saturating_sub(base).min(hashes.len());
+        let last = ((to - 1) / PAGE + 1).saturating_sub(base).min(hashes.len());
+        hashes[first..last].fill(0);
+    }
+
+    /// [`Shadow::copy`] of memory the write watch cannot answer for: each
+    /// whole page is read and hashed first, and written to the copy only
+    /// if it changed since the copy last took it. The world refreshed
+    /// ~1.4 GB of such memory a frame under root UAVs (views to the ends
+    /// of big buffers), mostly unchanged; writing the GPU's upload memory
+    /// is the costly part. `VICTORY_UNWATCHED_HASH=0` copies all.
+    fn copy_hashed(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if !hash_unwatched() {
+            self.forget_hashes(from, to);
+            return self.copy(from, to);
+        }
+        let base = start / PAGE;
+        let mut hashes = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if hashes.is_empty() {
+            hashes.resize((end - 1) / PAGE + 1 - base, 0);
+        }
+        let mut buf = page_buffer();
+        let page_bytes = &mut buf[..PAGE];
+        let mut written = 0;
+        let mut at = from;
+        while at < to {
+            let page = at / PAGE;
+            let next = ((page + 1) * PAGE).min(to);
+            let slot = &mut hashes[page - base];
+            if at != page * PAGE || next != (page + 1) * PAGE {
+                // Part of a page: copied, and its hash no longer stands.
+                *slot = 0;
+                written += self.copy(at, next);
+            } else if crate::host::read_into(at as *const u8, page_bytes) {
+                let hash = page_hash(page_bytes).max(1);
+                if *slot != hash {
+                    *slot = hash;
+                    // SAFETY: a whole page inside the mapping.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(page_bytes.as_ptr(), self.data.add(at - start), PAGE);
+                    }
+                    written += PAGE;
+                }
+            } else {
+                // Not all readable: as before (zeros where unmapped).
+                *slot = 0;
+                written += self.copy(at, next);
+            }
+            at = next;
+        }
+        give_back(Some(buf));
+        written
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -1258,6 +1331,32 @@ fn batch_asks() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_SRV_BATCH_ASK").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Whether refreshes of memory the write watch cannot answer for compare
+/// page hashes first: `VICTORY_UNWATCHED_HASH=0` turns it off.
+fn hash_unwatched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_UNWATCHED_HASH").map_or(true, |v| v.trim() != "0"))
+}
+
+/// A 64-bit hash of a page (four multiply-xor lanes over 8-byte words):
+/// to tell a changed page from an unchanged one, not against adversaries.
+fn page_hash(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let (chunks, rest) = bytes.as_chunks::<32>();
+    for c in chunks {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let w = u64::from_le_bytes(c[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+            *lane = (*lane ^ w).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut h = lanes.iter().fold(bytes.len() as u64, |h, &l| (h ^ l).wrapping_mul(K).rotate_left(31));
+    for &b in rest {
+        h = (h ^ u64::from(b)).wrapping_mul(K);
+    }
+    h ^ (h >> 29)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1676,6 +1775,30 @@ mod tests {
         // SAFETY: the copy's mapping covers the allocation.
         let copied = unsafe { t.shadow.data.add(PAGE + 16).cast::<u32>().read() };
         assert_eq!(copied, 9);
+    }
+
+    /// Memory refreshed without the write watch: a page is written to the
+    /// copy only when its contents changed, and a GPU write range makes it
+    /// taken again.
+    #[test]
+    fn unwatched_pages_are_copied_when_they_change() {
+        let Some(t) = Watched::new() else {
+            return;
+        };
+        let page = t.base + PAGE;
+        // SAFETY: inside the test's allocation.
+        unsafe { (page as *mut u32).write(3) };
+        assert_eq!(t.shadow.copy_hashed(page, page + PAGE), PAGE);
+        assert_eq!(t.shadow.copy_hashed(page, page + PAGE), 0);
+        // SAFETY: as above.
+        unsafe { ((page + 100) as *mut u32).write(4) };
+        assert_eq!(t.shadow.copy_hashed(page, page + PAGE), PAGE);
+        // SAFETY: the copy's mapping covers the allocation.
+        assert_eq!(unsafe { t.shadow.data.add(PAGE + 100).cast::<u32>().read() }, 4);
+        t.shadow.forget_hashes(page, page + 4);
+        assert_eq!(t.shadow.copy_hashed(page, page + PAGE), PAGE);
+        // Part of a page is copied as asked.
+        assert_eq!(t.shadow.copy_hashed(page + 8, page + 24), 16);
     }
 
     /// Small ranges in one page (as directly indexed SRVs ask for them): the
