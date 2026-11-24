@@ -36,7 +36,8 @@ pub struct Address {
     /// or picked by a branch between offsets from the parameter): it holds
     /// the parameter's address plus a varying offset, so the byte offset
     /// from the parameter is `dynamic` minus the parameter's first dword,
-    /// plus `offset`. Never set for [`CODE`].
+    /// plus `offset`. For [`CODE`], `dynamic` is the code address itself
+    /// (lowering makes `s_getpc_b64` the byte offset in the code).
     pub includes_base: bool,
 }
 
@@ -1174,6 +1175,20 @@ impl<'a> Tracer<'a> {
             .ok()
             .flatten()
             .ok_or(WHY)?;
+        if let Some(pc) = self.getpc(base) {
+            // A table in the code: the pointer is a code address, which
+            // lowering makes the byte offset in the code.
+            let high = pc.writes.get(1).map(|w| w.1);
+            if !self.pointer_high(hi, high, &mut Vec::new(), &mut budget) {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: CODE,
+                offset,
+                dynamic: Some(d),
+                includes_base: true,
+            });
+        }
         let reg = self.inputs[base.0 as usize].ok_or(WHY)?;
         let (param, _) = self.param_of(reg).ok_or(WHY)?;
         let high = match self.layout[param].root {
@@ -1212,9 +1227,10 @@ impl<'a> Tracer<'a> {
             return Ok(None);
         }
         if let Some(base) = self.sum(t).base {
-            // Program-counter tables are not tracked through phis.
+            // A root parameter, or the program counter (a table in the code).
             return match self.inputs[base.0 as usize] {
                 Some(_) => Ok(Some(base)),
+                None if self.getpc(base).is_some() => Ok(Some(base)),
                 None => Err(()),
             };
         }

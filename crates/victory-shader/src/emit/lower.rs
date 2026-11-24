@@ -2560,7 +2560,9 @@ impl<'a> Lower<'a> {
             return Ok(Some(d));
         }
         if a.param == CODE {
-            return Err("an address from a phi");
+            // `s_getpc_b64` lowers to the byte offset in the code, so the
+            // pointer is the byte offset itself.
+            return Ok(Some(d));
         }
         // VGPRs the pointer's phis join before any write are undefined only
         // if the hardware does not set them.
@@ -4778,6 +4780,18 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // The program counter as a byte offset in the code (the next
+        // instruction's): a table in the code reached through a pointer the
+        // code keeps in a phi reads at that offset ([`Self::dynamic_term`]).
+        if name == "s_getpc_b64"
+            && let Some(code) = dst_code
+        {
+            let pc = self.s.m.i32(inst.machine.offset as u32 + 4);
+            let zero = self.s.m.i32(0);
+            self.write(inst, Reg::S(code), pc, None);
+            self.write(inst, Reg::S(code + 1), zero, None);
+            return Ok(());
+        }
         // A lane mask written by a set operation also gets its value as a
         // number, from its sources' numbers. A ballot where the mask is
         // written misses the lanes it holds that do not run there: a loop's
@@ -13328,6 +13342,42 @@ mod tests {
         ];
         let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
         lower_wave(&words, layout, dword_buffers(), true).unwrap();
+    }
+
+    /// A table in the code read through a pointer the code keeps in a VGPR
+    /// phi (the strand interpolation shape): `s_getpc_b64` plus the table's
+    /// distance, plus a per-lane index that differs per path.
+    #[test]
+    fn a_code_table_read_through_a_joined_pointer_lowers() {
+        let mut words = vec![
+            0xBE82_1F00, // s_getpc_b64 s[2:3]
+            0x8002_FF02,
+            0x0000_005C, // s_add_u32 s2, s2, 0x5c (the table at byte 96)
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0x3608_0087, // v_and_b32_e32 v4, 7, v0
+            0x3408_0883, // v_lshlrev_b32_e32 v4, 3, v4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0005, // s_cbranch_scc1 B
+            0xD70F_6A05,
+            0x0002_0802, // v_add_co_u32 v5, vcc_lo, s2, v4
+            0xD528_6A06,
+            0x01A9_0003, // v_add_co_ci_u32_e64 v6, vcc_lo, s3, 0, vcc_lo
+            0xBF82_0005, // s_branch J
+            0x3A0E_0888, // B: v_xor_b32_e32 v7, 8, v4
+            0xD70F_6A05,
+            0x0002_0E02, // v_add_co_u32 v5, vcc_lo, s2, v7
+            0xD528_6A06,
+            0x01A9_0003, // v_add_co_ci_u32_e64 v6, vcc_lo, s3, 0, vcc_lo
+            0xDC34_8000,
+            0x087D_0005, // J: global_load_dwordx2 v[8:9], v[5:6], off
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        words.extend(0..16u32);
+        let l = lower_with(&words, vec![root(RootType::Constants, 0, 0)], vec![]);
+        l.unwrap();
     }
 
     /// Lowers a compute program of constants: whether it translates.
