@@ -582,6 +582,35 @@ impl HostHeap {
     }
 
     /// Slot `index` as a null raw buffer SRV: reads return 0.
+    /// A null raw UAV (writes dropped, reads 0) at slot `index`.
+    pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        self.keep(index, None);
+        self.set_stride(index, 0);
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 1,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+    }
+
     pub(crate) fn null_raw_srv_at(&self, index: u32) {
         self.keep(index, None);
         self.set_stride(index, 0);
