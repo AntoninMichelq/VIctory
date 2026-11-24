@@ -2707,11 +2707,11 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(c, pred::NE, any, z))
     }
 
-    /// For a wave32 program under [`MaskData::Host`], a 32-bit scalar operand
+    /// For a wave32 program under [`MaskData::Host`] (or a mesh program), a 32-bit scalar operand
     /// holding a tracked mask still represents a host-wave ballot, so its
     /// `(lo, hi)` pair must be read to preserve lanes 32-63 on wave64 hosts.
     fn host_mask_pair(&mut self, inst: &Inst, op: &Operand) -> Result<Option<(V, V)>, Why> {
-        if self.mask_data != MaskData::Host || self.x.native.wave64 {
+        if self.mask_data == MaskData::Console || self.x.native.wave64 {
             return Ok(None);
         }
         let Operand::Scalar { code, .. } = *op else {
@@ -4689,7 +4689,18 @@ impl<'a> Lower<'a> {
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
                     )
             }
-            MaskData::None => false,
+            // shortcut: a mesh program's counts and equality tests of masks
+            // (uniformity tests: any lane differing from the first) taken
+            // over the host's wave, as for pixel programs; lane numbers
+            // (`v_mbcnt`, `s_ff1`) stay refused, for they index LDS by
+            // console lane.
+            MaskData::None => {
+                name.starts_with("s_bcnt1_i32_")
+                    || matches!(
+                        name,
+                        "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+                    )
+            }
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. })
@@ -13117,6 +13128,32 @@ mod tests {
             S_ENDPGM,    // L3
         ];
         lower_wave(&words, vec![], vec![], true).unwrap();
+    }
+
+    /// A uniformity test: the lanes whose value differs from the first
+    /// lane's (`vcc ^ exec`), counted with `s_bcnt1`, its SCC (any lane
+    /// differs) branched on and the count read as data.
+    #[test]
+    fn counted_lanes_of_a_mask_are_a_number() {
+        let words = [
+            0x7E0C_052D, // v_readfirstlane_b32 s6, v45
+            0x7D84_5A06, // v_cmp_eq_u32_e32 vcc, s6, v45
+            0x8984_7E6A, // s_xor_b64 s[4:5], vcc, exec
+            0xBE84_1004, // s_bcnt1_i32_b64 s4, s[4:5]
+            0xBF85_0003, // s_cbranch_scc1 L1
+            0x7E02_0204, // v_mov_b32_e32 v1, s4
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,    // L1
+        ];
+        for wave64 in [true, false] {
+            let mut w = words.to_vec();
+            if !wave64 {
+                w[2] = 0x8904_7E6A; // s_xor_b32 s4, vcc_lo, exec_lo
+                w[3] = 0xBE84_0F04; // s_bcnt1_i32_b32 s4, s4
+            }
+            lower_wave(&w, vec![], vec![], wave64).unwrap();
+        }
     }
 
     /// Lowers a compute program of constants: whether it translates.
