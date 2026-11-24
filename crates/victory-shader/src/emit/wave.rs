@@ -526,16 +526,18 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
                 // Lane i of a row picks nibble i of {src2, src1}: from its
                 // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+                // 32 lanes (permlanex16). With every lane active, or with
+                // op_sel[0] (FI, fetch inactive): a lane then reads the
+                // lane it picks whatever EXEC holds there. Otherwise the
+                // opsel bits decide what reading an inactive lane gives.
+                // Only the lanes in EXEC write.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all => {
+                    (Some(s1), Some(s2)) if exec == all || v.opsel & 1 != 0 => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
@@ -1008,6 +1010,60 @@ mod tests {
         assert_eq!(
             shapes.get(&insts[1].write(Reg::V(2)).unwrap()),
             Some(&Shape::Masked(x.into(), saved, 0))
+        );
+    }
+
+    #[test]
+    fn an_exclusive_count_across_rows_with_a_partial_exec() {
+        // Assembled with llvm-mc (gfx1030, wave32): row_shr steps, then the
+        // upper row alone (EXEC 0xffff0000) adds lane 15 read with
+        // `v_permlanex16` fi:1 from the lower row, which EXEC leaves out;
+        // EXEC -1 again, less the lane's own 1.
+        let mut words = [
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+            0xD501_0001,
+            0x0009_0280, // v_cndmask_b32_e64 v1, 0, 1, s2
+            0x7E18_0301, // v_mov_b32_e32 v12, v1
+            0x4A02_02FA,
+            0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1 row_mask:0xf bank_mask:0xf
+            0x4A02_02FA,
+            0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2 row_mask:0xf bank_mask:0xf
+            0x4A02_02FA,
+            0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4 row_mask:0xf bank_mask:0xf
+            0x4A02_02FA,
+            0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8 row_mask:0xf bank_mask:0xf
+            0xBEFE_03FF,
+            0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+            0xD778_0802,
+            0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1 op_sel:[1,0]
+            0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x4C06_1901, // v_sub_nc_u32_e32 v3, v1, v12
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xBF81_0000, // s_endpgm
+        ];
+        let p = build(&words, false);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(2)).unwrap();
+        let found = sections(&p, 0);
+        let shapes = &found[&0].shapes;
+        assert_eq!(
+            shapes.get(&insts[9].write(Reg::V(1)).unwrap()),
+            Some(&Shape::Prefix(Op::AddU, Src::K(1), saved, 0, true))
+        );
+        assert_eq!(
+            shapes.get(&insts[11].write(Reg::V(3)).unwrap()),
+            Some(&Shape::Prefix(Op::AddU, Src::K(1), saved, 0, false))
+        );
+        // Without fi, the lower row the upper one reads is outside EXEC.
+        assert_eq!(words[14], 0xD778_0802);
+        words[14] = 0xD778_0002;
+        let p = build(&words, false);
+        let insts = &p.blocks[0].insts;
+        let found = sections(&p, 0);
+        assert_eq!(
+            found[&0].shapes.get(&insts[11].write(Reg::V(3)).unwrap()),
+            None
         );
     }
 

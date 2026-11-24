@@ -11990,6 +11990,74 @@ mod tests {
         assert_eq!(l.root_srvs, vec![2]);
     }
 
+    /// Assembled with llvm-mc (gfx1030, wave32): an append. The lanes below
+    /// a root constant (s1) add 1 to a counter (dword 20 of the buffer at
+    /// the table at s0) once for the wave, then each takes the counter plus
+    /// the count of active lanes below it as its index: an exclusive prefix
+    /// sum of 1 (row_shr 1, 2, 4, 8; the upper row adds lane 15 with
+    /// `v_permlanex16` fi:1 under EXEC 0xffff0000; less the lane's own 1).
+    const APPEND_WAVE32: [u32; 42] = [
+        0xBE94_0300, // s_mov_b32 s20, s0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xF408_020A,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[20:21], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0001, // v_cmp_gt_u32_e32 vcc_lo, s1, v0
+        0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+        0x7E14_0281, // v_mov_b32_e32 v10, 1
+        0x7E16_0294, // v_mov_b32_e32 v11, 20
+        0xE0C8_6000,
+        0x8002_0A0B, // buffer_atomic_add v10, v11, s[8:11], 0 idxen glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2E_050A, // v_readfirstlane_b32 s23, v10
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001,
+        0x0009_0280, // v_cndmask_b32_e64 v1, 0, 1, s2
+        0x7E18_0301, // v_mov_b32_e32 v12, v1
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8 row_mask:0xf bank_mask:0xf
+        0xBEFE_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xD778_0802,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1 op_sel:[1,0]
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0x4C06_1901, // v_sub_nc_u32_e32 v3, v1, v12
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0x4A06_0617, // v_add_nc_u32_e32 v3, s23, v3
+        0x7E08_0D00, // v_cvt_f32_u32_e32 v4, v0
+        0x7E0A_0304, // v_mov_b32_e32 v5, v4
+        0x7E0C_0304, // v_mov_b32_e32 v6, v4
+        0x7E0E_0304, // v_mov_b32_e32 v7, v4
+        0xE01C_2000,
+        0x8002_0403, // buffer_store_format_xyzw v[4:7], v3, s[8:11], 0 idxen
+        0x887E_167E, // s_or_b32 exec_lo, exec_lo, s22
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn an_append_indexed_by_a_whole_wave_prefix_count() {
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&APPEND_WAVE32, layout, used).unwrap();
+        assert!(l.wave_ops);
+    }
+
     #[test]
     fn constants_loaded_from_a_root_view() {
         // Two dwords at byte 0x10 of the memory of a root descriptor (in
