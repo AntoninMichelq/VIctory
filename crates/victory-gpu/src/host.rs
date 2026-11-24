@@ -436,6 +436,10 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+/// A list of a slow submission that ran for this long or longer is named
+/// with its pipelines (every build).
+const SLOW_LIST_MS: u64 = 100;
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -676,6 +680,20 @@ impl Host {
         }
     }
 
+    /// Waits until the queue has signalled the fence with `value` (the
+    /// caller holds `submitted`, under which the event is waited on).
+    fn wait_for(&self, value: u64) {
+        // SAFETY: the fence and event are ours.
+        unsafe {
+            match self.fence.SetEventOnCompletion(value, self.event) {
+                Ok(()) => {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -702,9 +720,11 @@ impl Host {
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
         // the world's frames (a second or more over dozens of lists) fit
-        // that only list by list. One wait at the end; with
-        // `VICTORY_GPU_TIMING` (diagnostics) each run is waited for and
-        // timed on its own.
+        // that only list by list. Each run signals the fence; the waits
+        // come after the last one, in order, so the time each run ended is
+        // known in every build and a slow submission names its slow lists.
+        // With `VICTORY_GPU_TIMING` (diagnostics) each run is waited for
+        // and timed on its own.
         let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
             .iter()
             .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -714,29 +734,26 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
+        // (run, fence value) still to wait for.
+        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(groups.len());
         for (i, group) in groups.iter().enumerate() {
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
-            if !each && i + 1 < groups.len() {
+            *submitted += 1;
+            // SAFETY: the fence is ours.
+            if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
+                tracing::warn!(error = %e, "host submission not waited for");
                 continue;
             }
-            *submitted += 1;
-            // SAFETY: the fence and event are ours.
-            unsafe {
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+            pending.push((i, *submitted));
+            if !each {
+                continue;
             }
+            self.wait_for(*submitted);
+            pending.clear();
             #[cfg(feature = "diagnostics")]
-            if each && started.elapsed() > std::time::Duration::from_millis(50) {
+            if started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -746,6 +763,17 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        // When each run ended (a fence wakes us within microseconds), so
+        // its GPU time is the gap to the run before it: one queue runs them
+        // in order.
+        let mut ended: Vec<(usize, std::time::Duration)> = Vec::with_capacity(pending.len());
+        let mut last = prepared;
+        for (i, value) in pending {
+            self.wait_for(value);
+            let now = std::time::Instant::now();
+            ended.push((i, now - last));
+            last = now;
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -760,6 +788,21 @@ impl Host {
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            // The lists that took the time, slowest first, with their
+            // pipelines: a list is a run of its own on the queue.
+            ended.sort_by(|a, b| b.1.cmp(&a.1));
+            for &(i, took) in ended.iter().take(4) {
+                if took < std::time::Duration::from_millis(SLOW_LIST_MS) {
+                    break;
+                }
+                let pipelines = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                tracing::warn!(
+                    ms = took.as_millis(),
+                    list = i,
+                    ?pipelines,
+                    "slow host list in that submission"
+                );
+            }
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
