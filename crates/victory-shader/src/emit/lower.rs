@@ -1630,6 +1630,10 @@ impl<'a> Lower<'a> {
             "cmpswap" | "inc" | "dec" => None,
             "csub" if returns => None,
             "csub" => return Err("global_atomic_csub without the required GLC bit"),
+            // Floats: a compare-exchange loop on the bits (no DXIL float
+            // atomics but exchange). shortcut: denormals follow the host's
+            // float mode, not the console's.
+            "fcmpswap" | "fmin" | "fmax" => None,
             _ => return Err("a global floating-point atomic"),
         };
         let a = *self
@@ -1641,7 +1645,8 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(site.0, site.1)?;
         let d = data.ok_or("global atomic data")?;
-        let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 } else { 1 })?;
+        let pair = matches!(op, "cmpswap" | "fcmpswap");
+        let vals = self.vgprs(inst, d, if pair { 2 } else { 1 })?;
         let val = vals[0];
         let zero = self.s.m.i32(0);
         let c = self.cur;
@@ -1685,6 +1690,27 @@ impl<'a> Lower<'a> {
                 78,
                 &[h, code, coords[0], coords[1], coords[2], data],
             )
+        } else if matches!(op, "fcmpswap" | "fmin" | "fmax") {
+            let cmp = vals.get(1).copied();
+            self.atomic_update(zero, |l, old| {
+                let c = l.cur;
+                let f = l.as_float(old);
+                let d = l.as_float(val);
+                let x = match op {
+                    "fmin" | "fmax" => {
+                        let r = l.max_min(op == "fmax", f, d);
+                        l.as_int(r)
+                    }
+                    _ => {
+                        // fcmpswap: data is (new, compare), compared as
+                        // floats.
+                        let want = l.as_float(cmp.unwrap_or(zero));
+                        let equal = l.s.m.cmp(c, pred::OEQ, f, want);
+                        l.s.m.select(c, equal, val, old)
+                    }
+                };
+                l.buffer_compare_exchange(h, coords, old, x, false)
+            })
         } else {
             let update = match op {
                 "inc" => AtomicUpdate::Inc,
@@ -14412,6 +14438,30 @@ mod tests {
         let l = lower_with(&words, vec![constants], vec![]).unwrap();
         assert_eq!(l.root_uavs, [crate::emit::POINTER_SLOT + 2]);
         assert!(l.root_srvs.is_empty());
+    }
+
+    /// Float atomics through an address in root constants: compare-exchange
+    /// loops on a root UAV.
+    #[test]
+    fn global_float_atomics_lower_to_compare_exchange_loops() {
+        let words = [
+            0x7E00_0202, // v_mov_b32_e32 v0, s2
+            0x7E02_0203, // v_mov_b32_e32 v1, s3
+            0xDCFC_8000,
+            0x007D_0400, // global_atomic_fmin v[0:1], v4, off
+            0xDCF9_8008,
+            0x037D_0400, // global_atomic_fcmpswap v3, v[0:1], v[4:5], off offset:8 glc
+            0xDD00_8010,
+            0x007D_0400, // global_atomic_fmax v[0:1], v4, off offset:16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        let mut constants = root(RootType::Constants, 0, 0);
+        constants.sgprs = 4;
+        let l = lower_with(&words, vec![constants], vec![]).unwrap();
+        assert_eq!(l.root_uavs, [crate::emit::POINTER_SLOT + 2]);
     }
 
     /// An address kept shifted right by 8 in one root constant (s3 of
