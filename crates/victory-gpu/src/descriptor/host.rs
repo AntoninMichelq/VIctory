@@ -1092,8 +1092,10 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
-    // (`resource::target_format`): views name the format it has.
+    // A target made in another format than the title's
+    // (`resource::target_format`: R9G9B9E5_SHAREDEXP as R16G16B16A16_FLOAT,
+    // a packed 16-bit one as R8G8B8A8_UNORM on this GPU): views name the
+    // format it has.
     if view != own && crate::resource::target_format(view) == own {
         if let Some(format) = format {
             *format = d.Format;

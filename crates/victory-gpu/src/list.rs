@@ -500,6 +500,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if !copy_compatible(to, from) {
+                return;
+            }
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -516,6 +519,34 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// Whether the host can copy texels between two host textures: not when
+/// one is made in a stand-in format of another texel size
+/// ([`crate::resource::target_format`]: an R9G9B9E5_SHAREDEXP target is
+/// R16G16B16A16_FLOAT, a sampled one stays R9G9B9E5_SHAREDEXP).
+/// shortcut: such copies are skipped, not converted.
+#[cfg(windows)]
+fn copy_compatible(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use crate::resource::{element, target_format};
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+    let stand_in = |x: u32, y: u32| x != y && target_format(y) == x;
+    if a == b || !(stand_in(a, b) || stand_in(b, a)) || element(a) == element(b) {
+        return true;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            to = a,
+            from = b,
+            "texture copy skipped: one side is made in a stand-in format"
+        );
+    });
+    false
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -609,6 +640,20 @@ extern "system" fn copy_texture_region(
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
+            if crate::resource::substituted(src.resource) {
+                // R9G9B9E5_SHAREDEXP made R16G16B16A16_FLOAT: the host texels
+                // are twice the size of the footprint's.
+                // shortcut: not converted back; the title's buffer keeps
+                // what it had.
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        format = dst.footprint.format,
+                        "texture-to-buffer readback skipped: the texture is made in a stand-in format",
+                    );
+                });
+                return;
+            }
             let host_format = crate::resource::pc_format(dst.footprint.format);
             if crate::resource::element(host_format)
                 != crate::resource::element(dst.footprint.format)
@@ -744,6 +789,25 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        if src.kind == FOOTPRINT && crate::resource::substituted(dst.resource) {
+            // Title bytes in the console format (R9G9B9E5_SHAREDEXP, 4 bytes
+            // a texel) into a stand-in texture (R16G16B16A16_FLOAT, 8).
+            // shortcut: not converted; the host's contents stay.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    format = src.footprint.format,
+                    "buffer-to-texture copy skipped: the texture is made in a stand-in format",
+                );
+            });
+            return;
+        }
+        if src.kind != FOOTPRINT
+            && let Some(texture) = crate::resource::host_resource(src.resource)
+            && !copy_compatible(to, texture)
+        {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -862,6 +926,12 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
+            // An R9G9B9E5_SHAREDEXP target is made R16G16B16A16_FLOAT
+            // (`resource::target_format`): resolve in the format it has.
+            let format = match crate::resource::target_format(format) {
+                stand_in if stand_in == a.Format.0 as u32 => stand_in,
+                _ => format,
+            };
             let format = DXGI_FORMAT(format as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list

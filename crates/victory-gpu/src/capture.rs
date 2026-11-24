@@ -252,7 +252,11 @@ fn note_present(resource: crate::object::This) {
     };
     // SAFETY: a live resource.
     let d = unsafe { copy.texture.GetDesc() };
-    if (d.Width, d.Height, d.Format.0) != (w, h, format)
+    // A format the host makes targets in a stand-in for (R9G9B9E5_SHAREDEXP
+    // as R16G16B16A16_FLOAT) matches its stand-in.
+    let stand_in = crate::resource::target_format(format as u32) as i32;
+    if (d.Width, d.Height) != (w, h)
+        || (d.Format.0 != format && d.Format.0 != stand_in)
         || d.SampleDesc.Count > 1
         || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
     {
