@@ -287,8 +287,11 @@ fn device_paths() -> Vec<Vec<u16>> {
         while unsafe { *path.add(len) } != 0 {
             len += 1;
         }
-        // SAFETY: `path` is valid for `len` u16s in the live buffer.
-        paths.push(unsafe { std::slice::from_raw_parts(path, len) }.to_vec());
+        // SAFETY: `path` is valid for `len` u16s and its NUL in the live
+        // buffer. The NUL is kept: CreateFileW reads the copy up to it, and
+        // without one it read past the copy's end (an access violation when
+        // the allocation ended at a page).
+        paths.push(unsafe { std::slice::from_raw_parts(path, len + 1) }.to_vec());
     }
     // SAFETY: the set is ours.
     unsafe { SetupDiDestroyDeviceInfoList(set) };
@@ -486,7 +489,7 @@ mod tests {
         let paths = device_paths();
         println!("hid interfaces: {}", paths.len());
         for path in &paths {
-            println!("  {}", String::from_utf16_lossy(path));
+            println!("  {}", String::from_utf16_lossy(path.strip_suffix(&[0]).unwrap_or(path)));
         }
         match open_pad() {
             Some(pad) => println!("opened a DualSense: report length {}", pad.input_len),
