@@ -125,6 +125,14 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// VGPRs read before any write that the phis of a pointer address
+    /// ([`Address::includes_base`]) join: taken as undefined, so as
+    /// anything (the lanes that load through the pointer took a path that
+    /// wrote it), which holds unless the hardware loads them.
+    pub pointer_unset: Vec<Value>,
+    /// Root descriptors (layout indices) whose address the program only
+    /// adds offsets to and reads memory at (see [`address_only`]).
+    pub address_only: Vec<usize>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -231,6 +239,10 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     }
     out.waterfall = t.waterfall(&first_lane);
     out.waterfall.unset = t.unset.take();
+    out.pointer_unset = t.pointer_unset.take();
+    out.address_only = (0..layout.len())
+        .filter(|&i| layout[i].root == RootType::Descriptor && address_only(p, &out, i))
+        .collect();
     // Taking the first lane's descriptor as each lane's own holds only in
     // a waterfall loop: one whose compare of the first lane's dwords with
     // the lane's own repeats the access until every lane has had its turn.
@@ -280,6 +292,8 @@ struct Tracer<'a> {
     lane_joins: RefCell<Vec<(usize, Vec<Term>)>>,
     /// See [`Waterfall::unset`].
     unset: RefCell<Vec<Value>>,
+    /// See [`Resources::pointer_unset`].
+    pointer_unset: RefCell<Vec<Value>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -328,6 +342,7 @@ impl<'a> Tracer<'a> {
             sums: std::cell::RefCell::new(Vec::new()),
             lane_joins: RefCell::new(Vec::new()),
             unset: RefCell::new(Vec::new()),
+            pointer_unset: RefCell::new(Vec::new()),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -818,7 +833,18 @@ impl<'a> Tracer<'a> {
             let mut found = None;
             let mut result = Ok(());
             for &a in &self.p.blocks[block].phis[i].args {
-                match self.pointer_base(self.vorigin(a), seen, budget) {
+                let a = self.vorigin(a);
+                // A VGPR no instruction wrote yet on that path: the
+                // pointer only on the paths that wrote it, undefined (so
+                // anything) on the others, unless the hardware sets it
+                // ([`Resources::pointer_unset`], checked when lowering).
+                if self.unset_input(a) {
+                    if let Term::Value(u) = a {
+                        self.pointer_unset.borrow_mut().push(u);
+                    }
+                    continue;
+                }
+                match self.pointer_base(a, seen, budget) {
                     Ok(None) => {}
                     Ok(Some(b)) if found.is_none_or(|f| f == b) => found = Some(b),
                     _ => {
@@ -870,10 +896,17 @@ impl<'a> Tracer<'a> {
         }
         if let Some((block, i)) = self.phis[v.0 as usize] {
             seen.push(v);
-            let ok = self.p.blocks[block].phis[i]
-                .args
-                .iter()
-                .all(|&a| self.pointer_high(self.vorigin(a), high, seen, budget));
+            // A VGPR not written yet on a path: as for the low half.
+            let ok = self.p.blocks[block].phis[i].args.iter().all(|&a| {
+                let a = self.vorigin(a);
+                if self.unset_input(a) {
+                    if let Term::Value(u) = a {
+                        self.pointer_unset.borrow_mut().push(u);
+                    }
+                    return true;
+                }
+                self.pointer_high(a, high, seen, budget)
+            });
             seen.pop();
             return ok;
         }
@@ -1762,6 +1795,128 @@ fn lane_of(op: Operand) -> Option<u32> {
 }
 
 /// What dword `k` of a move's result copies.
+/// Whether the program uses the address of root descriptor `param` only
+/// to read or write memory there: its dwords and everything computed from
+/// them go only through copies, phis, additions and subtractions (with
+/// their carries and borrows) into the address operands of memory accesses
+/// traced to `param`. The address itself is then never seen, so any value
+/// of it gives the same accesses: the translation, which does not have it,
+/// may take 0 (the offsets from it are then the addresses).
+pub fn address_only(p: &Program, r: &Resources, param: usize) -> bool {
+    const STEPS: &[&str] = &[
+        "s_mov_b32",
+        "s_mov_b64",
+        "s_add_u32",
+        "s_addc_u32",
+        "s_sub_u32",
+        "s_subb_u32",
+        "v_mov_b32",
+        "v_add_co_u32",
+        "v_add_co_ci_u32",
+        "v_add_nc_u32",
+    ];
+    let mut todo: Vec<Value> = r
+        .params
+        .iter()
+        .filter(|q| q.1 == param)
+        .map(|q| q.0)
+        .collect();
+    if todo.is_empty() {
+        return false;
+    }
+    let mut seen: std::collections::HashSet<Value> = todo.iter().copied().collect();
+    let sinks: Vec<Site> = r
+        .scalar
+        .iter()
+        .filter(|(_, a)| a.param == param)
+        .map(|s| s.0)
+        .collect();
+    while let Some(v) = todo.pop() {
+        let mut next = Vec::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                if phi.args.contains(&v) {
+                    next.push(phi.value);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let regs: Vec<Reg> = inst
+                    .reads
+                    .iter()
+                    .filter(|x| x.1 == v)
+                    .map(|x| x.0)
+                    .collect();
+                if regs.is_empty() {
+                    continue;
+                }
+                let plain = match &inst.fields {
+                    Fields::Valu(f) => {
+                        f.abs == 0
+                            && f.neg == 0
+                            && !f.clamp
+                            && f.omod == 0
+                            && f.sdwa.is_none()
+                            && f.dpp.is_none()
+                    }
+                    Fields::Sop { .. } => true,
+                    _ => false,
+                };
+                if plain && STEPS.contains(&inst.name()) {
+                    next.extend(inst.writes.iter().map(|w| w.1));
+                    continue;
+                }
+                // The old value of a VGPR a VALU operation writes (lanes
+                // disabled in EXEC keep it) is in the new one.
+                if let Fields::Valu(f) = &inst.fields {
+                    let source = |r: &Reg| {
+                        f.src.iter().any(|o| match (*o, *r) {
+                            (Operand::Vector { reg, dwords }, Reg::V(x)) => {
+                                (reg..reg.saturating_add(dwords)).contains(&x)
+                            }
+                            (Operand::Scalar { code, .. }, Reg::S(x)) => code == x,
+                            _ => false,
+                        })
+                    };
+                    if regs
+                        .iter()
+                        .all(|r| matches!(r, Reg::V(_)) && inst.write(*r).is_some() && !source(r))
+                    {
+                        next.extend(regs.iter().filter_map(|r| inst.write(*r)));
+                        continue;
+                    }
+                }
+                // Read as an address of an access traced to `param`.
+                let address: Vec<Reg> = match &inst.fields {
+                    Fields::Flat {
+                        addr: Some(Operand::Vector { reg, .. }),
+                        saddr,
+                        ..
+                    } => match saddr {
+                        Some(Operand::Scalar { code, .. }) if *code != NULL => {
+                            vec![Reg::V(*reg), Reg::S(*code), Reg::S(code + 1)]
+                        }
+                        _ => vec![Reg::V(*reg), Reg::V(reg + 1)],
+                    },
+                    Fields::Smem {
+                        base: Operand::Scalar { code, .. },
+                        ..
+                    } => vec![Reg::S(*code), Reg::S(code + 1)],
+                    _ => Vec::new(),
+                };
+                if !sinks.contains(&(b, i)) || regs.iter().any(|r| !address.contains(r)) {
+                    return false;
+                }
+            }
+        }
+        for n in next {
+            if seen.insert(n) {
+                todo.push(n);
+            }
+        }
+    }
+    true
+}
+
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
         return None;
@@ -2207,6 +2362,143 @@ pub(crate) mod tests {
         );
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset, a.includes_base), (0, 0, true));
+    }
+
+    /// Assembled with llvm-mc (gfx1030, wave32): a loop reading a table of
+    /// 64 items of 8 bytes at a root descriptor (s[2:3]) at a pseudo-random
+    /// index, a hash of a generator state the loop carries in a VGPR (an LCG
+    /// step each iteration: times root constant s0 plus a constant); the
+    /// address is the descriptor's plus the index times 8, added with
+    /// `v_add_co_u32`/`v_add_co_ci_u32`. The sums go to LDS.
+    pub(crate) const RANDOM_TABLE_READ_WAVE32: [u32; 34] = [
+        0x7E02_0300, // v_mov_b32_e32 v1, v0
+        0x7E18_0280, // v_mov_b32_e32 v12, 0
+        0x7E1A_0280, // v_mov_b32_e32 v13, 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xD569_0001,
+        0x0000_0101, // 0x10: v_mul_lo_u32 v1, v1, s0
+        0x4A02_02FF,
+        0x3C6E_F35F, // v_add_nc_u32_e32 v1, 0x3c6ef35f, v1
+        0x2C0C_029C, // v_lshrrev_b32_e32 v6, 28, v1
+        0x4A0C_0C84, // v_add_nc_u32_e32 v6, 4, v6
+        0x2C0E_0306, // v_lshrrev_b32_e32 v7, v6, v1
+        0x3A0E_0307, // v_xor_b32_e32 v7, v7, v1
+        0xD569_0007,
+        0x0000_0307, // v_mul_lo_u32 v7, v7, s1
+        0x2C10_0E96, // v_lshrrev_b32_e32 v8, 22, v7
+        0x3A0E_0F08, // v_xor_b32_e32 v7, v8, v7
+        0x360E_0EBF, // v_and_b32_e32 v7, 63, v7
+        0x340E_0E83, // v_lshlrev_b32_e32 v7, 3, v7
+        0xD70F_6A08,
+        0x0002_0E02, // v_add_co_u32 v8, vcc_lo, s2, v7
+        0x7E12_0203, // v_mov_b32_e32 v9, s3
+        0x5012_1280, // v_add_co_ci_u32_e32 v9, vcc_lo, 0, v9, vcc_lo
+        0xDC34_8000,
+        0x0A7D_0008, // global_load_dwordx2 v[10:11], v[8:9], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x4A18_150C, // v_add_nc_u32_e32 v12, v12, v10
+        0x4A1A_170D, // v_add_nc_u32_e32 v13, v13, v11
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF06_8806, // s_cmp_eq_u32 s6, 8
+        0xBF84_FFE6, // s_cbranch_scc0 -> 0x10
+        0x3400_0083, // v_lshlrev_b32_e32 v0, 3, v0
+        0xD934_0000,
+        0x0000_0C00, // ds_write_b64 v0, v[12:13]
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_root_descriptor_plus_an_offset_hashed_from_a_phi() {
+        let code: Vec<u8> = RANDOM_TABLE_READ_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Constants, 0, 2), param(Descriptor, 2, 2)];
+        let r = track(&p, &layout, HwStage::Cs).unwrap();
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (1, 0, false));
+        assert!(a.dynamic.is_some());
+    }
+
+    /// The same read split in two regions under one per-lane condition
+    /// (the state below 2^30): the address is computed in the first, the
+    /// load made in the second, so the address VGPRs reach the load through
+    /// phis that also join what they held before the loop (nothing).
+    pub(crate) const RANDOM_TABLE_READ_SPLIT_WAVE32: [u32; 39] = [
+        0x7E02_0300, // v_mov_b32_e32 v1, v0
+        0x7E18_0280, // v_mov_b32_e32 v12, 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xD569_0001,
+        0x0000_0101, // 0xc: v_mul_lo_u32 v1, v1, s0
+        0x4A02_02FF,
+        0x3C6E_F35F, // v_add_nc_u32_e32 v1, 0x3c6ef35f, v1
+        0x7D88_02F4, // v_cmp_gt_u32_e32 vcc_lo, 2.0, v1
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_000E, // s_cbranch_execz -> s_or_b32
+        0x2C0C_029C, // v_lshrrev_b32_e32 v6, 28, v1
+        0x4A0C_0C84, // v_add_nc_u32_e32 v6, 4, v6
+        0x2C0E_0306, // v_lshrrev_b32_e32 v7, v6, v1
+        0x3A0E_0307, // v_xor_b32_e32 v7, v7, v1
+        0xD569_0007,
+        0x0000_0307, // v_mul_lo_u32 v7, v7, s1
+        0x2C0C_0E96, // v_lshrrev_b32_e32 v6, 22, v7
+        0x3A0E_0F06, // v_xor_b32_e32 v7, v6, v7
+        0x360E_0EBF, // v_and_b32_e32 v7, 63, v7
+        0x340E_0E83, // v_lshlrev_b32_e32 v7, 3, v7
+        0xD70F_6A08,
+        0x0002_0E02, // v_add_co_u32 v8, vcc_lo, s2, v7
+        0x7E12_0203, // v_mov_b32_e32 v9, s3
+        0x5012_1280, // v_add_co_ci_u32_e32 v9, vcc_lo, 0, v9, vcc_lo
+        0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+        0x7D88_02F4, // v_cmp_gt_u32_e32 vcc_lo, 2.0, v1
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_0004, // s_cbranch_execz -> s_or_b32
+        0xDC34_8000,
+        0x0A7D_0008, // global_load_dwordx2 v[10:11], v[8:9], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x4A18_150C, // v_add_nc_u32_e32 v12, v12, v10
+        0x887E_087E, // s_or_b32 exec_lo, exec_lo, s8
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF06_8806, // s_cmp_eq_u32 s6, 8
+        0xBF84_FFDD, // s_cbranch_scc0 -> 0xc
+        0xD834_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_pointer_phi_joined_with_vgprs_not_written_yet() {
+        let code: Vec<u8> = RANDOM_TABLE_READ_SPLIT_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Constants, 0, 2), param(Descriptor, 2, 2)];
+        let r = track(&p, &layout, HwStage::Cs).unwrap();
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (1, 0, true));
+        // v8 and v9 as the program starts.
+        assert_eq!(r.pointer_unset.len(), 2);
+        assert!(r.pointer_unset.iter().all(|u| {
+            p.inputs
+                .iter()
+                .any(|i| i.1 == *u && matches!(i.0, Reg::V(8 | 9)))
+        }));
+        // The descriptor's address is only added to and loaded at.
+        assert_eq!(r.address_only, [1]);
+        // Written to LDS as data, it is seen.
+        let mut words = RANDOM_TABLE_READ_SPLIT_WAVE32;
+        assert_eq!(words[37], 0x0000_0C00);
+        words[37] = 0x0000_0800; // ds_write_b32 v0, v8
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &layout, HwStage::Cs).unwrap();
+        assert!(r.address_only.is_empty());
     }
 
     #[test]
