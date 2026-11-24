@@ -35,6 +35,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Host pipelines another worker was already loading or creating under the
+/// same name, handed its result instead of a second compile.
+pub(crate) static SHARED: AtomicU64 = AtomicU64::new(0);
+/// Time spent in the host's compiles (`create`), in microseconds.
+pub(crate) static COMPILE_US: AtomicU64 = AtomicU64::new(0);
 
 struct Library {
     library: ID3D12PipelineLibrary1,
@@ -127,9 +132,64 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// A host pipeline being loaded or created, shared by every worker that
+/// asks for the same name meanwhile.
+type Slot = std::sync::Arc<OnceLock<Made>>;
+struct Made(windows::core::Result<ID3D12PipelineState>);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Made {}
+// SAFETY: as above.
+unsafe impl Sync for Made {}
+
+/// Names being loaded or created right now (removed once done, so a name
+/// asked for later is loaded from the library instead of kept alive here).
+static IN_FLIGHT: Mutex<Option<std::collections::HashMap<String, Slot>>> = Mutex::new(None);
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description, else made by `create` and stored. Two
+/// title pipelines with the same host description (the title creates
+/// duplicates) asked for at once are made once: the later caller waits for
+/// the first one's result.
 pub(crate) fn pipeline(
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let slot: Slot = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .entry(name.to_owned())
+        .or_default()
+        .clone();
+    let mut ran = false;
+    let made = slot.get_or_init(|| {
+        ran = true;
+        Made(load_or_create(name, load, create))
+    });
+    let result = made.0.clone();
+    if ran {
+        let mut flying = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = flying.as_mut() {
+            map.remove(name);
+        }
+    } else {
+        SHARED.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// `create`, timed.
+fn compile(
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let started = std::time::Instant::now();
+    let pso = create();
+    COMPILE_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    pso
+}
+
+fn load_or_create(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
@@ -137,7 +197,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return compile(create);
     };
     if let Ok(pso) = load(
         &library.lock().unwrap_or_else(|e| e.into_inner()).library,
@@ -147,7 +207,7 @@ pub(crate) fn pipeline(
         return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
-    let pso = create()?;
+    let pso = compile(create)?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
