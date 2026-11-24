@@ -6144,6 +6144,11 @@ impl<'a> Lower<'a> {
             .map_err(|_| "a structured buffer of unknown stride")?;
         let c = self.cur;
         let table = self.s.stride_table_handle();
+        // Slots past the table read its last entry, zero (a root view has
+        // no bounds check).
+        let slots = self.s.m.i32(super::shader::STRIDE_TABLE_SLOTS);
+        let inside = self.s.m.cmp(c, pred::IULT, slot, slots);
+        let slot = self.s.m.select(c, inside, slot, slots);
         let four = self.s.m.i32(4);
         let addr = self.s.m.bin(c, Bin::Mul, slot, four);
         let iu = self.s.m.undef(self.s.t.i32);
