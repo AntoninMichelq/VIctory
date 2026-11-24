@@ -1451,7 +1451,24 @@ mod tests {
         let page = t.base + PAGE;
         // SAFETY: inside the test's allocation.
         unsafe { (page as *mut u32).write(1) };
+        let ww = |tag: &str| {
+            use windows_sys::Win32::System::Memory::GetWriteWatch;
+            let mut found = vec![0usize; 64];
+            let mut count = 64usize;
+            let mut gran = 0u32;
+            let r = unsafe { GetWriteWatch(1, t.base as *const _, 2 * PAGE, found.as_mut_ptr().cast(), &mut count, &mut gran) };
+            let offs: Vec<usize> = found[..count].iter().map(|a| a - t.base).collect();
+            eprintln!("PROBE ww {tag}: r={r} offsets={offs:x?}");
+        };
         assert_eq!(t.shadow.update(page + 16, 16), PAGE);
+        ww("after first update");
+        let mut buf = vec![0u8; PAGE];
+        crate::host::copy_mapped(buf.as_mut_ptr(), page as *const u8, PAGE, false);
+        ww("after copy_mapped read");
+        unsafe { std::ptr::copy_nonoverlapping(page as *const u8, buf.as_mut_ptr(), PAGE) };
+        ww("after plain read");
+        crate::host::copy_mapped(buf.as_mut_ptr(), page as *const u8, PAGE, false);
+        ww("after copy_mapped read 2");
         for offset in (256..PAGE).step_by(4096) {
             assert_eq!(t.shadow.update(page + offset, 16), 0);
         }
