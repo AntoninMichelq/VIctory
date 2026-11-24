@@ -438,7 +438,11 @@ mod tests {
             half: false,
         };
         let part = signature(
-            &[el("B", 1, 0, 4), el("TEXCOORD", 0, 1, 2), el("COLOR", 0, 0, 1)],
+            &[
+                el("B", 1, 0, 4),
+                el("TEXCOORD", 0, 1, 2),
+                el("COLOR", 0, 0, 1),
+            ],
             true,
         );
         let name_of = |row: usize| {
