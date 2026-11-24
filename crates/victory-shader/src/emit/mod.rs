@@ -133,6 +133,15 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// right by 8.
 pub const POINTER_SLOT: u8 = 128;
 
+/// Whether addresses the program computes from data are looked up in the
+/// host's memory table ([`crate::resource::CHASE`]);
+/// `VICTORY_NO_POINTER_CHASE=1` refuses them instead. Part of the
+/// translation, so the shader cache key includes it.
+pub fn pointer_chase() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_NO_POINTER_CHASE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Whether addresses kept in root constants become root SRVs
 /// ([`POINTER_SLOT`]); `VICTORY_NO_POINTER_VIEWS=1` turns it off (such
 /// programs then stop at "an address in an SGPR that is no root parameter",
@@ -565,7 +574,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
-        memory_table: false,
+        memory_table: l.memory_table,
         root_uavs: l.root_uavs,
     })
 }
@@ -1599,7 +1608,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
-                memory_table: false,
+                memory_table: l.memory_table,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1758,7 +1767,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
-                memory_table: false,
+                memory_table: l.memory_table,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1926,7 +1935,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
-                memory_table: false,
+                memory_table: l.memory_table,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2085,7 +2094,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
-                memory_table: false,
+                memory_table: l.memory_table,
                 root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

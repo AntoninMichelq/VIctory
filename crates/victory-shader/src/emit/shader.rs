@@ -96,6 +96,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
+    /// Handle of the memory table (`t0`, [`MEMORY_SPACE`]), if read.
+    pub memory_table: Option<V>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -156,6 +158,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: None,
+            memory_table: None,
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -306,6 +309,33 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's memory table (`t0` in [`MEMORY_SPACE`], a
+    /// raw buffer: the entry count, then 8 dwords per window sorted by
+    /// address: start low, start high, length in bytes, SRV heap index, UAV
+    /// heap index, low dword of the address its views begin at, 0, 0).
+    pub fn memory_table_handle(&mut self) -> V {
+        if let Some(h) = self.memory_table {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(MEMORY_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.memory_table = Some(h);
+        h
+    }
+
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
@@ -426,6 +456,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.stride_table.is_some()
+            || self.memory_table.is_some()
             || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
@@ -481,7 +512,10 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
+            if !self.root_srvs.is_empty()
+                || self.stride_table.is_some()
+                || self.memory_table.is_some()
+            {
                 let mut specs: Vec<(u32, u32)> = self
                     .root_srvs
                     .iter()
@@ -489,6 +523,9 @@ impl Shader {
                     .collect();
                 if self.stride_table.is_some() {
                     specs.push((STRIDE_SPACE, 0));
+                }
+                if self.memory_table.is_some() {
+                    specs.push((MEMORY_SPACE, 0));
                 }
                 let ty = self
                     .m

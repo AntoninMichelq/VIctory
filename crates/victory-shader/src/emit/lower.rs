@@ -98,6 +98,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub stride_table: bool,
+    /// The shader reads the memory table ([`super::MEMORY_SPACE`]).
+    pub memory_table: bool,
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -513,6 +515,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// The view-heap index of the window the last address computed from
+    /// data fell in ([`Self::chase_lookup`]), for [`Self::handle`].
+    chase: Option<V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1384,6 +1389,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            chase: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2223,6 +2229,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
+        let memory_table = self.s.memory_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
@@ -2242,6 +2249,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             first_lane_handles: self.first_lane_handles,
             stride_table,
+            memory_table,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2798,6 +2806,9 @@ impl<'a> Lower<'a> {
     /// the host binds such views at their address rounded down to 16 bytes,
     /// as D3D12 raw views must start there. Other addresses as they are.
     fn view_offset(&mut self, a: &Address, off: V) -> Result<V, Why> {
+        if let Some((lo, hi)) = crate::resource::chase_values(a.param) {
+            return self.chase_lookup(lo, hi, off);
+        }
         let lo = if let Some(index) = crate::resource::pointer_user_data(a.param) {
             if index & 0x100 != 0 {
                 // Kept shifted right by 8: on 256 bytes.
@@ -2826,6 +2837,100 @@ impl<'a> Lower<'a> {
         let fifteen = self.s.m.i32(15);
         let bias = self.s.m.bin(c, Bin::And, lo, fifteen);
         Ok(self.s.m.bin(c, Bin::Add, off, bias))
+    }
+
+    /// Looks the address `hi:lo + off` (a [`crate::resource::CHASE`]
+    /// address) up in the host's memory table: a binary search over its
+    /// windows, sorted by start. Leaves the window's SRV heap index in
+    /// [`Self::chase`] and returns the byte offset in the window's raw view,
+    /// or one past 2 GiB (read as 0) when no window holds the address.
+    /// shortcut: `off` adds without sign, its carry into the high dword
+    /// included (negative immediate offsets would borrow instead).
+    fn chase_lookup(&mut self, lo: Value, hi: Value, off: V) -> Result<V, Why> {
+        let lo = self.i32_of(lo)?;
+        let hi = self.i32_of(hi)?;
+        let c = self.cur;
+        let table = self.s.memory_table_handle();
+        let alo = self.s.m.bin(c, Bin::Add, lo, off);
+        let carried = self.s.m.cmp(c, pred::IULT, alo, lo);
+        let carry = self.s.m.cast(c, Cast::ZExt, carried, self.s.t.i32);
+        let ahi = self.s.m.bin(c, Bin::Add, hi, carry);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let n = self.table_dword(table, zero);
+        // Entry e (from 0) begins at byte 4 + 32 * e.
+        let field = |this: &mut Self, e: V, k: u32| {
+            let five = this.s.m.i32(5);
+            let at = this.s.m.bin(c, Bin::Shl, e, five);
+            let k = this.s.m.i32(4 + 4 * k);
+            let at = this.s.m.bin(c, Bin::Add, at, k);
+            this.table_dword(table, at)
+        };
+        // pos: how many windows start at or below the address.
+        let mut pos = zero;
+        for step in (0..16).rev().map(|k| 1u32 << k) {
+            let step = self.s.m.i32(step);
+            let cand = self.s.m.bin(c, Bin::Add, pos, step);
+            let listed = self.s.m.cmp(c, pred::IULE, cand, n);
+            let e = self.s.m.bin(c, Bin::Sub, cand, one);
+            let e = self.s.m.select(c, listed, e, zero);
+            let slo = field(self, e, 0);
+            let shi = field(self, e, 1);
+            let below = self.s.m.cmp(c, pred::IULT, shi, ahi);
+            let same = self.s.m.cmp(c, pred::EQ, shi, ahi);
+            let low_le = self.s.m.cmp(c, pred::IULE, slo, alo);
+            let same_le = self.s.m.bin(c, Bin::And, same, low_le);
+            let le = self.s.m.bin(c, Bin::Or, below, same_le);
+            let take = self.s.m.bin(c, Bin::And, listed, le);
+            pos = self.s.m.select(c, take, cand, pos);
+        }
+        let found = self.s.m.cmp(c, pred::NE, pos, zero);
+        let e = self.s.m.bin(c, Bin::Sub, pos, one);
+        let e = self.s.m.select(c, found, e, zero);
+        let slo = field(self, e, 0);
+        let shi = field(self, e, 1);
+        let len = field(self, e, 2);
+        // The host gives the window's SRV, or its UAV (0xFFFFFFFF for the
+        // SRV) when the list keeps that copy writable. shortcut: either is
+        // read through a raw SRV handle (the same buffer descriptor on the
+        // hardware this targets).
+        let srv = field(self, e, 3);
+        let uav = field(self, e, 4);
+        let none = self.s.m.i32(u32::MAX);
+        let no_srv = self.s.m.cmp(c, pred::EQ, srv, none);
+        let srv = self.s.m.select(c, no_srv, uav, srv);
+        let base = field(self, e, 5);
+        let dlo = self.s.m.bin(c, Bin::Sub, alo, slo);
+        let borrow = self.s.m.cmp(c, pred::IULT, alo, slo);
+        let borrow = self.s.m.cast(c, Cast::ZExt, borrow, self.s.t.i32);
+        let dhi = self.s.m.bin(c, Bin::Sub, ahi, shi);
+        let dhi = self.s.m.bin(c, Bin::Sub, dhi, borrow);
+        let near = self.s.m.cmp(c, pred::EQ, dhi, zero);
+        let inside = self.s.m.cmp(c, pred::IULT, dlo, len);
+        let inside = self.s.m.bin(c, Bin::And, near, inside);
+        let inside = self.s.m.bin(c, Bin::And, found, inside);
+        self.chase = Some(srv);
+        let at = self.s.m.bin(c, Bin::Sub, alo, base);
+        let outside = self.s.m.i32(0xFFFF_FFF0);
+        Ok(self.s.m.select(c, inside, at, outside))
+    }
+
+    /// The dword at byte `at` of the raw buffer `h`.
+    fn table_dword(&mut self, h: V, at: V) -> V {
+        let c = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let al = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, iu, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -5767,6 +5872,7 @@ impl<'a> Lower<'a> {
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             if let Some(a) = self.scalar.get(&site).copied()
                 && (crate::resource::pointer_user_data(a.param).is_some()
+                    || crate::resource::chase_values(a.param).is_some()
                     || self
                         .x
                         .native
@@ -5959,11 +6065,11 @@ impl<'a> Lower<'a> {
             words: [0, 0],
         };
         let srv = crate::resource::pointer_user_data(a.param).is_some()
+            || crate::resource::chase_values(a.param).is_some()
             || self
                 .used_kind(&src)
                 .is_some_and(|u| u.kind == ResourceType::Srv);
         let props = if srv { (11, 0) } else { (13, 0x1_0000) };
-        let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(d) = self.dynamic_term(&a)? {
@@ -5976,6 +6082,9 @@ impl<'a> Lower<'a> {
                 constant = None;
             }
         }
+        // After the view offset: an address computed from data looks its
+        // window up there.
+        let h = self.handle(site, &src, false, props)?;
         let words = self.view_dwords(h, srv.then_some(0), addr, constant, count);
         for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
@@ -6773,6 +6882,20 @@ impl<'a> Lower<'a> {
                 } else {
                     self.s.root_srv_handle(super::POINTER_SLOT + slot)
                 })
+            }
+            Source::Built { address, .. }
+                if crate::resource::chase_values(address.param).is_some() =>
+            {
+                // An address computed from data: the window the memory
+                // table found, read through the view heap.
+                if props.0 & !0x4000 != 11 || sampler {
+                    return Err("a write or typed view through an address computed from data");
+                }
+                let index = self
+                    .chase
+                    .take()
+                    .ok_or("an address computed from data used before its lookup")?;
+                Ok(self.s.heap_handle(self.cur, index, false, true, (11, 0)))
             }
             Source::Built { address, .. } => {
                 let rp = *self
@@ -15009,6 +15132,33 @@ mod tests {
         let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
         let read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
         assert_eq!(read, [0, 1]);
+    }
+
+    /// A pointer read from a root descriptor's buffer and read through,
+    /// by a scalar load and a per-lane global load: both look the address
+    /// up in the host's memory table.
+    #[test]
+    fn loads_through_pointers_read_from_memory_use_the_memory_table() {
+        let words = [
+            0xF404_0100,
+            0xFA00_0000, // s_load_dwordx2 s[4:5], s[0:1], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF400_0182,
+            0xFA00_0010, // s_load_dword s6, s[4:5], 0x10
+            0x7E04_0204, // v_mov_b32 v2, s4
+            0x7E06_0205, // v_mov_b32 v3, s5
+            0xDC30_8008,
+            0x017D_0002, // global_load_dword v1, v[2:3], off offset:8
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
+        assert!(l.memory_table);
     }
 
     #[test]

@@ -57,6 +57,19 @@ pub const POINTER: usize = usize::MAX - 0x1_0000;
 /// user-data index of that dword (see [`pointer_user_data`]).
 pub const SHIFTED_POINTER: usize = POINTER + 0x100;
 
+/// [`Address::param`] of an address the program computes from data (a
+/// pointer read from memory, say): this plus the high dword's value index
+/// shifted left by 31, plus the low dword's (see [`chase_values`]). The
+/// shader looks the 64-bit address up in the host's memory table
+/// (`crate::emit::MEMORY_SPACE`); loads only.
+pub const CHASE: usize = 1 << 62;
+
+/// The low and high dwords of a [`CHASE`] address.
+pub fn chase_values(param: usize) -> Option<(Value, Value)> {
+    let i = param.checked_sub(CHASE).filter(|&i| i < 1 << 62)?;
+    Some((Value((i & 0x7FFF_FFFF) as u32), Value((i >> 31) as u32)))
+}
+
 /// The user-data index of the low dword of a [`POINTER`] address, or of
 /// the dword of a [`SHIFTED_POINTER`] one (bit 8 set).
 pub fn pointer_user_data(param: usize) -> Option<u32> {
@@ -301,15 +314,36 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
-                        Ok(address) => out.scalar.push((site, address)),
-                        Err(why) => {
-                            let Some((source, sum)) = (inst.name().starts_with("global_load_"))
-                                .then(|| t.described(inst, addr.as_ref(), saddr.as_ref(), *offset))
-                                .flatten()
-                            else {
-                                return Err(fail(why));
-                            };
+                    let described = || {
+                        (inst.name().starts_with("global_load_"))
+                            .then(|| t.described(inst, addr.as_ref(), saddr.as_ref(), *offset))
+                            .flatten()
+                    };
+                    let address = t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset);
+                    // A buffer a descriptor loaded from the heaps describes
+                    // goes before the memory table.
+                    let in_heaps = |src: &Source| {
+                        let Source::Loaded { load, .. } = src else {
+                            return false;
+                        };
+                        out.scalar.iter().any(|(s, a)| {
+                            s == load
+                                && t.layout.get(a.param).is_some_and(|p| {
+                                    matches!(p.root, RootType::Table | RootType::ResourceHeap)
+                                })
+                        })
+                    };
+                    let found = match &address {
+                        Ok(a) if chase_values(a.param).is_some() => {
+                            described().filter(|(src, _)| in_heaps(src))
+                        }
+                        Ok(_) => None,
+                        Err(_) => described(),
+                    };
+                    match (address, found) {
+                        (Ok(address), None) => out.scalar.push((site, address)),
+                        (Err(why), None) => return Err(fail(why)),
+                        (_, Some((source, sum))) => {
                             out.descriptors.push(Descriptor {
                                 site,
                                 role: Role::Resource,
@@ -974,6 +1008,38 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        match self.address_of_param(lo, hi, extra) {
+            Err(
+                why @ ("an address loaded from memory"
+                | "an address not from a root parameter"
+                | "an address in an SGPR that is no root parameter"
+                | "an address from a phi"),
+            ) => self.chase(lo, hi, extra).ok_or(why),
+            r => r,
+        }
+    }
+
+    /// `lo`/`hi` (plus `extra`) as a [`CHASE`] address: two computed
+    /// dwords the memory table resolves at run time.
+    fn chase(&self, lo: Term, hi: Term, extra: Sum) -> Option<Address> {
+        if !crate::emit::pointer_chase() || extra.base.is_some() {
+            return None;
+        }
+        let (Term::Value(lo), Term::Value(hi)) = (lo, hi) else {
+            return None;
+        };
+        if lo.0 >= 1 << 31 || hi.0 >= 1 << 31 {
+            return None;
+        }
+        Some(Address {
+            param: CHASE + ((hi.0 as usize) << 31 | lo.0 as usize),
+            offset: extra.offset,
+            dynamic: extra.dynamic,
+            includes_base: false,
+        })
+    }
+
+    fn address_of_param(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -3130,21 +3196,21 @@ pub(crate) mod tests {
         );
     }
 
+    /// An address in SGPRs no root parameter holds is looked up in the
+    /// memory table: a [`CHASE`] address of the two registers' values.
     #[test]
-    fn untraceable_addresses_fail_with_a_reason() {
+    fn untraceable_addresses_are_looked_up_in_the_memory_table() {
         let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
             .iter()
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                offset: 0,
-                what: "an address in an SGPR that is no root parameter"
-            }
-        );
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap();
+        let a = r.scalar[0].1;
+        let (lo, hi) = chase_values(a.param).unwrap();
+        let input = |reg| p.inputs.iter().find(|i| i.0 == reg).unwrap().1;
+        assert_eq!((lo, hi), (input(Reg::S(2)), input(Reg::S(3))));
+        assert_eq!((a.offset, a.dynamic), (0, None));
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
