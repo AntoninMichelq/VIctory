@@ -57,6 +57,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Back edges that count against the spin-wait limit.
+    #[cfg(test)]
+    pub spin_loops: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -252,6 +255,26 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Headers of loops that only wait for memory to change: they stop
+    /// at [`super::spin_limit`] instead.
+    spin: HashSet<usize>,
+    /// Back edges given the spin-wait limit.
+    #[cfg(test)]
+    spun: usize,
+}
+
+/// The `globallycoherent` bit of a UAV handle's properties for `inst`:
+/// set for a load with `glc`. The console's `glc` load misses the
+/// per-CU caches and sees what other workgroups (and queues) wrote; a
+/// plain host UAV load may hit a stale line in them, and a loop waiting
+/// for that write then never sees it. (`glc` on an atomic only asks for
+/// the old value; stores and atomics are coherent anyway.)
+fn coherent(inst: &Inst, writes: bool) -> u32 {
+    let glc = match &inst.fields {
+        Fields::Buffer { cache, .. } | Fields::Image { cache, .. } => cache.glc,
+        _ => false,
+    };
+    if glc && !writes { 0x4000 } else { 0 }
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -685,6 +708,9 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            spin: HashSet::new(),
+            #[cfg(test)]
+            spun: 0,
             dead,
         }
     }
@@ -1044,7 +1070,8 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less).
+        self.spin = super::spin::spin_loops(p);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -1118,6 +1145,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            spin_loops: self.spun,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6765,6 +6794,11 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
+        let props = if uav {
+            (props.0 | coherent(inst, false), props.1)
+        } else {
+            props
+        };
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
@@ -7209,7 +7243,11 @@ impl<'a> Lower<'a> {
             x => (x, off),
         };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let u = if uav {
+            0x1000 | coherent(inst, store || atomic.is_some())
+        } else {
+            0
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -7776,7 +7814,16 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = if self.spin.contains(&to) {
+            #[cfg(test)]
+            {
+                self.spun += 1;
+            }
+            super::spin_limit()
+        } else {
+            super::loop_limit()
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -8618,6 +8665,9 @@ mod tests {
             // dwords: no wave operation is left.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+            // A waterfall loop changes its descriptor each round: not a
+            // spin wait.
+            assert_eq!(l.spin_loops, 0);
         }
     }
 
@@ -8633,6 +8683,51 @@ mod tests {
             user_data: 0,
             slot: 0,
         }]
+    }
+
+    #[test]
+    fn glc_loads_read_through_globally_coherent_handles() {
+        let inst = |w0: u32| {
+            let words = [w0, 0x8002_0100, S_ENDPGM];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            p.blocks
+                .iter()
+                .flat_map(|b| b.insts.clone())
+                .next()
+                .unwrap()
+        };
+        // buffer_load_dword v1, v0, s[8:11], 0 idxen (glc)
+        assert_eq!(super::coherent(&inst(0xE030_6000), false), 0x4000);
+        assert_eq!(super::coherent(&inst(0xE030_2000), false), 0);
+        // buffer_atomic_add v1, v0, s[8:11], 0 idxen glc: glc returns.
+        assert_eq!(super::coherent(&inst(0xE0C8_6000), true), 0);
+    }
+
+    #[test]
+    fn a_spin_wait_on_a_table_buffer_gets_the_spin_limit() {
+        // Each lane rereads its flag in a buffer loaded from the table at
+        // s0 until it is no longer 0, then copies it to LDS.
+        let spin = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE030_6000,
+            0x8002_0100, // 0x14: buffer_load_dword v1, v0, s[8:11], 0 idxen glc
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFA, // s_cbranch_execnz -> 0x14
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let l = lower_with(&spin, layout, dword_buffers()).unwrap();
+        assert_eq!(l.spin_loops, 1);
     }
 
     #[test]
@@ -8674,7 +8769,9 @@ mod tests {
         ];
         let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
         lower_with(&picked, layout(), dword_buffers()).unwrap();
-        lower_with(&advanced, layout(), dword_buffers()).unwrap();
+        let l = lower_with(&advanced, layout(), dword_buffers()).unwrap();
+        // It writes LDS and moves its pointer: not a spin wait.
+        assert_eq!(l.spin_loops, 0);
     }
 
     #[test]
