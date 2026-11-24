@@ -92,10 +92,36 @@ impl Pending {
 
     fn make(&self) {
         let started = Instant::now();
+        let id = std::ptr::from_ref(self) as usize;
+        let names = || {
+            self.shaders
+                .iter()
+                .map(|s| format!("{} {}", s.stage, s.hash))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        MAKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(id, (started, names()));
         let made = self
             .made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        MAKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .remove(&id);
         let us = started.elapsed().as_micros() as u64;
+        if made.is_none() || us >= SLOW_MAKE_US {
+            tracing::info!(
+                shaders = names(),
+                ms = us / 1000,
+                made = made.is_some(),
+                "slow or failed pipeline"
+            );
+        }
         STATS.us.fetch_add(us, Ordering::Relaxed);
         STATS.max_us.fetch_max(us, Ordering::Relaxed);
         let counter = if made.is_some() { &STATS.ok } else { &STATS.failed };
@@ -107,6 +133,12 @@ impl Pending {
         self.wait_done.notify_all();
     }
 }
+
+/// Pipelines being made right now: when each started and its shaders
+/// (the progress line names those running long).
+static MAKING: Mutex<Option<std::collections::HashMap<usize, (Instant, String)>>> = Mutex::new(None);
+/// A make this long (or failing) is logged with its shaders.
+const SLOW_MAKE_US: u64 = 10_000_000;
 
 /// Pipelines started early (the last run drew with them) not made yet.
 static EARLY_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +244,20 @@ fn progress() {
             queue_entries = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).heap.len(),
             "pipeline workers (last 5 s)"
         );
+        // Makes still running after 30 s, by shader.
+        let long: Vec<(u64, String)> = MAKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .filter_map(|(_, (at, names))| {
+                let s = at.elapsed().as_secs();
+                (s >= 30).then(|| (s, names.clone()))
+            })
+            .collect();
+        for (s, names) in long.iter().take(8) {
+            tracing::info!(seconds = s, shaders = %names, "pipeline still being made");
+        }
     }
 }
 
