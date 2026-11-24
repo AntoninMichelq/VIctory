@@ -2017,6 +2017,7 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
+        victory_shader::emit::enable_root_uavs_for_tests();
         let (shader, used) = build_root_view_cs();
         let pso = crate::pipeline::test_compute_pipeline(shader, used);
 
