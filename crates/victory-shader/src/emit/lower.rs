@@ -2708,6 +2708,30 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// The record count (dword 2) of the buffer view a scalar load at
+    /// `site` reads from a table entry, from the host view's size: bytes
+    /// for a raw view, elements of the console's stride for a structured
+    /// one. None if the host cannot name the view.
+    fn view_records(&mut self, site: Site) -> Option<V> {
+        let src = Source::Loaded { load: site, first: 0 };
+        let used = self.used_kind(&src);
+        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let stride = used.map_or(0, |u| u.stride);
+        let h = self.handle(site, &src, false, (11 | if uav { 0x1000 } else { 0 }, 0)).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let n = self.s.m.extract(c, d, 0);
+        Some(if stride > 1 {
+            let k = self.s.m.i32(stride);
+            self.s.m.bin(c, Bin::UDiv, n, k)
+        } else {
+            n
+        })
+    }
+
     /// `count` dwords a scalar load at `site` reads from a descriptor table
     /// or the view heap at a computed offset, from the title memory they lie
     /// in (the address from the host, `USER_TABLE_ADDRESS`); none for a load
@@ -5738,8 +5762,9 @@ impl<'a> Lower<'a> {
                 return Err("a sampler's descriptor read as data");
             }
             // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // the memory behind it (a ray-tracing structure), or the record
+            // count of, to skip an empty one: the address from the host, the
+            // count from the host view's size; the other dwords have no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
@@ -5748,6 +5773,17 @@ impl<'a> Lower<'a> {
                     match k {
                         0 => self.write(inst, reg, lo, None),
                         1 => self.write(inst, reg, hi, None),
+                        2 if inst.write(reg).is_some() => {
+                            match self.view_records(site) {
+                                Some(n) => self.write(inst, reg, n, None),
+                                None => {
+                                    if let Some(v) = inst.write(reg) {
+                                        self.vals.insert(v, Val::Missing(OTHER));
+                                        self.stale.insert(v);
+                                    }
+                                }
+                            }
+                        }
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
