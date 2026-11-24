@@ -915,6 +915,51 @@ pub(crate) fn alias_report(address: u64) -> String {
     format!("nearest host texture at {at:#x} ({:+}): {descs:?}", at as i64 - address as i64)
 }
 
+/// For a view-only texture: a host texture the GPU writes (render target or
+/// unordered access) placed at the same address with the same size and
+/// element size but another format, so the two cannot share one host copy
+/// (a UAV of R32_UINT packing what a shared-exponent texture reads, say).
+/// Its bytes are copied into this texture's host copy where it is read
+/// (`texture::copy_alias`). `VICTORY_NO_ALIAS=1` turns this off.
+#[cfg(windows)]
+pub(crate) fn written_alias(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() || std::env::var_os("VICTORY_NO_ALIAS").is_some() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let own = r.host()?;
+    let address = r.data() as u64;
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let mine = unsafe { own.texture.GetDesc() };
+    let (bytes, 1) = element(mine.Format.0 as u32)? else {
+        return None;
+    };
+    const WRITTEN: i32 = 0x1 | 0x4; // render target, unordered access
+    let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&address)?
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .find(|h| {
+            // SAFETY: a live resource.
+            let d = unsafe { h.texture.GetDesc() };
+            !std::sync::Arc::ptr_eq(h, own)
+                && d.Flags.0 & WRITTEN != 0
+                && d.Dimension == mine.Dimension
+                && d.Width == mine.Width
+                && d.Height == mine.Height
+                && d.DepthOrArraySize == mine.DepthOrArraySize
+                && d.SampleDesc.Count == 1
+                && mine.SampleDesc.Count == 1
+                && element(d.Format.0 as u32) == Some((bytes, 1))
+        })
+}
+
 #[cfg(windows)]
 fn remember_alias(address: u64, made: &std::sync::Arc<HostTexture>) {
     if address == 0 {

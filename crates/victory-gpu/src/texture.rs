@@ -899,3 +899,155 @@ mod read_tests {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 }
+
+/// Copies the first subresource of `from` (a host texture the GPU writes
+/// at the same console address as `this`, in another format of the same
+/// element size) into `this`'s host copy `to`, recorded in `list` where
+/// `this` is read: through a buffer, since a texture copy cannot change
+/// the format. False if nothing was recorded.
+pub(crate) fn copy_alias(
+    list: &crate::host::HostList,
+    from: &std::sync::Arc<crate::resource::HostTexture>,
+    this: crate::object::This,
+    to: &ID3D12Resource,
+) -> bool {
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    // SAFETY: live resources.
+    let (src, dst) = unsafe { (from.texture.GetDesc(), to.GetDesc()) };
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: a texture description and outputs for one subresource.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &dst,
+            0,
+            1,
+            0,
+            Some(&mut footprint),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    let Some(buffer) = alias_buffer(total) else {
+        return false;
+    };
+    let l = &list.list;
+    let buffer_state = |before, after| {
+        crate::host::transition(
+            &buffer,
+            D3D12_RESOURCE_STATES(before),
+            D3D12_RESOURCE_STATES(after),
+        )
+    };
+    if let Some((texture, before)) = list.transition_copy(from, COPY_SOURCE) {
+        let after = crate::host::legal_state(&texture, COPY_SOURCE);
+        let b = crate::host::transition(
+            &texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(after as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { l.ResourceBarrier(&[b]) };
+    }
+    crate::list::ensure_state(list, this, COPY_DEST);
+    let location =
+        |resource: &ID3D12Resource, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            ..footprint.Footprint
+                        },
+                    },
+                },
+            }
+        };
+    let subresource = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(resource) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
+    };
+    // SAFETY: an open list; the buffer holds the footprint; both textures
+    // have the footprint's size and element size.
+    unsafe {
+        // The buffer starts each list in the common state, promoted to a
+        // copy destination by its first copy.
+        l.CopyTextureRegion(
+            &location(&buffer, src.Format),
+            0,
+            0,
+            0,
+            &subresource(&from.texture),
+            None,
+        );
+        l.ResourceBarrier(&[buffer_state(COPY_DEST as i32, COPY_SOURCE as i32)]);
+        l.CopyTextureRegion(
+            &subresource(to),
+            0,
+            0,
+            0,
+            &location(&buffer, dst.Format),
+            None,
+        );
+        l.ResourceBarrier(&[buffer_state(COPY_SOURCE as i32, COPY_DEST as i32)]);
+    }
+    list.keep(&buffer);
+    list.keep(&from.texture);
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: std::sync::Mutex<Vec<(i32, i32, u64, u32)>> =
+            std::sync::Mutex::new(Vec::new());
+        let key = (src.Format.0, dst.Format.0, dst.Width, dst.Height);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 64 && !seen.contains(&key) {
+            seen.push(key);
+            tracing::debug!(
+                from = src.Format.0,
+                to = dst.Format.0,
+                width = dst.Width,
+                height = dst.Height,
+                "a texture placed over another's memory reads its bytes in its own format"
+            );
+        }
+    }
+    true
+}
+
+/// A device-local buffer of at least `size` bytes for [`copy_alias`]: a few
+/// per size, used in turn (a list's copies through one are ordered by its
+/// barriers; lists of one queue run in order).
+fn alias_buffer(size: u64) -> Option<ID3D12Resource> {
+    const RING: usize = 4;
+    static BUFFERS: std::sync::Mutex<Vec<(u64, Vec<ID3D12Resource>, usize)>> =
+        std::sync::Mutex::new(Vec::new());
+    let size = size.max(1).next_multiple_of(64 << 10);
+    let mut all = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match all.iter().position(|b| b.0 == size) {
+        Some(i) => i,
+        None => {
+            all.push((size, Vec::new(), 0));
+            all.len() - 1
+        }
+    };
+    let (_, ring, next) = &mut all[i];
+    if ring.len() < RING {
+        let buffer = crate::host::host()?.uav_buffer(size)?;
+        ring.push(buffer.clone());
+        return Some(buffer);
+    }
+    *next = (*next + 1) % RING;
+    Some(ring[*next].clone())
+}

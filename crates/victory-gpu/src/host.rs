@@ -1900,6 +1900,28 @@ impl HostList {
         }
     }
 
+    /// As [`HostList::transition`], for a host copy named directly (one a
+    /// title texture reads through another's memory, see
+    /// `resource::written_alias`).
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then(|| (copy.texture.clone(), before))
+            }
+        }
+    }
+
     /// Records that this list starts and ends with `copy` in `wanted` state
     /// (test helper matching `transition`'s first-use tracking).
     #[cfg(test)]
