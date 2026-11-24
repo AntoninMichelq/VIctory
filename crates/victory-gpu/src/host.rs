@@ -436,6 +436,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_caps(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -443,6 +444,49 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(host)
     }
+}
+
+/// Logs the host's optional shader capabilities that translated shaders may
+/// declare (a pipeline whose shader needs a missing one is refused with
+/// E_INVALIDARG and no other reason in release builds).
+fn log_caps(device: &ID3D12Device) {
+    fn query<T: Default>(device: &ID3D12Device, feature: D3D12_FEATURE) -> Option<T> {
+        let mut data = T::default();
+        // SAFETY: the query writes its own structure of the given size.
+        unsafe {
+            device
+                .CheckFeatureSupport(feature, (&raw mut data).cast(), size_of::<T>() as u32)
+                .ok()
+                .map(|()| data)
+        }
+    }
+    let o1: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS1> = query(device, D3D12_FEATURE_D3D12_OPTIONS1);
+    let o3: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS3> = query(device, D3D12_FEATURE_D3D12_OPTIONS3);
+    let o7: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS7> = query(device, D3D12_FEATURE_D3D12_OPTIONS7);
+    let o9: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS9> = query(device, D3D12_FEATURE_D3D12_OPTIONS9);
+    let o11: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS11> = query(device, D3D12_FEATURE_D3D12_OPTIONS11);
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_7 };
+    // SAFETY: as above.
+    let sm_ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok()
+    };
+    tracing::info!(
+        shader_model = if sm_ok { format!("{:#x}", sm.HighestShaderModel.0) } else { "?".into() },
+        int64_ops = ?o1.map(|o| o.Int64ShaderOps.as_bool()),
+        wave_ops = ?o1.map(|o| o.WaveOps.as_bool()),
+        barycentrics = ?o3.map(|o| o.BarycentricsSupported.as_bool()),
+        mesh_tier = ?o7.map(|o| o.MeshShaderTier.0),
+        atomic64_typed = ?o9.map(|o| o.AtomicInt64OnTypedResourceSupported.as_bool()),
+        atomic64_group_shared = ?o9.map(|o| o.AtomicInt64OnGroupSharedSupported.as_bool()),
+        atomic64_heap = ?o11.map(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()),
+        "host shader capabilities"
+    );
 }
 
 impl Host {
