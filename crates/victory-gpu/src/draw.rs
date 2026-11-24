@@ -740,6 +740,12 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            #[cfg(feature = "diagnostics")]
+            if traced {
+                let why = crate::pipeline::drop_reason(self.pipeline as This);
+                outcome(&format!("DROPPED (no host pipeline: {why})"));
+            }
+            #[cfg(not(feature = "diagnostics"))]
             outcome("DROPPED (no host pipeline)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1077,16 +1083,17 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&t| {
+                let host = crate::resource::host_resource(t as This)?;
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                let d = unsafe { host.GetDesc() };
+                Some(format!("{}x{} f{} {}", d.Width, d.Height, d.Format.0, identity(t as This)))
             })
             .collect();
+        let depth = (self.depth != 0).then(|| identity(self.depth as This));
         let v = self.vertex[0];
         let line = format!(
-            "{kind} {count} from {first} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            "{kind} {count} from {first} topology {} pipeline {:#x} targets {targets:?} depth {depth:?} vb {:#x}+{} stride {} reads {:?}",
             self.topology,
             self.pipeline,
             v.address,
@@ -1662,6 +1669,19 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
 }
 
+/// Which title texture and host texture `r` is, to match a pass's writes
+/// with a later pass's reads (diagnostics builds): the title object, the
+/// console address of its memory, and the host texture it has (two title
+/// textures at one address with different host textures do not see each
+/// other's contents).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn identity(r: This) -> String {
+    use windows::core::Interface;
+    let address = crate::resource::texture_memory(r).map_or(0, |(m, _)| m as usize);
+    let host = crate::resource::host_resource(r).map_or(std::ptr::null_mut(), |t| t.as_raw());
+    format!("@{address:#x} obj {:#x} host {host:p}", r as usize)
+}
+
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
@@ -1670,8 +1690,12 @@ fn describe(view: Option<&View>) -> String {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
             format!(
-                "{}x{} f{} flags {:#x}",
-                d.Width, d.Height, d.Format.0, d.Flags.0
+                "{}x{} f{} flags {:#x} {}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                d.Flags.0,
+                identity(r)
             )
         })
     };

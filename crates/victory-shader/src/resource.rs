@@ -607,16 +607,19 @@ impl<'a> Tracer<'a> {
             offset,
             offen,
             idxen,
-            format: None,
-            lds: false,
-            tfe: false,
+            format,
+            lds,
+            tfe,
             ..
         } = &inst.fields
         else {
             return Err(WHY);
         };
+        if format.is_some() || *lds || *tfe {
+            return Err("a descriptor read from the first lane of a formatted buffer load");
+        }
         if *idxen {
-            return Err(WHY);
+            return Err("a descriptor read from the first lane of an indexed buffer load");
         }
         let Source::Built { address, .. } = self.descriptor(inst, rsrc)? else {
             return Err("a descriptor read from the first lane of a buffer of descriptors");
@@ -641,7 +644,7 @@ impl<'a> Tracer<'a> {
         for t in terms {
             let s = self.sum(t);
             if s.base.is_some() {
-                return Err(WHY);
+                return Err("a descriptor read from the first lane of a buffer load at a loaded offset");
             }
             a.offset = a.offset.wrapping_add(s.offset);
             if let Some(d) = s.dynamic {
@@ -1320,7 +1323,13 @@ impl<'a> Tracer<'a> {
                 "a descriptor read from the first lane of an LDS read"
             }
             Some(n) if n.starts_with("buffer_load") => {
-                "a descriptor read from the first lane of a buffer load"
+                if words.iter().all(|w| {
+                    matches!(*w, Term::Value(v) if self.def(v).is_some_and(|i| i.name().starts_with("buffer_load")))
+                }) {
+                    "a descriptor read from the first lane of a buffer load"
+                } else {
+                    "a descriptor read from the first lane of a buffer load mixed with other words"
+                }
             }
             Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => {
                 "a descriptor read from the first lane of a partial or mixed load"
@@ -1444,9 +1453,27 @@ impl<'a> Tracer<'a> {
     /// `global_load_dwordx4`).
     fn fetched(&self, words: &[Term]) -> Result<Option<Source>, &'static str> {
         let at = |w: &Term| -> Option<(Site, usize)> {
-            let Term::Value(v) = *w else { return None };
-            let site = self.defs[v.0 as usize]?;
-            let inst = self.inst(site);
+            let Term::Value(mut v) = *w else { return None };
+            let mut site = self.defs[v.0 as usize]?;
+            let mut inst = self.inst(site);
+            // A loaded word a VALU op changes with uniform operands (masked,
+            // or bits set): taken as the loaded word, as the heap's copy
+            // has it.
+            for _ in 0..4 {
+                if inst.name().starts_with("global_load_dword")
+                    || inst.name().starts_with("buffer_load_dword")
+                    || !inst.name().starts_with("v_")
+                {
+                    break;
+                }
+                let mut lanes = inst.reads.iter().filter(|r| matches!(r.0, Reg::V(_)));
+                let (Some(&(_, from)), None) = (lanes.next(), lanes.next()) else {
+                    return None;
+                };
+                v = from;
+                site = self.defs[v.0 as usize]?;
+                inst = self.inst(site);
+            }
             if !inst.name().starts_with("global_load_dword")
                 && !inst.name().starts_with("buffer_load_dword")
             {
@@ -1459,7 +1486,25 @@ impl<'a> Tracer<'a> {
                 .position(|w| w.1 == v)?;
             Some((site, k))
         };
-        let Some(sites) = words.iter().map(at).collect::<Option<Vec<_>>>() else {
+        // Dwords that are the same in every lane (constants, SGPRs) may
+        // stand in for some of the loaded ones (a fixed format or size
+        // word): the descriptor is then the one fetched, with those words
+        // as the heap's copy has them.
+        let mut sites = Vec::with_capacity(words.len());
+        let same = |w: Term| {
+            !self.varies(w)
+                || matches!(w, Term::Value(v) if self.def(v).is_some_and(|i| {
+                    i.name() == "v_mov_b32" && !i.reads.iter().any(|r| matches!(r.0, Reg::V(_)))
+                }))
+        };
+        for (i, w) in words.iter().enumerate() {
+            match at(w) {
+                Some(s) => sites.push(Some(s)),
+                None if i > 0 && same(*w) => sites.push(None),
+                None => return Ok(None),
+            }
+        }
+        let Some(&Some((load, first))) = sites.first() else {
             return Ok(None);
         };
         let address = |site: Site| {
@@ -1478,9 +1523,8 @@ impl<'a> Tracer<'a> {
             };
             self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
         };
-        let (load, first) = sites[0];
         let a0 = address(load)?;
-        for (k, &(site, dword)) in sites.iter().enumerate() {
+        for (k, (site, dword)) in sites.iter().enumerate().filter_map(|(k, s)| Some((k, (*s)?))) {
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
             if (a.param, a.dynamic, a.includes_base) != (a0.param, a0.dynamic, a0.includes_base)
@@ -2755,6 +2799,38 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_buffer_loads_mixed_with_constant_words_are_fetched() {
+        // waterfall_buffer_wave32 with dword 3 replaced by a constant
+        // before the loop: v_mov_b32 v7, 0x31016fac after the loads.
+        let mut words = waterfall_buffer_wave32();
+        let at = words.iter().position(|&w| w == 0x8006_0801).unwrap() + 1;
+        words.splice(at..at, [0x7E0E_02FF, 0x3101_6FAC]);
+        let r = waterfall(&words, false).unwrap();
+        let image = &r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        assert!(matches!(image.source, Source::Fetched { first: 0, .. }), "{:?}", image.source);
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_buffer_loads_with_a_masked_word_are_fetched() {
+        // waterfall_buffer_wave32 with dword 2 masked after the loads:
+        // v_and_b32 v6, 0xffff, v6.
+        let mut words = waterfall_buffer_wave32();
+        let at = words.iter().position(|&w| w == 0x8006_0801).unwrap() + 1;
+        words.splice(at..at, [0x360C_0CFF, 0x0000_FFFF]);
+        let r = waterfall(&words, false).unwrap();
+        let image = &r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        assert!(matches!(image.source, Source::Fetched { first: 0, .. }), "{:?}", image.source);
     }
 
     #[test]
