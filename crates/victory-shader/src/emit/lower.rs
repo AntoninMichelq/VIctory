@@ -6613,6 +6613,19 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Whether the program writes (stores or atomics) through a buffer
+    /// built around the root view at `param`: then every access to it goes
+    /// through a root UAV, whatever view the title declared there.
+    fn root_view_written(&self, param: usize) -> bool {
+        self.descriptors.iter().any(|(&((b, i), _), src)| {
+            let name = self.x.p.blocks[b].insts[i].name();
+            matches!(src, Source::Built { address, .. } if address.param == param)
+                && (name.starts_with("buffer_store_")
+                    || name.starts_with("buffer_atomic_")
+                    || name.starts_with("tbuffer_store_"))
+        })
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -6714,17 +6727,24 @@ impl<'a> Lower<'a> {
                     .iter()
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
-                match (rp.root, kind, props.0) {
+                // Raw, read or written; the globally-coherent bit of a
+                // GLC load is moot for a root view.
+                let raw = props.0 & !0x4000;
+                let written = raw & 0xFFF == 11
+                    && (raw == 11 | 0x1000
+                        || kind == Some(ResourceType::Uav)
+                        || self.root_view_written(address.param));
+                match (rp.root, kind, raw) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
-                        if p == 11 | 0x1000 && (cfg!(test) || super::root_uavs()) =>
+                    (RootType::Descriptor, Some(ResourceType::Srv | ResourceType::Uav) | None, _)
+                        if written && (cfg!(test) || super::root_uavs()) =>
                     {
                         Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
+                        Ok(self.s.root_srv_handle(rp.slot))
                     }
                     _ => Err("a typed root view"),
                 }
@@ -13933,6 +13953,31 @@ mod tests {
         // A root UAV's memory has no read-only host view.
         let used = vec![root_view(ResourceType::Uav, 0, 3)];
         assert!(lower_with(&words, layout(), used).is_err());
+    }
+
+    /// A buffer built around a root view the title declares an SRV, read
+    /// and written (GLC) per lane: both through one root UAV.
+    #[test]
+    fn a_root_srv_the_program_writes_is_a_root_uav() {
+        let words = [
+            0xBE84_0300, // 0x0: s_mov_b32 s4, s0
+            0x8805_FF01,
+            0x000C_0000, // 0x4: s_or_b32 s5, s1, 0xc0000
+            0xBE86_03C1, // 0xc: s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // 0x10: s_mov_b32 s7, 0x11014fac
+            0xE030_E000,
+            0x8001_0100, // 0x18: buffer_load_dword v1, v0, s[4:7], 0 idxen glc dlc
+            0xBF8C_3F70, // 0x20: s_waitcnt vmcnt(0)
+            0xE070_6004,
+            0x8001_0100, // 0x24: buffer_store_dword v1, v0, s[4:7], 0 idxen offset:4 glc
+            0xBF81_0000, // 0x2c: s_endpgm
+        ];
+        crate::emit::enable_root_uavs_for_tests();
+        let layout = vec![root(RootType::Descriptor, 0, 3)];
+        let used = vec![root_view(ResourceType::Srv, 0, 3)];
+        let l = lower_with(&words, layout, used).unwrap();
+        assert_eq!((l.root_srvs, l.root_uavs), (vec![], vec![3]));
     }
 
     #[test]
