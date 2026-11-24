@@ -536,6 +536,15 @@ impl HostHeap {
     /// one-descriptor table, so reads past the title buffer return zero
     /// instead of faulting (root views have no bounds).
     pub(crate) fn raw_srv_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, elements: u32) {
+        // The host removes the device for a raw view not on 16 bytes.
+        if !raw_start_fits(first) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(first, "raw view not on 16 bytes of its buffer left null");
+            });
+            self.null_raw_srv_at(index);
+            return;
+        }
         self.keep(index, Some(buffer.clone()));
         self.set_stride(index, 0);
         let Some(host) = host() else { return };
@@ -563,6 +572,15 @@ impl HostHeap {
     /// one-descriptor table, so accesses past the title buffer are
     /// dropped (writes) or return zero (reads) instead of faulting.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, elements: u32) {
+        // The host removes the device for a raw view not on 16 bytes.
+        if !raw_start_fits(first) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(first, "raw view not on 16 bytes of its buffer left null");
+            });
+            self.null_raw_uav_at(index);
+            return;
+        }
         self.keep(index, Some(buffer.clone()));
         self.set_stride(index, 0);
         let Some(host) = host() else { return };

@@ -493,11 +493,19 @@ impl State {
         // A raw UAV must start 16 bytes into its buffer (the debug layer:
         // "the offset of the first element ... must be a multiple of 16
         // bytes"); the host removes the device for one that does not.
-        if uav && !(gpu - base).is_multiple_of(16) {
-            once!(
-                address = format_args!("{address:#x}"),
-                "a root UAV not 16-byte aligned in its copy: no bounded table"
-            );
+        // (SRVs too: the debug layer refuses raw SRVs the same way.)
+        if !(gpu - base).is_multiple_of(16) {
+            if uav {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root UAV not 16-byte aligned in its copy: no bounded table"
+                );
+            } else {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root SRV not 16-byte aligned in its copy: no bounded table"
+                );
+            }
             return None;
         }
         let heap = self
