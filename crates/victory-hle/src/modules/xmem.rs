@@ -542,6 +542,40 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Bytes `[offset, offset + len)` of `pages` were just written through a
+/// view of our own (DirectStorage page destinations): tells the GPU side
+/// that every title address showing those pages was written, as if the
+/// title had written there. Its guards on view memory only see writes at
+/// the title's addresses, so without this a host copy taken before the
+/// read (a streaming pool reused for new models) stays stale for good.
+pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    {
+        let physical = physical();
+        for (slice, n) in &runs {
+            let (first, last) = (slice.index, slice.index + n);
+            for (&at, (size, view)) in &physical.views {
+                if !Arc::ptr_eq(&view.section, &slice.section) {
+                    continue;
+                }
+                let (from, to) = (view.index, view.index + size.div_ceil(PAGE));
+                let (lo, hi) = (first.max(from), last.min(to));
+                if lo < hi {
+                    let start = at + (lo - from) * PAGE;
+                    let end = (at + (hi - from) * PAGE).min(at + size);
+                    seen.push((start, end - start));
+                }
+            }
+        }
+    }
+    for (at, len) in seen {
+        victory_gpu::kernel_will_write(at, len);
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
