@@ -36,13 +36,216 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Title allocations seen: base → (end, whether write-watched). Only
+    /// write-watched ones outlive an epoch.
+    allocations: BTreeMap<usize, (usize, bool)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    allocations: BTreeMap::new(),
 });
+
+std::thread_local! {
+    /// While this thread prepares a submission ([`begin_epoch`]): pages
+    /// asked of the kernel since it began, as disjoint runs (first page →
+    /// end page). Asks inside them are answered from the journal. Per
+    /// thread: another thread's asks are not part of the preparation.
+    static EPOCH: std::cell::RefCell<Option<BTreeMap<usize, usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn journal() -> std::sync::MutexGuard<'static, Journal> {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes of title memory around an ask that one kernel ask takes in during
+/// an epoch (within the allocation): `VICTORY_WATCH_WINDOW_MB`, 32 by
+/// default.
+fn window() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let mb = std::env::var("VICTORY_WATCH_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .min(4096);
+        (mb << 20).max(PAGE)
+    })
+}
+
+/// Whether submissions ask the kernel in epochs; `VICTORY_WATCH_EPOCH=0`
+/// asks it for every range as before.
+fn epochs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WATCH_EPOCH").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Starts (or restarts) an epoch: a submission's preparation, during which
+/// nothing of ours writes title memory. The first ask in a part of a
+/// write-watched allocation asks the kernel for a window around it (up to
+/// [`window`], within the allocation); later asks inside what was asked
+/// are answered from the journal, without a system call (a world
+/// submission asks thousands of times: every texture and buffer range).
+///
+/// Per thread: only the thread that began it answers from the epoch.
+///
+/// What the title's threads write after the window was asked is not seen
+/// until the next epoch's ask, which stamps it newer than any copy made now,
+/// so it is copied by the next submission. A write racing the preparation
+/// had no order with the GPU's reads before either: the ask it raced might
+/// as well have come first. Our own writes into title memory (a
+/// submission's copies and work, copy-back) end the epoch first
+/// ([`end_epoch`]).
+pub(crate) fn begin_epoch() {
+    if !epochs() {
+        return;
+    }
+    EPOCH.with_borrow_mut(|e| *e = Some(BTreeMap::new()));
+    let mut j = journal();
+    // Memory that was not watched may be by now (remapped, reallocated).
+    j.allocations.retain(|_, (_, watched)| *watched);
+}
+
+/// Ends the epoch: asks go to the kernel again.
+pub(crate) fn end_epoch() {
+    EPOCH.with_borrow_mut(|e| *e = None);
+}
+
+/// Whether pages `[first, last)` were asked in this epoch.
+fn covered(runs: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    runs.range(..=first).next_back().is_some_and(|(_, &end)| end >= last)
+}
+
+/// Notes pages `[first, last)` asked in this epoch, merging runs.
+fn cover(runs: &mut BTreeMap<usize, usize>, mut first: usize, mut last: usize) {
+    if let Some((&a, &e)) = runs.range(..=first).next_back()
+        && e >= first
+    {
+        first = a;
+        last = last.max(e);
+    }
+    let inside: Vec<(usize, usize)> = runs.range(first..=last).map(|(&a, &e)| (a, e)).collect();
+    for (a, e) in inside {
+        runs.remove(&a);
+        last = last.max(e);
+    }
+    runs.insert(first, last);
+}
+
+/// The allocation holding `at`: (base, end, write-watched), from what was
+/// seen or the system's answer (then taken as watched until an ask fails).
+fn allocation(j: &mut Journal, at: usize) -> Option<(usize, usize, bool)> {
+    if let Some((&base, &(end, watched))) = j.allocations.range(..=at).next_back()
+        && at < end
+    {
+        return Some((base, end, watched));
+    }
+    use windows_sys::Win32::System::Memory::{MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: describes an address without dereferencing it; the output
+    // buffer matches the information class.
+    let queried = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            at as *const _,
+            MemoryRegionInfo,
+            (&raw mut region).cast(),
+            size_of_val(&region),
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    let base = region.AllocationBase as usize;
+    let end = base.checked_add(region.RegionSize)?;
+    if !queried || base > at || end <= at {
+        return None;
+    }
+    // Entries overlapping it are gone (the cache keeps disjoint ones).
+    let stale: Vec<usize> = j.allocations.range(..end).filter(|(_, (e, _))| *e > base).map(|(&b, _)| b).collect();
+    for b in stale {
+        j.allocations.remove(&b);
+    }
+    j.allocations.insert(base, (end, true));
+    Some((base, end, true))
+}
+
+/// Asks the kernel for the written pages of `[from, to)` (bytes; whole
+/// kernel pages), clearing them, into `j.found`. The count found, or `None`
+/// if the range is not write-watched (or spans allocations).
+fn ask(j: &mut Journal, from: usize, to: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (to - from).div_ceil(KERNEL_PAGE);
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    ASKS[2].fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            from as *const _,
+            to - from,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    (!failed).then_some(count)
+}
+
+/// Inside an epoch: answers `[first, last)` (pages) from the journal if
+/// asked already, else asks the kernel for a window around it. `None`:
+/// not answered (ask as outside an epoch); `Some(None)`: the memory is not
+/// write-watched.
+fn from_epoch(j: &mut Journal, first: usize, last: usize) -> Option<Option<u64>> {
+    if EPOCH.with_borrow(|e| e.as_ref().map(|runs| covered(runs, first, last)))? {
+        return Some(Some(j.asked));
+    }
+    let (base, end, watched) = allocation(j, first * PAGE)?;
+    if last * PAGE > end {
+        return None;
+    }
+    if !watched {
+        return Some(None);
+    }
+    let w = window();
+    let from = (first * PAGE / w * w).max(base);
+    let to = (last * PAGE).next_multiple_of(w).min(end);
+    let Some(count) = ask(j, from, to) else {
+        // Not watched, or no longer the allocation it was: as outside an
+        // epoch, which notes it unwatched if that fails too.
+        j.allocations.remove(&base);
+        return None;
+    };
+    j.asked += 1;
+    let now = j.asked;
+    let found: Vec<usize> = j.found[..count].iter().map(|&at| at / PAGE).collect();
+    for page in found {
+        j.written.insert(page, now);
+    }
+    // Only whole pages were asked: a partial one at the allocation's end
+    // is asked again (and fails, as outside an epoch).
+    let (a, e) = (from.div_ceil(PAGE), to / PAGE);
+    if a < e {
+        EPOCH.with_borrow_mut(|runs| {
+            if let Some(runs) = runs {
+                cover(runs, a, e);
+            }
+        });
+    }
+    Some(Some(now))
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -57,65 +260,64 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     answer
 }
 
-/// Calls of [`writes`] and the microseconds they took, since the last
-/// [`take_asks`].
-static ASKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Since the last [`take_asks`]: calls of [`writes`], the microseconds
+/// they took, and the asks of the kernel among them.
+static ASKS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Calls of [`writes`] and their microseconds since the last call.
-pub(crate) fn take_asks() -> [u64; 2] {
-    [0, 1].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
+/// Calls of [`writes`], their microseconds and the kernel asks they made,
+/// since the last call.
+pub(crate) fn take_asks() -> [u64; 3] {
+    [0, 1, 2].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
 }
 
 fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
+    let now = match from_epoch(j, first, last) {
+        Some(Some(now)) => now,
+        Some(None) => {
+            // Not write-watched: as when the kernel says so below.
+            if !guarded {
+                return None;
+            }
+            let pages = guard(first * PAGE, last * PAGE)?;
+            return Some(record(j, pages, first, last));
         }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
+        None => match ask(j, first * PAGE, last * PAGE) {
+            Some(count) => {
+                let pages: Vec<usize> = j.found[..count].iter().map(|&at| at / PAGE).collect();
+                return Some(record(j, pages, first, last));
+            }
+            None => {
+                // Not write-watched: in an epoch, the allocation is noted
+                // so, so that its next ranges do not ask again.
+                if EPOCH.with_borrow(Option::is_some)
+                    && let Some((base, end, _)) = allocation(j, first * PAGE)
+                    && last * PAGE <= end
+                {
+                    j.allocations.insert(base, (end, false));
+                }
+                if !guarded {
+                    return None;
+                }
+                let pages = guard(first * PAGE, last * PAGE)?;
+                return Some(record(j, pages, first, last));
+            }
+        },
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
+/// Notes `pages` written as of a new asking; its number and the journal's
+/// entries for pages `[first, last)`.
+fn record(j: &mut Journal, pages: Vec<usize>, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in pages {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
 }
 
 /// Guarded blocks of view memory.
@@ -275,6 +477,16 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    {
+        // Its allocations are new too.
+        let end = at.saturating_add(len);
+        let mut j = journal();
+        let gone: Vec<usize> =
+            j.allocations.range(..end).filter(|(_, (e, _))| *e > at).map(|(&b, _)| b).collect();
+        for b in gone {
+            j.allocations.remove(&b);
+        }
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -417,6 +629,46 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// In an epoch the first ask takes in the allocation around it; asks
+    /// inside it then come from the journal, and a write after it shows at
+    /// the next epoch's ask, newer than the answer given before it.
+    #[test]
+    fn epoch_asks_the_kernel_once_per_window() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 5 * PAGE) as *mut u8).write(1) };
+        begin_epoch();
+        let (first, at_first) = writes(p, p + PAGE, false).expect("watched");
+        assert!(at_first.iter().all(|&(page, _)| page != p / PAGE + 5));
+        // The page written before the epoch, though not asked for above.
+        let (now, written) = writes(p + 4 * PAGE, p + 6 * PAGE, false).expect("watched");
+        assert!(now >= first);
+        assert_eq!(written, [(p / PAGE + 5, first)]);
+        // SAFETY: as above.
+        unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
+        // Within the epoch, not yet seen.
+        let (_, inside) = writes(p + 2 * PAGE, p + 3 * PAGE, false).expect("watched");
+        assert!(inside.is_empty());
+        end_epoch();
+        begin_epoch();
+        let (later, seen) = writes(p + 2 * PAGE, p + 3 * PAGE, false).expect("watched");
+        assert!(later > now);
+        assert_eq!(seen, [(p / PAGE + 2, later)]);
+        end_epoch();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        title_memory_remapped(p, 8 * PAGE);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
