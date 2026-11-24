@@ -13,7 +13,7 @@
 //! (`ComputeSurfaceInfoMacroTiled`, `ComputeThinBlockDimension`,
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
-//! patterns in [`MICRO`] from `gfx10SwizzlePattern.h` (the RB+ tables, as on
+//! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
 //! RDNA2). addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
@@ -701,8 +701,10 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By DXGI format number, with the console's own numbers: 116/117 (10-bit
+/// float color), 118-120 (16-bit depth with 8-bit stencil), 189
+/// (R10G10B10_SNORM_A2_UNORM) and 190 (R4G4_UNORM). `None` for 96-bit,
+/// 1-bit, packed 4:2:2 and video formats.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -711,10 +713,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1008,6 +1010,50 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    /// The console's own format numbers have element sizes, so their
+    /// textures get a console layout like any other.
+    #[test]
+    fn console_formats_have_layouts() {
+        let element = |bytes, stencil| {
+            Some(Format {
+                bytes,
+                block: 1,
+                stencil,
+            })
+        };
+        for (dxgi, want) in [
+            // R10G10B10_7E3_A2_FLOAT, R10G10B10_6E4_A2_FLOAT.
+            (116, element(4, false)),
+            (117, element(4, false)),
+            // D16_UNORM_S8_UINT and its typeless views: 16-bit depth, then
+            // a stencil plane.
+            (118, element(2, true)),
+            (119, element(2, true)),
+            (120, element(2, true)),
+            // R10G10B10_SNORM_A2_UNORM, R4G4_UNORM.
+            (189, element(4, false)),
+            (190, element(1, false)),
+        ] {
+            assert_eq!(format(dxgi), want, "format {dxgi}");
+            let t = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth_or_array: 1,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_R_X,
+            })
+            .unwrap_or_else(|e| panic!("format {dxgi}: {e:?}"));
+            assert_eq!(t.planes[0].layout.desc.element_bytes, want.unwrap().bytes);
+        }
+        // Video and 1-bit formats still have none.
+        for dxgi in [66, 103, 130] {
+            assert_eq!(format(dxgi), None, "format {dxgi}");
+        }
     }
 
     #[test]
