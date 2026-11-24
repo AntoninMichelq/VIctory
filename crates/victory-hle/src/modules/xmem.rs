@@ -93,6 +93,7 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     start_memory_log();
+    let raw_protect = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -160,11 +161,87 @@ pub extern "system" fn XMemVirtualAlloc(
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            protect = format_args!("{raw_protect:#x}"),
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+        if placeholder && !at.is_null() {
+            note_reservation(at as usize, size, raw_protect);
+        }
     }
     at
+}
+
+/// A console protection bit above the host's (`PAGE_GRAPHICS_NOACCESS`). A
+/// reservation with `PAGE_NOACCESS` plus this bit, made right after a
+/// CPU-readable one of the same size, is the GPU's view of that memory.
+/// Grand Theft Auto VI reserves its 64 KiB-page pools in such pairs, maps
+/// physical pages into the first only, and places GPU resources at the
+/// same offsets in the second (one memory on the console). Host views of
+/// the first are mapped into the second too ([`mirror`]), or textures there
+/// read pages nothing ever maps. `VICTORY_NO_GPU_TWINS=1` turns it off.
+const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
+
+#[derive(Default)]
+struct Twins {
+    /// The last 64 KiB-page reservation: base, size, GPU-only.
+    last: Option<(usize, usize, bool)>,
+    /// CPU view base to its size and GPU view base.
+    gpu_of: BTreeMap<usize, (usize, usize)>,
+}
+
+static TWINS: LazyLock<Mutex<Twins>> = LazyLock::new(Default::default);
+
+fn twins_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_NO_GPU_TWINS").is_none());
+    *ON
+}
+
+fn note_reservation(at: usize, size: usize, protect: u32) {
+    let gpu_only = protect & PAGE_GRAPHICS_NOACCESS != 0 && protect & HOST_PROTECTION <= PAGE_NOACCESS;
+    let mut twins = TWINS.lock().unwrap_or_else(|e| e.into_inner());
+    if gpu_only
+        && let Some((cpu, cpu_size, false)) = twins.last
+        && cpu_size == size
+    {
+        tracing::info!(
+            cpu = format_args!("{cpu:#x}"),
+            gpu = format_args!("{at:#x}"),
+            size,
+            mirrored = twins_on(),
+            "a GPU-only reservation twins the CPU one before it"
+        );
+        twins.gpu_of.insert(cpu, (size, at));
+        twins.last = None;
+        return;
+    }
+    twins.last = Some((at, size, gpu_only));
+}
+
+/// Where `[base, base + len)` of a CPU view shows in its GPU twin, if it
+/// has one.
+fn twin_of(base: usize, len: usize) -> Option<usize> {
+    if !twins_on() {
+        return None;
+    }
+    let twins = TWINS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&cpu, &(size, gpu)) = twins.gpu_of.range(..=base).next_back()?;
+    (base + len <= cpu + size).then(|| gpu + (base - cpu))
+}
+
+/// After pages were mapped at (or unmapped from) `[base, base + len)`:
+/// the same in the GPU twin of that memory, if it has one.
+fn mirror(base: usize, len: usize, unmapped: bool) {
+    let Some(gpu) = twin_of(base, len) else { return };
+    let from = if unmapped { 0 } else { base as u64 };
+    if !map_alias(gpu as u64, from, len as u64) {
+        tracing::warn!(
+            cpu = format_args!("{base:#x}"),
+            gpu = format_args!("{gpu:#x}"),
+            len,
+            "pages not mirrored into their GPU view"
+        );
+    }
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -607,6 +684,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     let mut physical = physical();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
+        drop(physical);
+        mirror(base, n * PAGE, true);
         return address;
     }
     // SAFETY: the title passes `n` page numbers.
@@ -632,6 +711,8 @@ pub extern "system" fn XMemMapPhysicalPages(
         }
         i += run;
     }
+    drop(physical);
+    mirror(base, n * PAGE, false);
     address
 }
 
