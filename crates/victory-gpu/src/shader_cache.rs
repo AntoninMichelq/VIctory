@@ -36,14 +36,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop and spin-wait limits,
+/// What identifies this build's translations: the translator's source
+/// digest, this file, and the translation settings it runs with (the loop and spin-wait limits,
 /// which `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT`
 /// change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -58,21 +57,17 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&spin.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        // The translator's sources (not our executable: any rebuild changed
+        // that, and every rebuild translated every shader again, seconds of
+        // stalls the title's own watchdog took for a hang), this file
+        // (the entry encoding) and the run-time limits.
+        let mut h = blake3::Hasher::new();
+        h.update(victory_shader::SOURCE_HASH.as_bytes());
+        h.update(include_str!("shader_cache.rs").as_bytes());
+        h.update(&[u8::from(cfg!(feature = "diagnostics"))]);
+        h.update(&limit.to_le_bytes());
+        h.update(&spin.to_le_bytes());
+        *h.finalize().as_bytes()
     })
 }
 
