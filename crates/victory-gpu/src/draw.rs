@@ -1118,6 +1118,8 @@ impl State {
             }
             let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
             shadow.refresh(list, v.address, u64::from(v.size));
+            // The expansion binds the source as a root unordered-access view.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             let (_, gpu, size) =
                 crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
             views.push((
