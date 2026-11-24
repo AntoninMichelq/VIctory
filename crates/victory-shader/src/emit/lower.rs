@@ -4554,6 +4554,26 @@ impl<'a> Lower<'a> {
         let number = self.mask_ok
             && mask_number_op(inst)
             && inst.writes.iter().any(|w| self.mask_numbers.contains(&w.1));
+        // `s_*_saveexec` saves EXEC as it was: its number, where a join
+        // that is no mask reads it.
+        if self.mask_ok
+            && name.contains("_saveexec_")
+            && inst.writes.iter().any(|w| self.mask_numbers.contains(&w.1))
+            && let Some(code) = dst_code
+        {
+            for k in 0..=u8::from(self.x.p.wave64) {
+                if let (Some(d), Some(e)) =
+                    (inst.write(Reg::S(code + k)), inst.read(Reg::S(EXEC + k)))
+                {
+                    let x = self.get(e)?;
+                    self.vals.insert(d, x);
+                }
+            }
+            for &(_, w) in &inst.writes {
+                self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
+            }
+            return Ok(());
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !number {
             return Err(LANE_MASK);
         }
@@ -12749,6 +12769,56 @@ mod tests {
                 slot: 0,
             }],
         )
+    }
+
+    #[test]
+    fn a_saved_exec_joined_with_loaded_data_is_read_as_its_number() {
+        // Assembled with llvm-mc (gfx1030, wave32): s19 saves EXEC around an
+        // if, then a scalar load overwrites it on one path. At the join it
+        // is read as data: on the other path its number is EXEC as saved.
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0x7D88_0089, // v_cmp_gt_u32_e32 vcc_lo, 9, v0
+            0xBE93_3C6A, // s_and_saveexec_b32 s19, vcc_lo
+            0x7E02_0283, // v_mov_b32_e32 v1, 3
+            0x887E_137E, // s_or_b32 exec_lo, exec_lo, s19
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0003, // s_cbranch_scc1 3
+            0xF400_04CA,
+            0xFA00_0010, // s_load_dword s19, s[20:21], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_0213, // v_mov_b32_e32 v2, s19
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        let (layout, used) = join_layout();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_saved_wave64_exec_joined_with_loaded_data_is_read_as_its_number() {
+        // As above in wave64, saved in s[18:19].
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0x7D88_0089, // v_cmp_gt_u32_e32 vcc, 9, v0
+            0xBE92_246A, // s_and_saveexec_b64 s[18:19], vcc
+            0x7E02_0283, // v_mov_b32_e32 v1, 3
+            0x88FE_127E, // s_or_b64 exec, exec, s[18:19]
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0003, // s_cbranch_scc1 3
+            0xF404_048A,
+            0xFA00_0010, // s_load_dwordx2 s[18:19], s[20:21], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_0212, // v_mov_b32_e32 v2, s18
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        let (layout, used) = join_layout();
+        lower_wave(&words, layout, used, true).unwrap();
     }
 
     #[test]
