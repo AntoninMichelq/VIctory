@@ -520,7 +520,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
     t.io_raised += 1;
     for (_, i) in &r.interps {
         match i {
-            io::Interp::Interpolated { .. } => t.interpolated += 1,
+            io::Interp::Interpolated { .. } | io::Interp::Weighted { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
         }
     }
@@ -561,8 +561,12 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } | resource::Source::Select { .. } => {
-                unreachable!("leaves are no phis or selects")
+            resource::Source::Fetched { load, .. } => {
+                t.loaded += 1;
+                address(load)
+            }
+            resource::Source::Phi { .. } | resource::Source::Select { .. } | resource::Source::Lanes { .. } => {
+                unreachable!("leaves are no phis, selects or per-lane picks")
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
