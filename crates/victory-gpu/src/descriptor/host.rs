@@ -369,24 +369,7 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = free_table(&taken[..spare.min(taken.len())], *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
             return None;
@@ -671,6 +654,23 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Try each possible table start from the cursor, then from slot zero.
+/// A table may cross the cursor on the second pass, but must fit in the heap.
+fn free_table(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len().checked_sub(n)? + 1;
+    let split = cursor.min(end);
+    for starts in [split..end, 0..split] {
+        let mut first = starts.start;
+        while first < starts.end {
+            match taken[first..first + n].iter().position(|&held| held) {
+                Some(offset) => first += offset + 1,
+                None => return Some(first),
+            }
+        }
+    }
+    None
 }
 
 /// Logs `what` the first time it happens.
@@ -1011,14 +1011,43 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host lets views of a typed resource name another format of
+/// its family (`CastingFullyTypedFormatSupported`; never SNORM for UNORM,
+/// nor FLOAT for another type), which [`fits`] uses for sRGB and linear
+/// twins only.
+fn casts_typed() -> bool {
+    static CASTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CASTS.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let casts = asked.is_ok() && options.CastingFullyTypedFormatSupported.as_bool();
+        if !casts {
+            tracing::warn!(
+                "the host does not cast typed formats: sRGB views of linear textures (and the reverse) read in the texture's own format"
+            );
+        }
+        casts
+    })
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// typed resource's, but for casts it allows (see [`casts_typed`]). A view
+/// of a typed texture in another format of its family takes the texture's
+/// format, unless it is the texture's sRGB or linear twin and the host
+/// casts: then the hardware converts (or not) as the console does.
+/// shortcut: other casts within a family (UINT of UNORM, say) read as the
+/// texture's own format.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -1064,8 +1093,12 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
+    let twin = crate::resource::SRGB
+        .iter()
+        .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
     if let Some(format) = format
         && !typeless
+        && !(twin && casts_typed())
     {
         *format = d.Format;
     }
@@ -1411,6 +1444,27 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    #[test]
+    fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_table(&taken, cursor, n),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
@@ -1633,5 +1687,25 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+
+    #[test]
+    fn a_free_table_can_straddle_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let left = heap.dynamic(4).unwrap();
+        let right = heap.dynamic(5).unwrap();
+        let tail = heap.dynamic(DYNAMIC - 9).unwrap();
+
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(4), Some(left)); // cursor now separates the two tables
+        heap.release(right, 5);
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(9), Some(left));
+        assert_eq!(heap.dynamic(1), None, "the tail is still held");
+
+        heap.release(tail, DYNAMIC - 9);
+        assert_eq!(heap.dynamic(DYNAMIC - 9), Some(tail));
     }
 }

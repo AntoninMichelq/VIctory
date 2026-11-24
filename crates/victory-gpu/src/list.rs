@@ -1168,19 +1168,17 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
     let to = shadow.offset(address);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("resolve {count} queries of type {kind} to {address:#x}"));
+    // A copy destination for the resolve, tracked with the list's other
+    // uses of the copy (`HostList::buffer_state`): what reads or writes it
+    // next moves it on, and the list's close returns it to common.
+    list.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
     // SAFETY: an open list, a live heap and buffer copy, kept until the list
-    // is reset; the copy is promoted to a copy destination and left for
-    // what reads it next.
+    // is reset.
     unsafe {
         for &(from, n) in &runs {
             let offset = to + u64::from(from) * bytes;
             list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &shadow.buffer, offset);
         }
-        list.list.ResourceBarrier(&[crate::host::transition(
-            &shadow.buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_COMMON,
-        )]);
     }
     measured
 }

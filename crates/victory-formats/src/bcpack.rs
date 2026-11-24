@@ -1565,14 +1565,17 @@ mod tests {
     }
 
     /// Compares with reference outputs made outside the repository:
-    /// `VICTORY_BCPACK_TABLES` (the table file) and `VICTORY_BCPACK_CASES`, a
-    /// directory of `<name>.bc<n>` packed chunks with `<name>.out` beside them.
+    /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
+    /// with `<name>.out` beside them. The tables are the built-in ones unless
+    /// `VICTORY_BCPACK_TABLES` names another table file.
     #[test]
-    #[ignore = "needs the format tables and reference chunks"]
+    #[ignore = "needs reference chunks outside the repository"]
     fn reference_chunks() {
-        let tables = std::env::var_os("VICTORY_BCPACK_TABLES").expect("VICTORY_BCPACK_TABLES");
         let cases = std::env::var_os("VICTORY_BCPACK_CASES").expect("VICTORY_BCPACK_CASES");
-        let t = Tables::parse(&std::fs::read(tables).unwrap()).unwrap();
+        let t = match std::env::var_os("VICTORY_BCPACK_TABLES") {
+            Some(tables) => Tables::parse(&std::fs::read(tables).unwrap()).unwrap(),
+            None => Tables::builtin().unwrap(),
+        };
         let mut n = 0;
         for entry in std::fs::read_dir(cases).unwrap() {
             let path = entry.unwrap().path();

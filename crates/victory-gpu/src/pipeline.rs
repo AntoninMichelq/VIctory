@@ -276,7 +276,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -328,16 +331,28 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    // SAFETY: the title passes a full `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
+    // (null is tolerated).
+    let Some(head) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
+    let stages = GRAPHICS_STAGES.iter().zip(&head.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let graphics = {
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        // SAFETY: `CreateGraphicsPipelineState` receives a complete
+        // `D3D12_GRAPHICS_PIPELINE_STATE_DESC` starting with `GraphicsHead`.
+        let full = unsafe { &*desc.cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>() };
+        // SAFETY: `full` is valid for the duration of this call.
+        Some(Box::new(unsafe {
+            host::GraphicsState::from_graphics_desc(full)
+        }))
+    };
     hand_out(
         shaders,
         #[cfg(windows)]
-        None,
+        graphics,
         iid,
         out,
     )
@@ -440,17 +455,28 @@ pub(crate) extern "system" fn create_stream(
             tracing::warn!(
                 kind,
                 at,
+                remaining = desc.size - at,
                 "pipeline subobject of unknown size; the rest is ignored"
             );
             break;
         };
+        if at + size > desc.size {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                remaining = desc.size - at,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
+            // SAFETY: a shader subobject has its bytecode at +8 and `at + size <= desc.size`.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
             shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
+        // SAFETY: a whole subobject of this kind lies within `desc.size` at `at`.
         unsafe {
             graphics.read(kind, desc.stream.add(at))
         };
@@ -502,6 +528,28 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_pipeline(
+    host: victory_shader::emit::HostShader,
+    used: Vec<victory_shader::UsedResource>,
+) -> This {
+    let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
+    let translated = OnceLock::new();
+    let _ = translated.set(Some(Translated { host, used }));
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash,
+        container: Vec::new(),
+        translated,
+    });
+    let mut out = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -528,44 +576,124 @@ mod tests {
     #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
-        let none = || Bytecode {
-            code: std::ptr::null(),
-            size: 0,
-        };
-        let desc = GraphicsHead {
-            root: std::ptr::null(),
-            stages: [
-                Bytecode {
-                    code: vs.as_ptr(),
-                    size: vs.len(),
+        #[cfg(windows)]
+        let (p, q) = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let semantic = c"POSITION";
+            let element = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(semantic.as_ptr().cast()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            };
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
                 },
-                Bytecode {
-                    code: ps.as_ptr(),
-                    size: ps.len(),
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
                 },
-                none(),
-                none(),
-                none(),
-            ],
+                SampleMask: 0x0f,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: &element,
+                    NumElements: 1,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_graphics(
+                    std::ptr::null(),
+                    (&raw const desc).cast::<GraphicsHead>(),
+                    &PIPELINE_IIDS[0],
+                    &mut p
+                ),
+                S_OK
+            );
+            let g = pipeline(p)
+                .host
+                .graphics
+                .as_deref()
+                .expect("plain graphics PSO must capture GraphicsState");
+            assert_eq!(g.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            assert_eq!(g.targets.NumRenderTargets, 1);
+            assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+            let mut q = std::ptr::null();
+            assert_eq!(
+                create_graphics(
+                    std::ptr::null(),
+                    (&raw const desc).cast::<GraphicsHead>(),
+                    &PIPELINE_IIDS[0],
+                    &mut q
+                ),
+                S_OK
+            );
+            (p, q)
         };
-        let mut p = std::ptr::null();
-        assert_eq!(
-            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
+        #[cfg(not(windows))]
+        let (p, q) = {
+            let none = || Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            };
+            let desc = GraphicsHead {
+                root: std::ptr::null(),
+                stages: [
+                    Bytecode {
+                        code: vs.as_ptr(),
+                        size: vs.len(),
+                    },
+                    Bytecode {
+                        code: ps.as_ptr(),
+                        size: ps.len(),
+                    },
+                    none(),
+                    none(),
+                    none(),
+                ],
+            };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            let mut q = std::ptr::null();
+            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
+            (p, q)
+        };
         assert_eq!(
             shaders(p),
             [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
         );
         // A second pipeline with the same pixel shader shares its container.
-        let mut q = std::ptr::null();
-        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
+
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample

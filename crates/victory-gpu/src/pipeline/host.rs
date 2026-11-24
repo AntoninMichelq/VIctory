@@ -92,6 +92,88 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Copies owned input layout elements and semantic names from a title
+    /// `D3D12_INPUT_LAYOUT_DESC`.
+    ///
+    /// # Safety
+    /// If `layout.pInputElementDescs` is non-null, it must point to
+    /// `layout.NumElements` valid `D3D12_INPUT_ELEMENT_DESC` entries whose
+    /// non-null `SemanticName` pointers are NUL-terminated C strings.
+    unsafe fn copy_input_layout(
+        layout: D3D12_INPUT_LAYOUT_DESC,
+    ) -> (Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<CString>) {
+        if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        // SAFETY: caller guarantees `NumElements` valid input element entries.
+        let elements = unsafe {
+            std::slice::from_raw_parts(layout.pInputElementDescs, layout.NumElements as usize)
+        };
+        let names: Vec<CString> = elements
+            .iter()
+            .map(|e| {
+                if e.SemanticName.0.is_null() {
+                    CString::default()
+                } else {
+                    // SAFETY: caller guarantees valid NUL-terminated C string.
+                    unsafe { CStr::from_ptr(e.SemanticName.0.cast()).to_owned() }
+                }
+            })
+            .collect();
+        let inputs = elements
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.Format.0 as u32) as i32),
+                ..*e
+            })
+            .collect();
+        (inputs, names)
+    }
+
+    /// Captures owned graphics state from a plain
+    /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+    ///
+    /// # Safety
+    /// `desc` must be a valid `D3D12_GRAPHICS_PIPELINE_STATE_DESC` whose
+    /// `InputLayout` pointers (if non-null) are valid for the duration of
+    /// this call.
+    pub(crate) unsafe fn from_graphics_desc(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Self {
+        // SAFETY: caller guarantees `desc.InputLayout` is valid.
+        let (inputs, names) = unsafe { Self::copy_input_layout(desc.InputLayout) };
+        let mut rt_formats = desc.RTVFormats;
+        for f in &mut rt_formats {
+            f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+        }
+        let samples = if desc.SampleDesc.Count == 0 {
+            DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            }
+        } else {
+            desc.SampleDesc
+        };
+        GraphicsState {
+            blend: desc.BlendState,
+            sample_mask: desc.SampleMask,
+            rasterizer: desc.RasterizerState,
+            depth: desc.DepthStencilState,
+            inputs,
+            names,
+            strip_cut: desc.IBStripCutValue,
+            topology: desc.PrimitiveTopologyType,
+            targets: D3D12_RT_FORMAT_ARRAY {
+                RTFormats: rt_formats,
+                NumRenderTargets: desc.NumRenderTargets.min(8),
+            },
+            depth_format: DXGI_FORMAT(crate::resource::pc_format(desc.DSVFormat.0 as u32) as i32),
+            samples,
+            // A plain description has no depth-bounds test.
+            depth_bounds: false,
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -126,28 +208,7 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
-                        return;
-                    }
-                    let elements = std::slice::from_raw_parts(
-                        layout.pInputElementDescs,
-                        layout.NumElements as usize,
-                    );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
-                            ..*e
-                        })
-                        .collect();
+                    (self.inputs, self.names) = Self::copy_input_layout(layout);
                 }
                 13 => {
                     self.strip_cut =
@@ -285,6 +346,7 @@ pub(crate) struct Stage {
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -323,6 +385,10 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    pub(crate) fn has_root_uavs(&self) -> bool {
+        self.stages.iter().any(|s| !s.root_uavs.is_empty())
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
@@ -369,6 +435,7 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -377,6 +444,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: None,
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -404,20 +472,18 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    let param =
+                        push_root_view(&mut params, &mut root_views, kind, slot, visibility);
+                    if !out.contains(&(slot, param)) {
+                        out.push((slot, param));
+                    }
                 }
             }
             if t.stride_table {
@@ -512,21 +578,26 @@ impl HostPipeline {
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
         if mesh.is_some() {
+            // "triangles": the stream names its topology since it did not
+            // load from the library without one (see `MeshStream`); a
+            // new name keeps such entries, stored before, from being
+            // looked up again.
             let name = super::library::name(
-                "mesh",
+                "mesh triangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            // The stream names a triangle topology (see `MeshStream`).
+            let ms = || MeshStream::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms(), code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms(), code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -656,6 +727,54 @@ struct VertexStream {
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
 }
 
+/// A mesh pipeline's stage subobjects: the mesh shader and a triangle
+/// topology, which D3D12 does not need for a mesh shader: without it the
+/// pipeline library refuses to load a stored pipeline with the very stream
+/// it was made from (`E_INVALIDARG`; debug layer message 972, "does not
+/// match the one used to create the PSO"), so every mesh pipeline was
+/// compiled again, and its store then refused (970, "already exists"). The
+/// translation makes triangle mesh shaders only (`mesh_prologue` refuses
+/// others), and the debug layer wants the two to agree (1323).
+#[repr(C)]
+struct MeshStream {
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+impl MeshStream {
+    fn new(ms: D3D12_SHADER_BYTECODE) -> Self {
+        Self {
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        }
+    }
+}
+
+/// A mesh pipeline from the title's graphics state with its plain depth
+/// state: the pipeline-state stream form (no input layout).
+#[cfg(test)]
+fn mesh_pipeline(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    ms: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    stream_pipeline(
+        device,
+        root,
+        MeshStream::new(ms),
+        ps,
+        g,
+        Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+        name,
+    )
+}
+
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
 fn stream_pipeline<S, D>(
     device: &ID3D12Device,
@@ -718,6 +837,38 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         .to_vec()
 }
 
+/// Adds or reuses a root view parameter for `(kind, slot)`, widening its
+/// visibility to `ALL` when shared across multiple shader stages so shared
+/// root descriptors do not consume extra root signature dwords.
+fn push_root_view(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    seen: &mut Vec<((i32, u8), u32)>,
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> u32 {
+    if let Some(&(_, existing)) = seen.iter().find(|&&(k, _)| k == (kind.0, slot)) {
+        if params[existing as usize].ShaderVisibility != visibility {
+            params[existing as usize].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        return existing;
+    }
+    let index = params.len() as u32;
+    seen.push(((kind.0, slot), index));
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    });
+    index
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -762,5 +913,184 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    /// A triangle mesh shader of our own and a pixel shader for it.
+    const MS: &str = "struct V { float4 p : SV_Position; };
+        [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+        void main(out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].p = float4(0, 0, 0, 1);
+            v[1].p = float4(1, 0, 0, 1);
+            v[2].p = float4(0, 1, 0, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
+    const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
+    fn dxc() -> Option<PathBuf> {
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => PathBuf::from(p),
+            None => victory_shader::emit::validator::Validator::default_path()?
+                .with_file_name("dxc.exe"),
+        };
+        dxc.exists().then_some(dxc)
+    }
+
+    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+        let (hlsl, out) = (
+            dir.join(format!("{profile}.hlsl")),
+            dir.join(format!("{profile}.dxil")),
+        );
+        std::fs::write(&hlsl, src).unwrap();
+        let status = std::process::Command::new(dxc)
+            .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .status()
+            .unwrap();
+        assert!(status.success(), "dxc failed for {profile}");
+        std::fs::read(out).unwrap()
+    }
+
+    fn code(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
+        D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// A mesh pipeline made once is loaded from the library the next time,
+    /// not compiled again (a stream without a topology never loads).
+    #[test]
+    fn a_mesh_pipeline_loads_from_the_library() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        assert!(
+            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
+            "the mesh pipeline was compiled again instead of loaded from the library"
+        );
+    }
+
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+    };
+
+    #[test]
+    fn root_views_deduplicate_across_stages_and_create_on_warp() {
+        let mut params = Vec::new();
+        let mut seen = Vec::new();
+
+        // Vertex stage declares CBV 0, SRV 1, UAV 2.
+        let v_cbv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            0,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        let v_srv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            1,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        let v_uav = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            2,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        assert_eq!((v_cbv, v_srv, v_uav), (0, 1, 2));
+        assert_eq!(params[2].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+
+        // Pixel stage shares CBV 0 and UAV 2, declares SRV 2 (same slot,
+        // different kind -> separate parameter), and pixel-only UAV 5.
+        let p_cbv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            0,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_uav_shared = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            2,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_srv_same_slot = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            2,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_uav_only = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            5,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+
+        assert_eq!(p_cbv, v_cbv);
+        assert_eq!(p_uav_shared, v_uav);
+        assert_eq!(p_srv_same_slot, 3);
+        assert_eq!(p_uav_only, 4);
+        assert_eq!(params.len(), 5);
+        assert_eq!(params[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        assert_eq!(params[1].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+        assert_eq!(params[2].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        assert_eq!(params[3].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+        assert_eq!(params[4].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        // Create the root signature on WARP (and on host() when available).
+        // SAFETY: plain DXGI/D3D12 device creation on the WARP software adapter.
+        let warp_device = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>())
+                .and_then(|a| {
+                    let mut dev: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut dev)?;
+                    dev.ok_or_else(windows::core::Error::empty)
+                })
+        };
+        if let Ok(dev) = warp_device {
+            root_signature(&dev, &params, &[], false)
+                .expect("WARP CreateRootSignature with deduplicated CBV/SRV/UAV root views");
+        }
+        if let Some(h) = host() {
+            root_signature(&h.device, &params, &[], false)
+                .expect("host CreateRootSignature with deduplicated CBV/SRV/UAV root views");
+        }
     }
 }

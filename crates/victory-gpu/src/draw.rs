@@ -169,24 +169,71 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootView {
+    Cbv,
+    Srv,
+    Uav,
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
-/// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
-    let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        return Some(gpu);
+/// copy in upload memory. Constant buffers refresh up to the D3D12 64 KiB
+/// maximum; SRVs and UAVs refresh the full remaining extent of the backing
+/// buffer (dirty-page watched) and UAVs also schedule write-back.
+/// `None` for a null address or one outside title buffers.
+fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
+    if address == 0 {
+        return None;
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    let shadow = crate::shadow::find(address, 1)?;
+    let gpu = shadow.gpu(address);
+    match kind {
+        RootView::Cbv => {
+            let len = shadow.left(address).min(1 << 16);
+            if gpu.is_multiple_of(256) {
+                shadow.refresh(list, address, len);
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+                return Some(gpu);
+            }
+            let (gpu, to) = list.scratch(len)?;
+            list.defer_fill(to, address as *const u8, len as usize);
+            Some(gpu)
+        }
+        RootView::Srv => {
+            if !gpu.is_multiple_of(4) {
+                return None;
+            }
+            let len = shadow.left(address);
+            shadow.refresh(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+            Some(gpu)
+        }
+        RootView::Uav => {
+            if !gpu.is_multiple_of(4) {
+                return None;
+            }
+            let len = shadow.left(address);
+            shadow.refresh(list, address, len);
+            shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+            Some(gpu)
+        }
+    }
+}
+
+fn emit_uav_barrier(list: &HostList) {
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    // SAFETY: an open command list and a global UAV barrier.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
 macro_rules! once {
@@ -427,6 +474,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -445,6 +494,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -521,6 +571,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let mut bound_params = 0u64;
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {
@@ -546,17 +597,28 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootView::Cbv),
+                (&stage.root_srvs, RootView::Srv),
+                (&stage.root_uavs, RootView::Uav),
+            ] {
                 for &(slot, param) in views {
+                    // A root view two stages share has one parameter.
+                    if param < 64 {
+                        if bound_params & (1u64 << param) != 0 {
+                            continue;
+                        }
+                        bound_params |= 1u64 << param;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, srv, "a shader reads a root view the title did not set");
+                        once!(slot, ?kind, "a shader reads a root view the title did not set");
                         return false;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind) else {
                         once!(
                             slot,
-                            srv,
+                            ?kind,
                             address = format_args!("{address:#x}"),
                             "a shader reads a root view outside title buffers"
                         );
@@ -564,11 +626,21 @@ impl State {
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, RootView::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootView::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootView::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootView::Cbv) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, RootView::Srv) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, RootView::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
+                            }
                         }
                     }
                 }
@@ -635,6 +707,9 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if p.has_root_uavs() {
+            emit_uav_barrier(list);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -663,7 +738,12 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -692,6 +772,11 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if crate::pipeline::host_pipeline(self.pipeline as This)
+                        .is_some_and(|p| p.has_root_uavs())
+                    {
+                        emit_uav_barrier(list);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -975,6 +1060,11 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.has_root_uavs())
+            {
+                emit_uav_barrier(list);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1063,6 +1153,11 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.has_root_uavs())
+            {
+                emit_uav_barrier(list);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1114,6 +1209,8 @@ impl State {
             }
             let shadow = crate::shadow::find(v.address, u64::from(v.size))?;
             shadow.refresh(list, v.address, u64::from(v.size));
+            // The expansion binds the source as a root unordered-access view.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             let (_, gpu, size) =
                 crate::rects::vertices(list, host, shadow.gpu(v.address), u64::from(v.size), v.stride, &elements)?;
             views.push((
@@ -1206,6 +1303,12 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own and
         // copies clamped active records into a scratch buffer at offset 0.
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        // The clamp reads the records and their count: after whatever shader
+        // wrote them earlier in the list.
+        list.buffer_state(&args.buffer, crate::host::BUFFER_READ);
+        if let Some((s, _)) = &counter {
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+        }
         let Some(bounded) = crate::indirect::bound(
             list,
             (&args.buffer, args.offset(arguments)),
@@ -1289,6 +1392,10 @@ impl State {
             )
         };
         crate::indirect::done(list, &bounded);
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
+        {
+            emit_uav_barrier(list);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1352,6 +1459,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {
@@ -1460,5 +1570,354 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::native::{ComputeIo, StageIo};
+    use victory_shader::{
+        Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    struct Allocation {
+        ptr: *mut u8,
+    }
+
+    impl Allocation {
+        fn watched(len: usize) -> Self {
+            // SAFETY: allocates a fresh write-watched virtual range freed in Drop.
+            let ptr = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    len,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<u8>();
+            assert!(!ptr.is_null());
+            Self { ptr }
+        }
+
+        fn reserved_unmapped(len: usize) -> Self {
+            // SAFETY: reserves an uncommitted VA range so accesses are unmapped.
+            let ptr = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) }
+                .cast::<u8>();
+            assert!(!ptr.is_null());
+            Self { ptr }
+        }
+
+        fn addr(&self) -> u64 {
+            self.ptr as u64
+        }
+    }
+
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            // SAFETY: `self.ptr` came from `VirtualAlloc`.
+            unsafe {
+                VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// Synthetic GFX10 compute shader reading Root CBV (slot 0, dword 0) and
+    /// Root SRV (slot 1, byte offset `+1.5 MiB`), and storing `cbv ^ srv ^
+    /// 0xA5A5_5A5A` to Root UAV (slot 2, byte offset `+1.5 MiB`).
+    fn build_root_view_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+        let s_mov_b32 =
+            |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
+        let s_load_dword = |dst: u8, base: u8, byte_off: u32| -> [u32; 2] {
+            [
+                0x3D << 26 | (dst as u32) << 6 | (base as u32 >> 1),
+                125 << 25 | (byte_off & 0x1F_FFFF),
+            ]
+        };
+        let vop1 = |op: u16, vdst: u8, src0: u16| -> u32 {
+            0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let buffer_load_dword_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x0C << 18 | (1 << 12),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8 | vaddr as u32,
+            ]
+        };
+        let buffer_store_dword_offen = |vdata: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (1 << 12),
+                0x80 << 24
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+
+        let mut words = Vec::new();
+        // s[0:1] = CBV 0, s[2:3] = SRV 1, s[4:5] = UAV 2.
+        words.extend_from_slice(&s_load_dword(6, 0, 0));
+        // SRV descriptor in s[8:11], UAV descriptor in s[12:15].
+        words.push(s_mov_b32(8, 2));
+        words.push(s_mov_b32(9, 3));
+        words.push(s_mov_b32(10, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(11, 0xFF), 0x3101_4FAC]);
+        words.push(s_mov_b32(12, 4));
+        words.push(s_mov_b32(13, 5));
+        words.push(s_mov_b32(14, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(15, 0xFF), 0x3101_4FAC]);
+        let vop2 = |op: u8, vdst: u8, src0: u16, vsrc1: u8| -> u32 {
+            (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        // v0 = 0x18_0000 (+1.5 MiB); v1 = srv[0x18_0000]; v2 = s6 ^ v1 ^ 0xA5A5_5A5A.
+        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), 0x0018_0000]);
+        words.extend_from_slice(&buffer_load_dword_offen(1, 0, 8));
+        words.push(vop2(0x1D, 2, 6, 1)); // v_xor_b32 v2, s6, v1
+        words.extend_from_slice(&[vop2(0x1D, 2, 0xFF, 2), 0xA5A5_5A5A]); // v_xor_b32 v2, literal, v2
+        words.extend_from_slice(&buffer_store_dword_offen(2, 0, 12));
+        words.push(0xBF81_0000); // s_endpgm
+
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 2,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 4,
+                slot: 2,
+            },
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 1,
+                    user_data: 2,
+                    slot: 1,
+                },
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 2,
+                    user_data: 4,
+                    slot: 2,
+                },
+            ],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 6 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, 8).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
+        (shader, used)
+    }
+
+    #[test]
+    fn null_and_unmapped_root_views_are_refused() {
+        assert!(crate::shadow::find(0, 1).is_none());
+        assert!(crate::shadow::find(0x1000, 64).is_none());
+        assert!(crate::shadow::find(u64::MAX - 16, 1).is_none());
+        assert!(crate::shadow::find(u64::MAX - (1 << 20), 1).is_none());
+
+        let unmapped = Allocation::reserved_unmapped(8 << 20);
+        let mid = unmapped.addr() + (4 << 20);
+        assert!(crate::shadow::find(mid, 64).is_none());
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("new_list");
+        assert!(root_view(&list, 0, RootView::Cbv).is_none());
+        assert!(root_view(&list, 0, RootView::Srv).is_none());
+        assert!(root_view(&list, 0, RootView::Uav).is_none());
+        assert!(root_view(&list, mid, RootView::Srv).is_none());
+        assert!(root_view(&list, mid, RootView::Uav).is_none());
+        assert!(root_view(&list, u64::MAX - 16, RootView::Srv).is_none());
+        assert!(root_view(&list, u64::MAX - 16, RootView::Uav).is_none());
+
+        list.close();
+    }
+
+    #[test]
+    fn root_srv_refreshes_dirty_data_past_one_mib() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let len = 2 << 20;
+        let alloc = Allocation::watched(len);
+        let base = alloc.addr();
+        let resource_id = alloc.ptr as usize;
+        crate::shadow::register(resource_id, base, len as u64);
+
+        let off_a = 0x18_0000usize; // +1.5 MiB
+        let off_b = 0x1C_0000usize; // +1.75 MiB
+        // SAFETY: `off_a` and `off_b` lie within the 2 MiB committed allocation.
+        unsafe {
+            alloc.ptr.add(off_a).cast::<u32>().write(0xCAFE_1234);
+        }
+
+        let list = host.new_list().expect("new_list");
+        let shadow = crate::shadow::find(base, 4).expect("shadow");
+        assert_eq!(
+            root_view(&list, base, RootView::Srv),
+            Some(shadow.gpu(base))
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(shadow.read_u32(off_a), 0xCAFE_1234);
+
+        // Second submission mutates another page past +1 MiB and verifies
+        // incremental dirty-page refresh updates it too.
+        list.reset();
+        // SAFETY: within the 2 MiB allocation.
+        unsafe {
+            alloc.ptr.add(off_b).cast::<u32>().write(0xBEEF_5678);
+        }
+        assert_eq!(
+            root_view(&list, base, RootView::Srv),
+            Some(shadow.gpu(base))
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(shadow.read_u32(off_a), 0xCAFE_1234);
+        assert_eq!(shadow.read_u32(off_b), 0xBEEF_5678);
+
+        crate::shadow::unregister(resource_id, base);
+    }
+
+    #[test]
+    fn dispatch_drops_unset_root_views_and_copies_root_uav_writes_back() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (shader, used) = build_root_view_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        let unmapped = Allocation::reserved_unmapped(8 << 20);
+        let mid_unmapped = unmapped.addr() + (4 << 20);
+
+        let len = 2 << 20;
+        let srv_buf = Allocation::watched(len);
+        let uav_buf = Allocation::watched(len);
+        let cbv_buf = Allocation::watched(64 << 10);
+        crate::shadow::register(srv_buf.ptr as usize, srv_buf.addr(), len as u64);
+        crate::shadow::register(uav_buf.ptr as usize, uav_buf.addr(), len as u64);
+        crate::shadow::register(cbv_buf.ptr as usize, cbv_buf.addr(), 64 << 10);
+
+        let off = 0x18_0000usize; // +1.5 MiB
+        // SAFETY: offsets are inside the committed allocations.
+        unsafe {
+            cbv_buf.ptr.cast::<u32>().write(0x1357_2468);
+            srv_buf.ptr.add(off).cast::<u32>().write(0xDEAD_BEEF);
+        }
+
+        // A dispatch whose root views the title did not set, set to null or
+        // set outside mapped memory is dropped (no fallback buffers: a
+        // compute pass spinning on zeros hangs the GPU), and writes nothing.
+        let list = host.new_list().expect("new_list");
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_view(true, 1, 0);
+        state.set_view(true, 2, mid_unmapped);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: reading the u32 at `+1.5 MiB` in title memory.
+        assert_eq!(unsafe { uav_buf.ptr.add(off).cast::<u32>().read() }, 0);
+
+        // Dispatch with all three root views bound (SRV reading +1.5 MiB and
+        //    UAV writing +1.5 MiB) and verify full extent refresh + write-back.
+        list.reset();
+        state.reset(pso);
+        state.set_view(true, 0, cbv_buf.addr());
+        state.set_view(true, 1, srv_buf.addr());
+        state.set_view(true, 2, uav_buf.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: reading back the u32 at `+1.5 MiB` in title memory.
+        let got = unsafe { uav_buf.ptr.add(off).cast::<u32>().read() };
+        assert_eq!(got, 0x1357_2468 ^ 0xDEAD_BEEF ^ 0xA5A5_5A5A);
+
+        // Indirect dispatch (`execute_indirect`) with Root UAVs bound also
+        //    emits its UAV barrier cleanly and copies updated writes back.
+        let args_buf = Allocation::watched(64 << 10);
+        crate::shadow::register(args_buf.ptr as usize, args_buf.addr(), 64 << 10);
+        // SAFETY: updating CBV[0] and writing [1, 1, 1] dispatch args inside committed allocations.
+        unsafe {
+            cbv_buf.ptr.cast::<u32>().write(0x2468_ACE0);
+            args_buf.ptr.cast::<[u32; 3]>().write([1, 1, 1]);
+        }
+        list.reset();
+        state.reset(pso);
+        state.set_view(true, 0, cbv_buf.addr());
+        state.set_view(true, 1, srv_buf.addr());
+        state.set_view(true, 2, uav_buf.addr());
+        assert!(state.execute_indirect(&list, (2, 12, 1), args_buf.addr(), None));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: reading back the u32 at `+1.5 MiB` in title memory.
+        let indirect_got = unsafe { uav_buf.ptr.add(off).cast::<u32>().read() };
+        assert_eq!(indirect_got, 0x2468_ACE0 ^ 0xDEAD_BEEF ^ 0xA5A5_5A5A);
+        crate::shadow::unregister(args_buf.ptr as usize, args_buf.addr());
+
+        crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
+        crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
+        crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
     }
 }

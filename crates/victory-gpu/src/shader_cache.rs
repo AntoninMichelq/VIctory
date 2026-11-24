@@ -92,6 +92,9 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    /// The translation it ran worked: a cache error after that is the
+    /// cache's (it could not keep the entry), not the shader's.
+    translated: AtomicBool,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -105,6 +108,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        self.translated.store(true, Ordering::Relaxed);
         Ok(encode(&shader))
     }
 }
@@ -119,11 +123,19 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        translated: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            // A full disk, a file in the way, a scanner holding the new
+            // entry: the shader is still good, only not kept.
+            Err(e) if converter.translated.load(Ordering::Relaxed) => {
+                tracing::warn!(error = format!("{e:#}"), "shader cache entry not written");
+                break;
+            }
+            Err(e) => return Err(format!("{e:#}")),
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -141,7 +153,8 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+// "VSH3": root UAVs (PR #294) joined the stride-table flag of "VSH2".
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -216,7 +229,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -277,6 +290,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -287,6 +301,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         stride_table,
+        root_uavs,
     })
 }
 
@@ -314,6 +329,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             stride_table: true,
+            root_uavs: vec![1],
         }
     }
 
@@ -338,7 +354,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -364,6 +380,23 @@ mod tests {
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+    }
+
+    #[test]
+    fn a_cache_that_cannot_keep_an_entry_still_gives_the_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        // A file where every entry's folder would go: nothing can be written.
+        for shard in 0..=0xff_u8 {
+            std::fs::write(dir.path().join(format!("{shard:02x}")), b"").unwrap();
+        }
+        let translate = |_: &[u8]| Ok(shader());
+        let container = b"a console container".as_slice();
+        assert_eq!(cached(&cache, &[7; 32], container, translate), Ok(shader()));
+        // A shader that does not translate still fails, with its own error.
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let error = cached(&cache, &[7; 32], b"other", fail).unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
