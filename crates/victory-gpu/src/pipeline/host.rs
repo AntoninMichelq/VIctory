@@ -519,6 +519,47 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Root SRVs become one-descriptor tables: a root view has no
+        // bounds, and a shader reading past its title buffer faults the
+        // device (D13f: a mesh draw read 32 MB past a 3.5 MB root view).
+        // The shader's binding (register, space) is the same either way.
+        let srv_tables = root_srv_tables();
+        let srv_params: Vec<usize> = if srv_tables {
+            params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV
+                        // SAFETY: a root descriptor parameter.
+                        && unsafe { p.Anonymous.Descriptor.RegisterSpace } == ROOT_CBV_SPACE
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = srv_params
+            .iter()
+            .map(|&i| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                // SAFETY: a root descriptor parameter.
+                BaseShaderRegister: unsafe { params[i].Anonymous.Descriptor.ShaderRegister },
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
+        for (range, &i) in ranges.iter().zip(&srv_params) {
+            params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[i].Anonymous = D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            };
+        }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
                 Ok(root) => root,
@@ -840,6 +881,19 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
 /// Adds or reuses a root view parameter for `(kind, slot)`, widening its
 /// visibility to `ALL` when shared across multiple shader stages so shared
 /// root descriptors do not consume extra root signature dwords.
+/// Whether root SRVs are bound as bounds-checked one-descriptor tables
+/// (default); `VICTORY_ROOT_SRV_VIEWS=1` keeps plain root views.
+pub(crate) fn root_srv_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let views = std::env::var("VICTORY_ROOT_SRV_VIEWS").is_ok_and(|v| v == "1");
+        if views {
+            tracing::info!("root SRVs bound as root views (VICTORY_ROOT_SRV_VIEWS=1)");
+        }
+        !views
+    })
+}
+
 fn push_root_view(
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
     seen: &mut Vec<((i32, u8), u32)>,

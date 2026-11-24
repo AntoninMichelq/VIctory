@@ -79,6 +79,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Root shader views made tables in this list: (title heap, host
+    /// buffer, title address, length) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
     /// Whether the last [`State::bind`] left a used unordered access view
     /// with nothing behind it (a null view).
     null_uav: bool,
@@ -304,6 +307,9 @@ impl State {
     /// Takes the dynamic descriptor slots held by this recording, so a
     /// pending host list can keep them alive until its submission finishes.
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        // What was made in those slots is no longer ours to reuse.
+        self.fresh_tables.clear();
+        self.root_srv_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
 
@@ -460,6 +466,54 @@ impl State {
     }
 
     /// The bound heap holding `handle`.
+    /// A title root shader view as a one-descriptor table in the bound
+    /// view heap: a raw view to the end of the title buffer, so reads past
+    /// it return zero (a root view reads whatever host memory is there).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: u64,
+    ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        if address == 0 {
+            return None;
+        }
+        let shadow = crate::shadow::find(address, 1)?;
+        let gpu = shadow.gpu(address);
+        if !gpu.is_multiple_of(4) {
+            return None;
+        }
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let len = shadow.left(address);
+        // SAFETY: a live buffer.
+        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+        let elements = u32::try_from(len / 4).ok()?;
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            shadow.buffer.as_raw() as usize,
+            address,
+            len,
+        );
+        let first = match self.root_srv_slots.get(&key) {
+            Some(&first) => first,
+            None => {
+                let first = host.dynamic(1)?;
+                self.dynamic.push((key.0, first, 1));
+                host.raw_srv_at(first, &shadow.buffer, (gpu - base) / 4, elements);
+                self.root_srv_slots.insert(key, first);
+                first
+            }
+        };
+        shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+        Some(host.gpu_handle(first))
+    }
+
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
             .iter()
@@ -665,7 +719,28 @@ impl State {
                         once!(slot, ?kind, "a shader reads a root view the title did not set");
                         return false;
                     };
-                    let Some(gpu) = root_view(list, *address, kind) else {
+                    let address = *address;
+                    if kind == RootView::Srv && crate::pipeline::host::root_srv_tables() {
+                        let Some(table) = self.root_srv_table(list, address) else {
+                            once!(
+                                slot,
+                                address = format_args!("{address:#x}"),
+                                "a root shader view could not be made a bounded table; draw dropped"
+                            );
+                            return false;
+                        };
+                        // SAFETY: an open list; the slot views live memory
+                        // and is held until the list is done.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootDescriptorTable(param, table);
+                            } else {
+                                l.SetGraphicsRootDescriptorTable(param, table);
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, address, kind) else {
                         once!(
                             slot,
                             ?kind,
