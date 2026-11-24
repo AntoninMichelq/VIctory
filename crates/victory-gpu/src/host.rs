@@ -166,6 +166,16 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Other parts of the preparing, in microseconds since the last frame-rate
+/// line: title-writing and host work run at submission, texture checks,
+/// texture upload recording (preludes), the final refresh flush, and
+/// directly indexed SRV refreshes.
+static PREP_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn prep_part(i: usize, started: std::time::Instant) {
+    PREP_PARTS[i].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -1270,13 +1280,20 @@ impl Host {
         for list in runs {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            let preluding = std::time::Instant::now();
+            let prelude = list.prelude(&uploads);
+            prep_part(2, preluding);
+            if let Some(prelude) = prelude {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
+        let flushing = std::time::Instant::now();
         batch.flush();
+        prep_part(3, flushing);
+        let srvs = std::time::Instant::now();
         let _direct_srvs = refresh_direct_srvs(runs);
+        prep_part(4, srvs);
         crate::watch::end_epoch();
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
@@ -2344,9 +2361,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    crate::watch::end_epoch();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    crate::watch::begin_epoch();
+                    // Only the pages written are asked again.
+                    crate::watch::uncover(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -2377,6 +2394,7 @@ impl HostList {
                     if run {
                         crate::watch::begin_epoch();
                     }
+                    prep_part(0, started);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -2396,6 +2414,7 @@ impl HostList {
                     if batch.texture_due(staging) && staging.refresh() {
                         uploads.push((staging.clone(), copy.clone()));
                     }
+                    prep_part(1, started);
                     continue;
                 }
             };
@@ -2967,6 +2986,8 @@ impl Meter {
         let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
         let [asks, ask_us, kernel_asks] = crate::watch::take_asks();
         let recording_us = crate::draw::take_recording_us();
+        let [runs_us, texture_check_us, prelude_us, flush_us, srv_us] =
+            [0, 1, 2, 3, 4].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed));
         let [pso_wait_us, buffer_lock_us, list_lock_us] = crate::draw::take_blocked_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
@@ -2981,7 +3002,10 @@ impl Meter {
             tracing::info!(
                 "frame CPU split: recording {:.1} ms (blocked: pipeline waits {:.1} ms, \
                  buffer lock {:.1} ms, list lock {:.1} ms); {:.1} submissions: preparing {cpu:.1} ms \
-                 (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms), submitting \
+                 (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms; \
+                 copies {copy_ms:.1} ms {copy_mb:.1} MB, run work {:.1} ms, texture checks {:.1} ms \
+                 ({texture_mb:.1} MB), texture uploads recorded {:.1} ms, last refresh {:.1} ms, \
+                 indexed SRVs {:.1} ms), submitting \
                  {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
                 per(recording_us, 1e3),
                 per(pso_wait_us, 1e3),
@@ -2993,6 +3017,11 @@ impl Meter {
                 per(asks, 1.0),
                 per(kernel_asks, 1.0),
                 per(ask_us, 1e3),
+                per(runs_us, 1e3),
+                per(texture_check_us, 1e3),
+                per(prelude_us, 1e3),
+                per(flush_us, 1e3),
+                per(srv_us, 1e3),
                 per(submit_us, 1e3),
                 per(wait_us, 1e3),
             );
