@@ -830,16 +830,6 @@ extern "system" fn copy_buffer_region(
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
-    // A host copy that leaves levels off (`crate::resource::mip_skip`)
-    // matches only another cut the same way.
-    let cut = crate::resource::skipped_mips(dst) != crate::resource::skipped_mips(src);
-    if cut {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy between textures whose host copies leave different levels off skipped (VICTORY_TEXTURE_HALF)")
-        });
-        return true;
-    }
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -876,6 +866,31 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            if crate::resource::skipped_mips(dst) != crate::resource::skipped_mips(src) {
+                // Host copies that leave different levels off
+                // (`crate::resource::mip_skip`): level by level, those both
+                // have (a host level has its title level's size).
+                let part = |texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, index: u32| {
+                    windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: a borrowed pointer the location never releases.
+                        pResource: unsafe { std::mem::transmute_copy(texture) },
+                        Type: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: index,
+                        },
+                    }
+                };
+                for sub in 0..crate::resource::subresources(dst) {
+                    if let (Some(a), Some(b)) = (
+                        crate::resource::host_subresource(dst, sub),
+                        crate::resource::host_subresource(src, sub),
+                    ) {
+                        // SAFETY: an open list; subresources of live textures.
+                        unsafe { list.list.CopyTextureRegion(&part(to, a), 0, 0, 0, &part(from, b), None) };
+                    }
+                }
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -962,10 +977,23 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        // Subresources and boxes name the title's levels; a host copy that
-        // leaves levels off has other ones (`crate::resource::mip_skip`).
-        if unlike(dst.resource, src.resource) || crate::resource::skipped_mips(dst.resource) > 0 {
+        if unlike(dst.resource, src.resource) {
             return;
+        }
+        // Subresources name the title's levels; a host copy that leaves
+        // levels off has other ones (`crate::resource::mip_skip`), each the
+        // size of the title level it stands for. A level left off is not
+        // copied.
+        let mut dst = dst;
+        let mut src = src;
+        for (at, kind) in [(&mut dst, 0u32), (&mut src, 0)] {
+            if at.kind == kind && crate::resource::skipped_mips(at.resource) > 0 {
+                let sub = at.footprint.offset as u32;
+                let Some(host) = crate::resource::host_subresource(at.resource, sub) else {
+                    return;
+                };
+                at.footprint.offset = (at.footprint.offset & !0xffff_ffff) | u64::from(host);
+            }
         }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
@@ -1078,8 +1106,13 @@ fn read_back(
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
     }
+    // A host copy that leaves levels off (`crate::resource::mip_skip`):
+    // its own index for the title's level, which is the same size.
+    let mut src = src;
     if crate::resource::skipped_mips(src.resource) > 0 {
-        return Err("a texture whose host copy leaves levels off (VICTORY_TEXTURE_HALF)");
+        let sub = crate::resource::host_subresource(src.resource, src.footprint.offset as u32)
+            .ok_or("a level the host copy left off (VICTORY_TEXTURE_HALF)")?;
+        src.footprint.offset = (src.footprint.offset & !0xffff_ffff) | u64::from(sub);
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;

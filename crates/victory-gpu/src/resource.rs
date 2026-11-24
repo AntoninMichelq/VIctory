@@ -1694,6 +1694,39 @@ pub(crate) fn skipped_mips(this: This) -> u32 {
     mip_skip(&resource(this).desc)
 }
 
+/// The host subresource of title texture `this`'s subresource `sub`
+/// (level plus levels times layer, as the title counts them), for a host
+/// copy that leaves levels off ([`mip_skip`]): `None` for a level it left
+/// off. A host level has the size of the title level it stands for.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, sub: u32) -> Option<u32> {
+    let skip = skipped_mips(this);
+    if skip == 0 {
+        return Some(sub);
+    }
+    let d = &resource(this).desc;
+    let levels = if d.mip_levels == 0 {
+        64 - d.width.max(u64::from(d.height)).leading_zeros()
+    } else {
+        u32::from(d.mip_levels)
+    };
+    let (mip, layer) = (sub % levels, sub / levels);
+    (mip >= skip).then(|| layer * (levels - skip) + mip - skip)
+}
+
+/// Title subresources of texture `this` (levels times layers).
+#[cfg(windows)]
+pub(crate) fn subresources(this: This) -> u32 {
+    let d = &resource(this).desc;
+    let levels = if d.mip_levels == 0 {
+        64 - d.width.max(u64::from(d.height)).leading_zeros()
+    } else {
+        u32::from(d.mip_levels)
+    };
+    let layers = if d.dimension == TEXTURE_3D { 1 } else { u32::from(d.depth_or_array_size) };
+    levels * layers
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
