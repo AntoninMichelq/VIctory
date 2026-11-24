@@ -309,7 +309,7 @@ extern "system" fn present(
         .map(object::Held::new);
     queue(this)
         .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+        .submit_present(Op::Run(Box::new(move || show(resource))));
     S_OK
 }
 
