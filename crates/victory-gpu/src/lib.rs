@@ -36,6 +36,8 @@ pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod present_target;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

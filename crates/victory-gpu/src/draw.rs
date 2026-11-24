@@ -449,6 +449,7 @@ impl State {
                 record.resource as usize,
                 crate::descriptor::rtv_mips(texture, desc.as_ref()),
             ));
+            crate::present_target::note(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, desc.as_ref()));
@@ -457,6 +458,7 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            crate::present_target::note(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
@@ -2065,6 +2067,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::present_target::note(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
