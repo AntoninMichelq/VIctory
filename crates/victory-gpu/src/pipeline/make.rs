@@ -409,7 +409,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// `VICTORY_DISPATCH_WAIT=1` (opt-in): a compute dispatch whose pipeline is
+/// `VICTORY_DISPATCH_WAIT` (on unless `=0`): a compute dispatch whose pipeline is
 /// not made yet waits for it (up to 5 s: the title ends itself after
 /// ~30 s in one frame) instead of being dropped. A
 /// dropped dispatch leaves data later passes read wrong (culling, light
@@ -418,10 +418,10 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn dispatches_wait() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_DISPATCH_WAIT").is_ok_and(|v| v.trim() == "1");
-        if on {
-            tracing::info!("VICTORY_DISPATCH_WAIT: compute dispatches wait for their pipeline");
-        }
+        // On by default: a dropped dispatch leaves the lighting inputs
+        // unwritten (black world). `VICTORY_DISPATCH_WAIT=0` turns it off.
+        let on = !std::env::var("VICTORY_DISPATCH_WAIT").is_ok_and(|v| v.trim() == "0");
+        tracing::info!(on, "VICTORY_DISPATCH_WAIT: compute dispatches wait for their pipeline");
         on
     })
 }

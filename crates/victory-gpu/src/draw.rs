@@ -740,6 +740,12 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            #[cfg(feature = "diagnostics")]
+            if traced {
+                let why = crate::pipeline::drop_reason(self.pipeline as This);
+                outcome(&format!("DROPPED (no host pipeline: {why})"));
+            }
+            #[cfg(not(feature = "diagnostics"))]
             outcome("DROPPED (no host pipeline)");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
