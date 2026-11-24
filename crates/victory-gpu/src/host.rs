@@ -2996,6 +2996,7 @@ impl Meter {
         let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
         let [asks, ask_us, kernel_asks] = crate::watch::take_asks();
         let recording_us = crate::draw::take_recording_us();
+        let [pso_wait_us, buffer_lock_us, list_lock_us] = crate::draw::take_blocked_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -3007,10 +3008,14 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             tracing::info!(
-                "frame CPU split: recording {:.1} ms; {:.1} submissions: preparing {cpu:.1} ms \
+                "frame CPU split: recording {:.1} ms (blocked: pipeline waits {:.1} ms, \
+                 buffer lock {:.1} ms, list lock {:.1} ms); {:.1} submissions: preparing {cpu:.1} ms \
                  (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms), submitting \
                  {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
                 per(recording_us, 1e3),
+                per(pso_wait_us, 1e3),
+                per(buffer_lock_us, 1e3),
+                per(list_lock_us, 1e3),
                 per(submissions, 1.0),
                 per(snapshot_us, 1e3),
                 per(snapshot_b, 1e6),
