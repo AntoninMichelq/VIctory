@@ -302,6 +302,11 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
+    /// Masks with lanes outside EXEC taken as the numbers the scalar unit makes of their
+    /// operands ([`Self::mask_as_number`]), and those being made.
+    mask_numbers: HashMap<Value, Option<V>>,
+    /// While set, [`Self::sop`] lowers an instruction writing a lane mask as numbers.
+    as_numbers: bool,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -1607,6 +1612,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
+            mask_numbers: HashMap::new(),
+            as_numbers: false,
             def_block: p
                 .blocks
                 .iter()
@@ -3154,6 +3161,9 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if !high && let Some(x) = self.mask_as_number(lo) {
+                return Ok(x);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -3200,6 +3210,51 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// A wave32 compute program's lane mask with lanes outside EXEC where it is written, read
+    /// as a number: no ballot gives it, but the scalar instruction that writes it computes the
+    /// number from its operands' numbers, as the console's scalar unit does. Made where the
+    /// instruction is, when first read. (A register joined with a lane mask on a path that does
+    /// not use it, then taken apart as a number: `CS_TraceShadowRays_FullAdaptive`.)
+    fn mask_as_number(&mut self, lo: Value) -> Option<V> {
+        if self.x.p.wave64 || self.mask_data != MaskData::Console || self.exchange.is_some() {
+            return None;
+        }
+        if let Some(&x) = self.mask_numbers.get(&lo) {
+            return x;
+        }
+        let b = *self.def_block.get(&lo)?;
+        let p = self.x.p;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| matches!(i.fields, Fields::Sop { .. }) && i.writes.iter().any(|w| w.1 == lo))?;
+        if inst.write(Reg::S(EXEC)).is_some() {
+            return None;
+        }
+        let at = if b == self.cur_ir { self.cur } else { self.tail[b]? };
+        // (`None` while being made: a mask made from itself is refused)
+        self.mask_numbers.insert(lo, None);
+        let kept: Vec<(Value, Option<Val>)> =
+            inst.writes.iter().map(|w| (w.1, self.vals.get(&w.1).copied())).collect();
+        let (cur, cur_ir, numbers) = (self.cur, self.cur_ir, self.as_numbers);
+        (self.cur, self.cur_ir, self.as_numbers) = (at, b, true);
+        let r = self.sop(inst);
+        (self.cur, self.cur_ir, self.as_numbers) = (cur, cur_ir, numbers);
+        let x = match (r, self.vals.get(&lo)) {
+            (Ok(()), Some(&Val::I32(x))) => Some(x),
+            _ => None,
+        };
+        // Only the mask's number is kept: SCC and the rest stay as lowered in order.
+        for (v, val) in kept {
+            match val {
+                Some(val) => self.vals.insert(v, val),
+                None => self.vals.remove(&v),
+            };
+        }
+        self.mask_numbers.insert(lo, x);
+        x
     }
 
     // ---- operands ----
@@ -5000,7 +5055,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.as_numbers {
             return Err(LANE_MASK);
         }
         if matches!(
