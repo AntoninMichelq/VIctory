@@ -263,6 +263,20 @@ struct Lower<'a> {
     spun: usize,
 }
 
+/// The `globallycoherent` bit of a UAV handle's properties for `inst`:
+/// set for a load with `glc`. The console's `glc` load misses the
+/// per-CU caches and sees what other workgroups (and queues) wrote; a
+/// plain host UAV load may hit a stale line in them, and a loop waiting
+/// for that write then never sees it. (`glc` on an atomic only asks for
+/// the old value; stores and atomics are coherent anyway.)
+fn coherent(inst: &Inst, writes: bool) -> u32 {
+    let glc = match &inst.fields {
+        Fields::Buffer { cache, .. } | Fields::Image { cache, .. } => cache.glc,
+        _ => false,
+    };
+    if glc && !writes { 0x4000 } else { 0 }
+}
+
 /// Iterations after which a loop is left (per entry into it), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
@@ -6780,6 +6794,11 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
+        let props = if uav {
+            (props.0 | coherent(inst, false), props.1)
+        } else {
+            props
+        };
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
@@ -7224,7 +7243,11 @@ impl<'a> Lower<'a> {
             x => (x, off),
         };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let u = if uav {
+            0x1000 | coherent(inst, store || atomic.is_some())
+        } else {
+            0
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -8660,6 +8683,25 @@ mod tests {
             user_data: 0,
             slot: 0,
         }]
+    }
+
+    #[test]
+    fn glc_loads_read_through_globally_coherent_handles() {
+        let inst = |w0: u32| {
+            let words = [w0, 0x8002_0100, S_ENDPGM];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            p.blocks
+                .iter()
+                .flat_map(|b| b.insts.clone())
+                .next()
+                .unwrap()
+        };
+        // buffer_load_dword v1, v0, s[8:11], 0 idxen (glc)
+        assert_eq!(super::coherent(&inst(0xE030_6000), false), 0x4000);
+        assert_eq!(super::coherent(&inst(0xE030_2000), false), 0);
+        // buffer_atomic_add v1, v0, s[8:11], 0 idxen glc: glc returns.
+        assert_eq!(super::coherent(&inst(0xE0C8_6000), true), 0);
     }
 
     #[test]
