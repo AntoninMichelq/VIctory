@@ -407,6 +407,7 @@ fn wait(p: &Pending, frame: u64) {
             .0;
     }
     drop(held);
+    crate::draw::BLOCKED_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let elapsed_us = started.elapsed().as_micros().min(u128::from(reserved_us)) as u32;
     FRAME_BUDGET.refund(frame, reserved_us - elapsed_us);
 }
