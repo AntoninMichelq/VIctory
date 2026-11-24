@@ -762,11 +762,20 @@ impl State {
                                 .find(|u| u.index == i)
                                 .map(|u| self.user_value(compute, u.slot, u.root, u.dword))
                         };
-                        let (Some(lo), Some(hi)) = (word(index), word(index + 1)) else {
-                            once!(slot, "a pointer view without its user data");
-                            return false;
-                        };
-                        u64::from(hi) << 32 | u64::from(lo)
+                        if index >= 64 {
+                            // Kept shifted right by 8 in one dword.
+                            let Some(x) = word(index - 64) else {
+                                once!(slot, "a pointer view without its user data");
+                                return false;
+                            };
+                            u64::from(x) << 8
+                        } else {
+                            let (Some(lo), Some(hi)) = (word(index), word(index + 1)) else {
+                                once!(slot, "a pointer view without its user data");
+                                return false;
+                            };
+                            u64::from(hi) << 32 | u64::from(lo)
+                        }
                     } else {
                         let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(slot))

@@ -6431,10 +6431,16 @@ impl<'a> Lower<'a> {
                 if props.0 != 11 {
                     return Err("a write or typed view through an address in root constants");
                 }
+                // A shifted address (bit 8): one dword, registers from
+                // `POINTER_SLOT + 64` on.
+                let shifted = index & 0x100 != 0;
+                let index = index & 0xFF;
+                let limit = if shifted { 64 } else { 128 };
                 let slot = u8::try_from(index)
                     .ok()
-                    .filter(|&i| i < 128)
-                    .ok_or("an address in root constants past user data 127")?;
+                    .filter(|&i| i < limit)
+                    .ok_or("an address in root constants past the pointer registers")?
+                    + if shifted { 64 } else { 0 };
                 let layout = &self.x.native.layout;
                 let param = (0..layout.len())
                     .find(|&i| {
@@ -6446,7 +6452,9 @@ impl<'a> Lower<'a> {
                     .ok_or("an address in root constants")?;
                 let dword = index - u32::from(layout[param].user_data);
                 let _ = self.user(param, dword);
-                let _ = self.user(param, dword + 1);
+                if !shifted {
+                    let _ = self.user(param, dword + 1);
+                }
                 Ok(self.s.root_srv_handle(super::POINTER_SLOT + slot))
             }
             Source::Built { address, .. } => {
@@ -14097,6 +14105,31 @@ mod tests {
         let mut read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
         read.sort_unstable();
         assert_eq!(read, [2, 3]);
+    }
+
+    /// An address kept shifted right by 8 in one root constant (s3 of
+    /// constants s0..s3): `u64(s3) << 8 | 12`, read by a scalar load.
+    #[test]
+    fn shifted_addresses_in_root_constants_lower_to_pointer_views() {
+        let words = [
+            0xBE84_0303, // s_mov_b32 s4, s3
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8F84_8804, // s_lshl_b64 s[4:5], s[4:5], 8
+            0x8804_8C04, // s_or_b32 s4, s4, 12
+            0xF400_0202,
+            0xFA00_0000, // s_load_dword s8, s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E06_0208, // v_mov_b32_e32 v3, s8
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        let mut constants = root(RootType::Constants, 0, 0);
+        constants.sgprs = 4;
+        let l = lower_with(&words, vec![constants], vec![]).unwrap();
+        assert_eq!(l.root_srvs, [crate::emit::POINTER_SLOT + 64 + 3]);
+        let read: Vec<u32> = l.user_data.iter().map(|u| u.index).collect();
+        assert_eq!(read, [3]);
     }
 
     #[test]

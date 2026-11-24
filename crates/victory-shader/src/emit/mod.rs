@@ -127,7 +127,9 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// raw views of addresses programs keep in root constants: `i` is the
 /// user-data index of the address's low dword, which with the next one the
 /// shader also reads as user data ([`HostShader::user_data`]); the host
-/// binds a root SRV at the address they hold.
+/// binds a root SRV at the address they hold. From `POINTER_SLOT + 64` on,
+/// `i` is the user-data index of one dword holding the address shifted
+/// right by 8.
 pub const POINTER_SLOT: u8 = 128;
 
 /// Whether addresses kept in root constants become root SRVs
