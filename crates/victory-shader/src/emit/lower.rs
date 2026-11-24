@@ -12898,8 +12898,11 @@ impl<'a> Lower<'a> {
                     // data through registers the program reuses: like a
                     // dead descriptor dword, junk on that edge, assuming
                     // the joined value is read only after the data edge.
+                    // So also where the join is taken for a mask that holds
+                    // lanes elsewhere: no ballot could give it as data.
                     (Some(Val::Missing(LANE_MASK)) | None, false)
-                        if !phi_is_mask
+                        if (!phi_is_mask
+                            || has_data && !self.x.st.active.contains(&phi.value))
                             && (self.x.st.masks.contains_key(&arg)
                                 || self.x.st.highs.contains_key(&arg)) =>
                     {
@@ -12966,10 +12969,17 @@ impl<'a> Lower<'a> {
                 // also takes masks that are constants or built from scalars.
                 let arg = &phi.args[n];
                 let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
-                let m =
-                    *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let Some(&m) = self.x.st.masks.get(arg).or(others) else {
+                    // Data the program left in a register it reuses for a
+                    // mask elsewhere: junk on that edge, as a mask reaching a
+                    // join of data, assuming the joined value is read as a
+                    // mask only after a mask edge.
+                    if matches!(self.vals.get(arg), Some(Val::I32(_))) {
+                        incoming.push((self.s.m.undef(self.s.t.i1), qb));
+                        continue;
+                    }
+                    return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
+                };
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -15166,6 +15176,36 @@ mod tests {
             0x0019_0280, // v_cndmask_b32 v0, 0, 1, s6
         ];
         lowers_valu(&body).unwrap();
+    }
+
+    #[test]
+    fn a_mask_joined_with_data_it_left_in_a_register_is_junk() {
+        // The ped raytracing resolve programs' form: a register that held a
+        // mask for a branch on one path and loaded data on the other, read
+        // as data after the join.
+        let body = [
+            0x7D88_0288, // v_cmp_gt_u32 vcc_lo, 8, v1
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x8806_7E6A, // s_or_b32 s6, vcc_lo, exec_lo
+            0xBF82_0001, // s_branch +1
+            0xBE86_0302, // s_mov_b32 s6, s2
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ];
+        lowers_valu(&body).unwrap();
+        // The join also read as a mask, after the same test: data on the
+        // mask edge and a mask on the data edge are both junk.
+        let mut twice = body[..6].to_vec();
+        twice.extend([
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0004, // s_cbranch_scc1 +4
+            0x8707_067E, // s_and_b32 s7, exec_lo, s6
+            0xD501_0000,
+            0x001D_0280, // v_cndmask_b32 v0, 0, 1, s7
+            0xBF82_0001, // s_branch +1
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ]);
+        lowers_valu(&twice).unwrap();
     }
 
     /// Lowers a one-thread compute program that copies four root constants
