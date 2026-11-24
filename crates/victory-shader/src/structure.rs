@@ -487,6 +487,13 @@ struct SopMasks {
 
 const MAX_ROUNDS: usize = 256;
 
+/// What a join argument brings (see [`Lanes::value_kind`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeKind {
+    Data,
+    Bool,
+}
+
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
@@ -831,41 +838,82 @@ impl<'a> Lanes<'a> {
         Some((m, derived))
     }
 
-    /// Whether a join with these arguments holds a uniform bool or data,
-    /// no mask: on some edge a scalar load or a scalar operation that
-    /// makes no mask wrote the register (data), on every other edge an
-    /// `s_cselect` of -1 or EXEC and 0 (a uniform bool, set in every lane
-    /// or none of those that run), and EXEC is not made from the joined
-    /// value (a register that becomes EXEC is a mask, as before).
+    /// Whether a join with these arguments holds data, no mask: on some
+    /// edge a scalar load or a scalar operation that makes no mask wrote
+    /// the register (data), on every other edge an `s_cselect` of -1 or
+    /// EXEC and 0 (a uniform bool, set in every lane or none of those that
+    /// run) or a copy of EXEC, also through joins of these, and EXEC is not
+    /// made from the joined value (a register that becomes EXEC is a mask,
+    /// as before). The masks get their numbers where the join takes them.
     fn bool_or_data(&self, args: &[Key], k: Key) -> bool {
-        let data = |v: Value| self.data(v);
-        let uniform_bool = |v: Value| {
-            let Some(&(b, i)) = self.defs.get(&v) else {
-                return false;
-            };
-            let inst = &self.p.blocks[b].insts[i];
-            let Fields::Sop { src, .. } = &inst.fields else {
-                return false;
-            };
-            inst.name().starts_with("s_cselect_b")
-                && src.len() == 2
-                && src.iter().all(|o| match *o {
-                    // 0 and -1.
-                    Operand::Const(128 | 193) => true,
-                    Operand::Scalar { code, .. } => code == EXEC || code == EXEC + 1,
-                    _ => false,
-                })
-        };
-        let is_data = |a: &Key| data(a.0) && !uniform_bool(a.0) || data(a.1) && !uniform_bool(a.1);
-        if !args.iter().any(is_data)
-            || !args
-                .iter()
-                .all(|a| is_data(a) || uniform_bool(a.0) && uniform_bool(a.1))
-        {
+        let mut seen = Vec::new();
+        let mut some_data = false;
+        for &a in args {
+            match self.edge_kind(a, &mut seen) {
+                Some(EdgeKind::Data) => some_data = true,
+                Some(EdgeKind::Bool) => {}
+                None => return false,
+            }
+        }
+        if !some_data {
             return false;
         }
         let exec = self.exec_sources();
         !exec.contains(&k.0) && !exec.contains(&k.1)
+    }
+
+    /// What a join argument (both dwords) brings: data if either dword is
+    /// [`Self::value_kind`] data, else a uniform bool or EXEC copy if both are.
+    fn edge_kind(&self, a: Key, seen: &mut Vec<Value>) -> Option<EdgeKind> {
+        let lo = self.value_kind(a.0, seen);
+        let hi = if a.1 == a.0 {
+            lo
+        } else {
+            self.value_kind(a.1, seen)
+        };
+        match (lo, hi) {
+            (Some(EdgeKind::Data), _) | (_, Some(EdgeKind::Data)) => Some(EdgeKind::Data),
+            (Some(EdgeKind::Bool), Some(EdgeKind::Bool)) => Some(EdgeKind::Bool),
+            _ => None,
+        }
+    }
+
+    /// Data ([`Self::data`]); a uniform bool (`s_cselect` of -1 or EXEC and
+    /// 0) or a copy of EXEC (`s_mov`); or, for a join, data if some
+    /// argument is data and every argument is one of these. None: anything
+    /// else.
+    fn value_kind(&self, v: Value, seen: &mut Vec<Value>) -> Option<EdgeKind> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                // A loop back to a join being followed adds nothing.
+                return Some(EdgeKind::Bool);
+            }
+            seen.push(v);
+            let mut kind = EdgeKind::Bool;
+            for &arg in &self.p.blocks[b].phis[i].args {
+                match self.value_kind(arg, seen)? {
+                    EdgeKind::Data => kind = EdgeKind::Data,
+                    EdgeKind::Bool => {}
+                }
+            }
+            return Some(kind);
+        }
+        if self.data(v) {
+            return Some(EdgeKind::Data);
+        }
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let exec = |o: &Operand| matches!(*o, Operand::Scalar { code, .. } if code == EXEC || code == EXEC + 1);
+        let name = inst.name();
+        let bool_or_copy = name.starts_with("s_cselect_b")
+            && src.len() == 2
+            // 0 and -1.
+            && src.iter().all(|o| matches!(*o, Operand::Const(128 | 193)) || exec(o))
+            || name.starts_with("s_mov_b") && src.len() == 1 && exec(&src[0]);
+        bool_or_copy.then_some(EdgeKind::Bool)
     }
 
     /// The SGPR values EXEC is made from: those an instruction writing EXEC

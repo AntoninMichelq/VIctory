@@ -12771,6 +12771,148 @@ mod tests {
         )
     }
 
+    /// Assembled with llvm-mc (gfx1030, wave32). Unless a root constant
+    /// (s1) is negative, a branch on `s_andn2 vcc, exec, s50` (s50 a
+    /// uniform `s_cselect` of EXEC) skips a descriptor and index load and
+    /// sets s0, s1 and s6 from EXEC instead. A second join brings a record
+    /// loaded on another path. After the join s0, s1 and s6 are read only as
+    /// data: `s_cmp_eq` and a branch, a load offset, byte conversions,
+    /// VALU sources. Here s0 is a copy of EXEC on that path.
+    const DATA_JOINED_WITH_EXEC_COPIES: [u32; 55] = [
+        0xBE94_0300, // s_mov_b32 s20, s0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBEB6_0302, // s_mov_b32 s54, s2
+        0xBF04_8001, // s_cmp_lt_i32 s1, 0
+        0x8532_807E, // s_cselect_b32 s50, exec_lo, 0
+        0x8A6A_327E, // s_andn2_b32 vcc_lo, exec_lo, s50
+        0xBF87_0007, // s_cbranch_vccnz 7
+        0xF408_000A,
+        0xFA00_0960, // s_load_dwordx4 s[0:3], s[20:21], 0x960
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0000,
+        0xFA00_0000, // s_buffer_load_dword s0, s[0:3], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF82_0004, // s_branch 4
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBE80_037E, // s_mov_b32 s0, exec_lo
+        0xBE81_037E, // s_mov_b32 s1, exec_lo
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0x7E66_0280, // v_mov_b32_e32 v51, 0
+        0xBF04_8036, // s_cmp_lt_i32 s54, 0
+        0xBF85_000C, // s_cbranch_scc1 12
+        0xF408_060A,
+        0xFA00_0320, // s_load_dwordx4 s[24:27], s[20:21], 0x320
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF428_000C,
+        0x6C00_0000, // s_buffer_load_dwordx4 s[0:3], s[24:27], s54
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x8810_0200, // s_or_b32 s16, s0, s2
+        0xBF07_8010, // s_cmp_lg_u32 s16, 0
+        0x8503_80C1, // s_cselect_b32 s3, -1, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0x7E66_0203, // v_mov_b32_e32 v51, s3
+        0xBF82_0000, // s_branch 0
+        0x7D84_66C1, // v_cmp_eq_u32_e32 vcc_lo, -1, v51
+        0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+        0xBF87_0012, // s_cbranch_vccnz 18
+        0xBE85_0381, // s_mov_b32 s5, 1
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_000F, // s_cbranch_scc1 15
+        0x8F08_8500, // s_lshl_b32 s8, s0, 5
+        0xF40C_0A0A,
+        0x1000_0000, // s_load_dwordx8 s[40:47], s[20:21], s8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E08_2200, // v_cvt_f32_ubyte0_e32 v4, s0
+        0x7E0A_2400, // v_cvt_f32_ubyte1_e32 v5, s0
+        0x0608_0B04, // v_add_f32_e32 v4, v4, v5
+        0xD834_0004,
+        0x0000_0400, // ds_write_b32 v0, v4 offset:4
+        0x8F07_8201, // s_lshl_b32 s7, s1, 2
+        0x7E04_0205, // v_mov_b32_e32 v2, s5
+        0x4A04_0407, // v_add_nc_u32_e32 v2, s7, v2
+        0x4A04_0406, // v_add_nc_u32_e32 v2, s6, v2
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn data_joined_with_exec_copies_is_data() {
+        let (layout, used) = join_layout();
+        lower_with(&DATA_JOINED_WITH_EXEC_COPIES, layout, used).unwrap();
+    }
+
+    /// As [`DATA_JOINED_WITH_EXEC_COPIES`], s0 an `s_cselect` of EXEC and 0
+    /// on that path, and the load path split by a branch that skips the loads
+    /// (s0 a shifted root constant there): the data comes through a join.
+    const DATA_THROUGH_A_JOIN_JOINED_WITH_EXEC: [u32; 59] = [
+        0xBE94_0300, // s_mov_b32 s20, s0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBEB6_0302, // s_mov_b32 s54, s2
+        0x8F00_8236, // s_lshl_b32 s0, s54, 2
+        0xBF04_8001, // s_cmp_lt_i32 s1, 0
+        0x8532_807E, // s_cselect_b32 s50, exec_lo, 0
+        0x8A6A_327E, // s_andn2_b32 vcc_lo, exec_lo, s50
+        0xBF87_000A, // s_cbranch_vccnz 10
+        0xBF06_FF36,
+        0x0000_00FF, // s_cmp_eq_u32 s54, 0xff
+        0xBF85_0006, // s_cbranch_scc1 6
+        0xF408_000A,
+        0xFA00_0960, // s_load_dwordx4 s[0:3], s[20:21], 0x960
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0000,
+        0xFA00_0000, // s_buffer_load_dword s0, s[0:3], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF82_0004, // s_branch 4
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0x8500_807E, // s_cselect_b32 s0, exec_lo, 0
+        0xBE81_037E, // s_mov_b32 s1, exec_lo
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0x7E66_0280, // v_mov_b32_e32 v51, 0
+        0xBF04_8036, // s_cmp_lt_i32 s54, 0
+        0xBF85_000C, // s_cbranch_scc1 12
+        0xF408_060A,
+        0xFA00_0320, // s_load_dwordx4 s[24:27], s[20:21], 0x320
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF428_000C,
+        0x6C00_0000, // s_buffer_load_dwordx4 s[0:3], s[24:27], s54
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x8810_0200, // s_or_b32 s16, s0, s2
+        0xBF07_8010, // s_cmp_lg_u32 s16, 0
+        0x8503_80C1, // s_cselect_b32 s3, -1, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0x7E66_0203, // v_mov_b32_e32 v51, s3
+        0xBF82_0000, // s_branch 0
+        0x7D84_66C1, // v_cmp_eq_u32_e32 vcc_lo, -1, v51
+        0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+        0xBF87_0012, // s_cbranch_vccnz 18
+        0xBE85_0381, // s_mov_b32 s5, 1
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_000F, // s_cbranch_scc1 15
+        0x8F08_8500, // s_lshl_b32 s8, s0, 5
+        0xF40C_0A0A,
+        0x1000_0000, // s_load_dwordx8 s[40:47], s[20:21], s8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E08_2200, // v_cvt_f32_ubyte0_e32 v4, s0
+        0x7E0A_2400, // v_cvt_f32_ubyte1_e32 v5, s0
+        0x0608_0B04, // v_add_f32_e32 v4, v4, v5
+        0xD834_0004,
+        0x0000_0400, // ds_write_b32 v0, v4 offset:4
+        0x8F07_8201, // s_lshl_b32 s7, s1, 2
+        0x7E04_0205, // v_mov_b32_e32 v2, s5
+        0x4A04_0407, // v_add_nc_u32_e32 v2, s7, v2
+        0x4A04_0406, // v_add_nc_u32_e32 v2, s6, v2
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn data_through_a_join_joined_with_exec_is_data() {
+        let (layout, used) = join_layout();
+        lower_with(&DATA_THROUGH_A_JOIN_JOINED_WITH_EXEC, layout, used).unwrap();
+    }
+
     #[test]
     fn a_saved_exec_joined_with_loaded_data_is_read_as_its_number() {
         // Assembled with llvm-mc (gfx1030, wave32): s19 saves EXEC around an
