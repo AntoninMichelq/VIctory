@@ -133,6 +133,32 @@ pub(crate) fn take_recording_us() -> u64 {
     RECORDING_US.swap(0, Ordering::Relaxed)
 }
 
+/// Parts of the recording time spent blocked, in microseconds since the
+/// last [`take_blocked_us`]: waiting for a pipeline (the per-frame budget),
+/// for the title buffers' lock, and for a list's draw state lock.
+pub(crate) static BLOCKED_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Pipeline waits, buffer-lock waits and list-lock waits since the last
+/// call, in microseconds.
+pub(crate) fn take_blocked_us() -> [u64; 3] {
+    [0, 1, 2].map(|i| BLOCKED_US[i].swap(0, Ordering::Relaxed))
+}
+
+/// Locks `m`, adding the time spent waiting for it to [`BLOCKED_US`]`[i]`
+/// (nothing when it was free).
+pub(crate) fn lock_timed<T>(m: &std::sync::Mutex<T>, i: usize) -> std::sync::MutexGuard<'_, T> {
+    match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let g = m.lock().unwrap_or_else(|e| e.into_inner());
+            BLOCKED_US[i].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            g
+        }
+    }
+}
+
 /// Groups the host runs per dimension of a dispatch (and of a mesh
 /// dispatch). A count past it is undefined behaviour on the host; drivers
 /// may run it for seconds and reset the display driver.
