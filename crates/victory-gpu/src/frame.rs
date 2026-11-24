@@ -49,11 +49,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = forced_interval().unwrap_or(asked);
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +67,22 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// `VICTORY_FPS` (opt-in): frames per second to pace at instead of the
+/// title's own interval, e.g. 60 where the title asks for 30. A title that
+/// steps its simulation per frame rather than per elapsed time runs faster
+/// with it. Unset, 0 or unreadable: the title's interval.
+fn forced_interval() -> Option<Duration> {
+    static FORCED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| parse_fps(std::env::var("VICTORY_FPS").ok().as_deref()))
+}
+
+/// `VICTORY_FPS`'s interval. Pure, for testing.
+fn parse_fps(value: Option<&str>) -> Option<Duration> {
+    let fps: f64 = value?.trim().parse().ok()?;
+    (fps.is_finite() && (1.0..=1000.0).contains(&fps))
+        .then(|| Duration::from_nanos((1e9 / fps) as u64))
 }
 
 /// Device method: events are scheduled at every tick.
@@ -101,7 +118,7 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: forced_interval().unwrap_or(SIXTIETH),
         first: 0,
     });
     let elapsed = c.start.elapsed().as_nanos();
@@ -239,5 +256,19 @@ mod tests {
         assert!(second > first, "{second} after {first}");
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+}
+
+#[cfg(test)]
+mod fps_tests {
+    use super::*;
+
+    #[test]
+    fn fps_override_parses() {
+        assert_eq!(parse_fps(Some("60")), Some(Duration::from_nanos(16_666_666)));
+        assert_eq!(parse_fps(Some(" 120 ")), Some(Duration::from_nanos(8_333_333)));
+        for bad in [None, Some(""), Some("0"), Some("-5"), Some("abc"), Some("inf"), Some("5000")] {
+            assert_eq!(parse_fps(bad), None, "{bad:?}");
+        }
     }
 }
