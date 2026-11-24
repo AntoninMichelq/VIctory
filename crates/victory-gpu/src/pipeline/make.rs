@@ -12,6 +12,11 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
+//! Workers take the pipelines the latest title frame asked for first: a
+//! backlog of hundreds is served newest frame first, so what is on screen
+//! now is made before what an earlier frame (or the last run's early list)
+//! wanted.
+//!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
@@ -33,6 +38,11 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// One more than the last title frame a draw asked for it (0: only
+    /// started early): the queue serves the most recent frame first.
+    wanted: AtomicU64,
+    /// A worker has started making it.
+    taken: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +66,21 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            wanted: AtomicU64::new(0),
+            taken: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
+        let started = Instant::now();
+        let made = self
+            .made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let us = started.elapsed().as_micros() as u64;
+        STATS.us.fetch_add(us, Ordering::Relaxed);
+        STATS.max_us.fetch_max(us, Ordering::Relaxed);
+        let counter = if made.is_some() { &STATS.ok } else { &STATS.failed };
+        counter.fetch_add(1, Ordering::Relaxed);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -91,6 +110,69 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// What the workers did since the last progress line.
+struct Stats {
+    ok: AtomicU64,
+    failed: AtomicU64,
+    /// Time making them (translation, root signature, library load or
+    /// host compile), total and longest, in microseconds.
+    us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    ok: AtomicU64::new(0),
+    failed: AtomicU64::new(0),
+    us: AtomicU64::new(0),
+    max_us: AtomicU64::new(0),
+};
+
+/// Every 5 s while there is pipeline work: one line on the backlog and
+/// what the workers made since the last one.
+fn progress() {
+    use super::library::{COMPILE_US, LOADED, MADE, SHARED};
+    let (mut made, mut loaded, mut shared, mut compile_us) = (0, 0, 0, 0);
+    let (mut hits, mut misses) = crate::shader_cache::counts();
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let ok = STATS.ok.swap(0, Ordering::Relaxed);
+        let failed = STATS.failed.swap(0, Ordering::Relaxed);
+        let us = STATS.us.swap(0, Ordering::Relaxed);
+        let max_us = STATS.max_us.swap(0, Ordering::Relaxed);
+        let queued = WAITING.load(Ordering::Relaxed);
+        let delta = |total: &AtomicU64, last: &mut u64| {
+            let now = total.load(Ordering::Relaxed);
+            now.saturating_sub(std::mem::replace(last, now))
+        };
+        let compiled = delta(&MADE, &mut made);
+        let from_library = delta(&LOADED, &mut loaded);
+        let deduped = delta(&SHARED, &mut shared);
+        let compile_ms = delta(&COMPILE_US, &mut compile_us) / 1000;
+        let (h, m) = crate::shader_cache::counts();
+        let shader_hits = h.saturating_sub(std::mem::replace(&mut hits, h));
+        let shader_translated = m.saturating_sub(std::mem::replace(&mut misses, m));
+        if queued == 0 && ok == 0 && failed == 0 {
+            continue;
+        }
+        let done = ok + failed;
+        tracing::info!(
+            queued,
+            made = ok,
+            failed,
+            compiled,
+            from_library,
+            deduped,
+            shader_hits,
+            shader_translated,
+            avg_ms = us.checked_div(done).unwrap_or(0) / 1000,
+            max_ms = max_us / 1000,
+            host_compile_avg_ms = compile_ms.checked_div(compiled).unwrap_or(0),
+            queue_entries = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).heap.len(),
+            "pipeline workers (last 5 s)"
+        );
+    }
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -109,8 +191,9 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        start(p, frame.saturating_add(1));
+        wait(p, frame);
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -119,11 +202,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+/// Queues `p` for the workers as wanted by `wanted` (one more than a
+/// title frame, 0 for an early start): again each time a newer frame asks
+/// for it while no worker has started on it, so it moves to the front.
+fn start(p: &Arc<Pending>, wanted: u64) {
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+        p.wanted.fetch_max(wanted, Ordering::Relaxed);
+        queue(p.clone(), wanted);
+    } else if !p.taken.load(Ordering::Relaxed) && p.wanted.fetch_max(wanted, Ordering::Relaxed) < wanted {
+        queue(p.clone(), wanted);
     }
 }
 
@@ -132,7 +220,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, 0);
     }
 }
 
@@ -157,16 +245,105 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` if set,
+/// else all logical processors but two (2 to 16). They run below the
+/// title's priority, so they mostly take time the title leaves idle; half
+/// the processors (at most 8) left a backlog of hundreds of pipelines for
+/// seconds in the world's first frames.
+fn workers() -> usize {
+    if let Some(n) = std::env::var("VICTORY_PIPELINE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.min(64);
+    }
+    std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(2).clamp(2, 16))
+}
+
+/// A queued pipeline, ordered by the title frame that last wanted it
+/// (newest first), then by when it was queued (oldest first): the
+/// pipelines the current frame draws with come before those of frames
+/// gone by and before early starts (wanted 0), which are only guesses
+/// from the last run.
+struct Entry {
+    wanted: u64,
+    seq: u64,
+    p: Arc<Pending>,
+}
+
+impl Entry {
+    /// Superseded by a newer entry, or already made or being made.
+    fn stale(&self) -> bool {
+        self.p.taken.load(Ordering::Relaxed)
+            || self.p.made.get().is_some()
+            || self.p.wanted.load(Ordering::Relaxed) != self.wanted
+    }
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Entry {}
+impl PartialOrd for Entry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wanted.cmp(&other.wanted).then(other.seq.cmp(&self.seq))
+    }
+}
+
+struct Queue {
+    heap: std::collections::BinaryHeap<Entry>,
+    seq: u64,
+}
+
+static QUEUE: Mutex<Queue> = Mutex::new(Queue {
+    heap: std::collections::BinaryHeap::new(),
+    seq: 0,
+});
+/// Signalled when an entry is queued.
+static WORK: Condvar = Condvar::new();
+
+/// Takes the next pipeline to make, waiting for one.
+fn next() -> Arc<Pending> {
+    let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        while let Some(e) = q.heap.pop() {
+            if !e.stale() && !e.p.taken.swap(true, Ordering::Relaxed) {
+                return e.p;
+            }
+        }
+        q = WORK.wait(q).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Makes `p`, taken from the queue, and does the bookkeeping.
+fn work(p: &Pending) {
+    p.make();
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    } else {
+        super::library::save(false);
+    }
+}
+
+/// Hands `p` to the workers (see [`workers`]), started on first use.
+fn queue(p: Arc<Pending>, wanted: u64) {
+    static STARTED: OnceLock<usize> = OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        let workers = workers();
+        tracing::info!(workers, "pipeline workers");
+        let _ = std::thread::Builder::new()
+            .name("victory-pipelines-progress".into())
+            .spawn(progress);
+        let mut started = 0;
         for i in 0..workers {
-            let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
@@ -177,27 +354,34 @@ fn queue(p: Arc<Pending>) {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
+                        work(&next());
                     }
                 });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
+            match spawned {
+                Ok(_) => started += 1,
+                Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
             }
         }
-        sender
+        started
     });
-    if let Err(e) = sender.send(p) {
+    if started == 0 {
         // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+        if !p.taken.swap(true, Ordering::Relaxed) {
+            work(&p);
+        }
+        return;
     }
+    let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    // Entries superseded by a newer frame's pile up while a backlog lasts:
+    // drop them once they outnumber the live ones.
+    if q.heap.len() >= 4096 && q.heap.len() as u64 > 4 * WAITING.load(Ordering::Relaxed) {
+        q.heap.retain(|e| !e.stale());
+    }
+    q.seq += 1;
+    let seq = q.seq;
+    q.heap.push(Entry { wanted, seq, p });
+    drop(q);
+    WORK.notify_one();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

@@ -156,6 +156,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// As [`with_state`], for a draw or dispatch: its CPU time counts as
+/// recording time in the frame-rate log.
+#[cfg(windows)]
+fn with_state_timed(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let started = std::time::Instant::now();
+    with_state(this, f);
+    crate::draw::recorded(started);
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
@@ -1256,7 +1265,7 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, host_list, with_state, with_state_timed};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1389,13 +1398,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state_timed(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
     /// title's mesh programs read only the x group id, so `x` (y and z
@@ -1414,7 +1423,7 @@ mod state {
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         if let Some(x) = mesh_groups(x, y, z) {
-            with_state(this, |list, s| s.dispatch_mesh(list, x));
+            with_state_timed(this, |list, s| s.dispatch_mesh(list, x));
         }
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
@@ -1436,13 +1445,13 @@ mod state {
         super::count_draw();
         if indirect == 0 {
             if x != 0 {
-                with_state(this, |list, s| s.dispatch_mesh(list, x));
+                with_state_timed(this, |list, s| s.dispatch_mesh(list, x));
             }
             return;
         }
         let mut ran = false;
         if super::indirect_on() {
-            with_state(this, |list, s| {
+            with_state_timed(this, |list, s| {
                 ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
             });
         }
@@ -1462,7 +1471,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1548,7 +1557,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
