@@ -713,6 +713,182 @@ impl Module {
         }
     }
 
+    /// The same pure computation (arithmetic, a cast, compare, select,
+    /// field read, address, or call of a function that reads nothing)
+    /// done again where an earlier one dominates: the earlier result is
+    /// used. The lowering makes a handle and a heap index at every access
+    /// and redoes address arithmetic per instruction; the big straight
+    /// programs (21k console instructions, 46 s driver compiles) carry
+    /// thousands of such repeats.
+    pub fn merge_repeats(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        // Reverse postorder of the reachable blocks.
+        let succs = |m: &Self, b: usize| successors(m.blocks[b].term);
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(self, b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut order = vec![usize::MAX; n];
+        for (k, &b) in post.iter().enumerate() {
+            order[b] = k;
+        }
+        let mut preds = vec![Vec::new(); n];
+        for &b in &post {
+            for &s in succs(self, b).iter() {
+                preds[s].push(b);
+            }
+        }
+        // Immediate dominators (Cooper, Harvey and Kennedy).
+        let mut idom = vec![usize::MAX; n];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in post.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut x, mut y) = (p, new);
+                        while x != y {
+                            while order[x] > order[y] {
+                                x = idom[x];
+                            }
+                            while order[y] > order[x] {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if new != usize::MAX && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        let mut children = vec![Vec::new(); n];
+        for &b in post.iter().skip(1) {
+            if idom[b] != usize::MAX {
+                children[idom[b]].push(b);
+            }
+        }
+        let mut repl: HashMap<u32, V> = HashMap::new();
+        let resolve = |repl: &HashMap<u32, V>, v: V| match v {
+            V::Inst(i) => repl.get(&i).copied().unwrap_or(v),
+            v => v,
+        };
+        // Scoped table: keys added per block, removed when leaving it.
+        let mut table: HashMap<(Ty, Vec<u64>), V> = HashMap::new();
+        let code = |v: V| -> u64 {
+            match v {
+                V::Global(i) => u64::from(i),
+                V::Func(i) => 1 << 32 | u64::from(i),
+                V::Const(i) => 2 << 32 | u64::from(i),
+                V::Inst(i) => 3 << 32 | u64::from(i),
+            }
+        };
+        enum Step {
+            Enter(usize),
+            Leave(Vec<(Ty, Vec<u64>)>),
+        }
+        let mut work = vec![Step::Enter(0)];
+        while let Some(step) = work.pop() {
+            let b = match step {
+                Step::Leave(keys) => {
+                    for k in keys {
+                        table.remove(&k);
+                    }
+                    continue;
+                }
+                Step::Enter(b) => b,
+            };
+            let mut added = Vec::new();
+            let body = std::mem::take(&mut self.blocks[b].body);
+            let mut kept = Vec::with_capacity(body.len());
+            for i in body {
+                // Operands through earlier merges.
+                let inst = &mut self.insts[i as usize];
+                for_each_operand_mut(&mut inst.op, |v| *v = resolve(&repl, *v));
+                let key = match &inst.op {
+                    Op::Bin(op, a, c) => Some(vec![0, *op as u64, code(*a), code(*c)]),
+                    Op::Cast(op, a) => Some(vec![1, *op as u64, code(*a)]),
+                    Op::Cmp(p, a, c) => Some(vec![2, u64::from(*p), code(*a), code(*c)]),
+                    Op::Select(a, c, d) => Some(vec![3, code(*a), code(*c), code(*d)]),
+                    Op::Extract(a, k) => Some(vec![4, code(*a), u64::from(*k)]),
+                    Op::Gep(t, p, idx) => {
+                        let mut k = vec![5, u64::from(t.0), code(*p)];
+                        k.extend(idx.iter().map(|&v| code(v)));
+                        Some(k)
+                    }
+                    Op::Call(f, args)
+                        if self.funcs[*f as usize].attr == Some(Attr::ReadNone) =>
+                    {
+                        let mut k = vec![6, u64::from(*f)];
+                        k.extend(args.iter().map(|&v| code(v)));
+                        Some(k)
+                    }
+                    _ => None,
+                };
+                if let Some(k) = key {
+                    let k = (inst.ty, k);
+                    if let Some(&earlier) = table.get(&k) {
+                        repl.insert(i, earlier);
+                        continue;
+                    }
+                    table.insert(k.clone(), V::Inst(i));
+                    added.push(k);
+                }
+                kept.push(i);
+            }
+            self.blocks[b].body = kept;
+            work.push(Step::Leave(added));
+            for &c in children[b].iter().rev() {
+                work.push(Step::Enter(c));
+            }
+        }
+        if repl.is_empty() {
+            return;
+        }
+        // Every remaining use, phis and branches included.
+        for inst in &mut self.insts {
+            for_each_operand_mut(&mut inst.op, |v| *v = resolve(&repl, *v));
+        }
+        for b in &mut self.blocks {
+            if let Some(Term::CondBr(c, t, f)) = b.term {
+                b.term = Some(Term::CondBr(resolve(&repl, c), t, f));
+            }
+        }
+        for m in &mut self.mds {
+            if let MdDef::Value(_, v) = m {
+                *v = resolve(&repl, *v);
+            }
+        }
+    }
+
     /// Instructions nothing uses and that do nothing else (arithmetic,
     /// reads, and calls of functions that only read) are left out. The
     /// lowering computes every register a console instruction writes, read
@@ -1135,6 +1311,28 @@ const METADATA_BLOCK: u64 = 15;
 const TYPE_BLOCK: u64 = 17;
 
 /// Calls `f` with every value `op` reads, in operand order.
+fn for_each_operand_mut(op: &mut Op, mut f: impl FnMut(&mut V)) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            f(a);
+            f(b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            f(a);
+            f(b);
+            f(c);
+        }
+        Op::Call(_, args) => args.iter_mut().for_each(f),
+        Op::Phi(inc) => inc.iter_mut().for_each(|x| f(&mut x.0)),
+        Op::Gep(_, p, idx) => {
+            f(p);
+            idx.iter_mut().for_each(f);
+        }
+        Op::Alloca(..) => {}
+    }
+}
+
 fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
@@ -1465,6 +1663,41 @@ mod tests {
         let V::Inst(u) = unused else { unreachable!() };
         assert!(!m.blocks[b0].body.contains(&u));
         assert_eq!(m.blocks[b0].body.len(), 3);
+        let _ = m.write();
+    }
+
+    #[test]
+    fn repeats_merge_only_where_the_first_dominates() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (b0, b1, b2, b3) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let p = m.alloca(b0, i32t);
+        let x = m.i32(5);
+        let a = m.bin(b0, Bin::Add, x, x);
+        let a2 = m.bin(b0, Bin::Add, x, x);
+        let c = m.cmp(b0, 32, a2, x);
+        m.terminate(b0, Term::CondBr(c, b1, b2));
+        // Dominated by b0: merges into a.
+        let a3 = m.bin(b1, Bin::Add, x, x);
+        let s1 = m.bin(b1, Bin::Mul, a3, x);
+        m.store(b1, p, s1);
+        m.terminate(b1, Term::Br(b3));
+        // Siblings: b2's copy of s1 must stay.
+        let s2 = m.bin(b2, Bin::Mul, a, x);
+        m.store(b2, p, s2);
+        m.terminate(b2, Term::Br(b3));
+        m.terminate(b3, Term::Ret);
+        m.merge_repeats();
+        let id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        assert!(!m.blocks[b0].body.contains(&id(a2)));
+        assert!(!m.blocks[b1].body.contains(&id(a3)));
+        assert!(m.blocks[b2].body.contains(&id(s2)));
+        assert!(matches!(m.blocks[b0].term, Some(Term::CondBr(V::Inst(i), ..)) if i == id(c)));
+        assert!(matches!(&m.insts[id(c) as usize].op, Op::Cmp(_, l, _) if *l == a));
+        assert!(matches!(&m.insts[id(s1) as usize].op, Op::Bin(_, l, _) if *l == a));
         let _ = m.write();
     }
 

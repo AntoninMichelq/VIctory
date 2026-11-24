@@ -706,6 +706,9 @@ impl Shader {
 
         if super::fold_branches() {
             self.m.fold_constant_branches();
+            if super::merge_repeats() {
+                self.m.merge_repeats();
+            }
             self.m.drop_unused();
         }
         let bitcode = self.m.write();

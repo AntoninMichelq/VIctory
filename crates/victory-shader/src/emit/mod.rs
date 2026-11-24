@@ -151,6 +151,14 @@ pub fn fold_branches() -> bool {
     *ON.get_or_init(|| !std::env::var("VICTORY_NO_BRANCH_FOLD").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether repeated pure computations are merged
+/// ([`bitcode::Module::merge_repeats`]); `VICTORY_NO_MERGE_REPEATS=1` turns
+/// it off. Part of the translation, so the shader cache keys on it.
+pub fn merge_repeats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_NO_MERGE_REPEATS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Whether shaders may write or read through root UAVs (`VICTORY_ROOT_UAVS=1`).
 /// Off by default: a root view has no bounds checks on the host, and the
 /// first world run with them on an RX 7600 page-faulted the GPU 47 s in.
