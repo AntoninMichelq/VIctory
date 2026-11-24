@@ -12073,6 +12073,11 @@ mod tests {
         lower(&parts).map(|l| l.dxil)
     }
 
+    #[test]
+    fn code_tables_read_through_an_address_from_the_first_lane_lower() {
+        lowers(crate::resource::tests::CODE_TABLE_THROUGH_FIRST_LANE).unwrap();
+    }
+
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_with(words, vec![], vec![]).map(|_| ())
