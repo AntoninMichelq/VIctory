@@ -15,14 +15,19 @@ pub enum Console {
 impl Console {
     /// Title memory in bytes: (GPU-optimal, standard). Series X in the
     /// advanced configuration; Series S has one range, counted as standard
-    /// (7,776 MiB, the published console-mode figure).
-    // shortcut: later system updates gave Series S titles more (amount not
-    // published here); the title sizes nothing from this figure
-    // (it goes by the device type), so update it if a title does.
+    /// (see below for its size).
+    // shortcut: the title picks its settings by the device type; it does
+    // look at this figure against what it uses before loading the world.
     pub const fn title_memory(self) -> (usize, usize) {
         match self {
             Console::SeriesX => (10 * GIB, 7 * GIB / 2),
-            Console::SeriesS => (0, 7_776 << 20),
+            // The published figure (7,776 MiB) left the title no room: our
+            // "used" is the whole process's commit (5 GB at the boot
+            // screen, the layer's own memory and the card's in it), so on
+            // Series S the title stopped before loading the world (run of
+            // 2026-11-25 00:34). The PC has the memory; tell Series S the
+            // same total as Series X, in one range.
+            Console::SeriesS => (0, 10 * GIB + 7 * GIB / 2),
         }
     }
 
