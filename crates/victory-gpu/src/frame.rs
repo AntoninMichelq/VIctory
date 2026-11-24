@@ -130,7 +130,9 @@ pub(crate) extern "system" fn wait(
 ) -> HRESULT {
     let origin = kind == ORIGIN;
     let limit = Duration::from_millis(u64::from(timeout_ms));
-    let (_, wait) = next_tick(kind, limit);
+    let (tick, wait) = next_tick(kind, limit);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = tick;
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
