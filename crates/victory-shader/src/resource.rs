@@ -2950,10 +2950,11 @@ pub(crate) mod tests {
         0xBF81_0000, // 0xc4: s_endpgm
     ];
 
-    /// The same choice made by a uniform branch on a root constant (s2): entry 0 or entry 1 (byte 32) of the table at s0 copied to
-    /// v[4:7] when s2 is 1 or 2, vertex data (unless bit 4 of s2 is set)
-    /// and a product there when s2 is 0. The access is skipped when s2 is
-    /// 0, and reads the first lane with no waterfall loop.
+    /// The same choice made by a uniform branch on a root constant (s2):
+    /// entry 1 (byte 32) of the table at s0 copied to v[4:7] when s2 is 1,
+    /// entry 0 when it is another nonzero value, vertex data (unless s2 is
+    /// 4) and a product there when s2 is 0. The access is skipped when s2
+    /// is 0, and reads the first lane with no waterfall loop.
     pub(crate) const PHI_JUNK_UNIFORM_WAVE32: &[u32] = &[
         0xBE84_0300, // 0x0: s_mov_b32 s4, s0
         0xBE85_0380, // 0x4: s_mov_b32 s5, 0
@@ -2981,7 +2982,7 @@ pub(crate) mod tests {
         0x7E0C_020E, // 0x5c: v_mov_b32 v6, s14
         0x7E0E_020F, // 0x60: v_mov_b32 v7, s15
         0xBF82_0006, // 0x64: s_branch 6
-        0xBF0D_8402, // 0x68: s_bitcmp1_b32 s2, 4
+        0xBF06_8402, // 0x68: s_cmp_eq_u32 s2, 4
         0xBF85_0003, // 0x6c: s_cbranch_scc1 3
         0xE03C_1000,
         0x8004_0401, // 0x70: buffer_load_dwordx3 v[4:6], v1, s[16:19], 0 offen
