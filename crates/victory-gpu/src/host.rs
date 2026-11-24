@@ -2853,68 +2853,38 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 
 /// Refresh live mirrored SRVs after deferred title writes and before
 /// GPU work. Retain the resources until the submission has finished.
-fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host::SrvRange)> {
+fn refresh_direct_srvs(
+    runs: &[&HostList],
+) -> Vec<std::sync::Arc<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>>> {
     use std::sync::Arc;
 
     let started = std::time::Instant::now();
     let mut heaps = std::collections::HashSet::new();
-    let mut ranges = Vec::new();
-    for list in runs {
-        for heap in &list.deferred().view_heaps {
-            if heaps.insert(Arc::as_ptr(heap)) {
-                let slots = heap.snapshot_srvs(&mut ranges);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::DirectSlots, slots as u64);
-                let _ = slots;
-            }
-        }
-    }
-    if ranges.is_empty() {
-        return ranges;
-    }
-    ranges.sort_unstable_by_key(|(_, r)| (Arc::as_ptr(&r.shadow), r.address));
+    let mut held = Vec::new();
     let mut copied = 0usize;
     let mut merged_count = 0u64;
     #[cfg(feature = "diagnostics")]
     let mut requested = 0usize;
-    crate::descriptor::with_live_views(|live| {
-        let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
-        for (key, range) in &ranges {
-            if !live(*key) || range.address == range.end {
+    for list in runs {
+        for heap in &list.deferred().view_heaps {
+            if !heaps.insert(Arc::as_ptr(heap)) {
                 continue;
             }
-            // Ranges of one buffer that start in the page where the last one
-            // ends (or at its end) are one update: each update asks the
-            // kernel for that page's writes, and the world has close to a
-            // million such ranges per frame. The bytes between them are
-            // under a page; pending ranges are still left out by `update`.
-            if let Some((shadow, _, end)) = &mut pending
-                && Arc::ptr_eq(shadow, &range.shadow)
-                && range.address <= (*end).next_multiple_of(crate::watch::PAGE)
-            {
-                *end = (*end).max(range.end);
-                continue;
-            }
-            if let Some((shadow, start, end)) =
-                pending.replace((&range.shadow, range.address, range.end))
-            {
-                copied += shadow.update(start, end - start);
+            let (slots, ranges) = heap.merged_srvs();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::DirectSlots, slots as u64);
+            let _ = slots;
+            for (shadow, start, end) in ranges.iter() {
+                copied += shadow.update(*start, end - start);
                 merged_count += 1;
                 #[cfg(feature = "diagnostics")]
                 {
                     requested += end - start;
                 }
             }
+            held.push(ranges);
         }
-        if let Some((shadow, start, end)) = pending {
-            copied += shadow.update(start, end - start);
-            merged_count += 1;
-            #[cfg(feature = "diagnostics")]
-            {
-                requested += end - start;
-            }
-        }
-    });
+    }
     let elapsed = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     {
@@ -2927,7 +2897,7 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     let _ = merged_count;
     PREPARING[0].fetch_add(elapsed, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-    ranges
+    held
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

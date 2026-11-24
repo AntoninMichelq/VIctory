@@ -108,6 +108,13 @@ struct Slots {
     made: Vec<u64>,
     /// Mirrored SRV slots and their associated shadow, once materialized.
     direct: BTreeMap<u32, (u64, Option<SrvRange>)>,
+    /// Bumped whenever `direct` changes (a slot added, rewritten, removed or
+    /// materialized): [`HostHeap::merged_srvs`] reuses its ranges until then.
+    generation: u64,
+    /// Ranges of `direct` merged per buffer copy (see `merged_srvs`), at the
+    /// generation they were made for; `None` while a slot was not
+    /// materialized (tried again at each submission).
+    merged: Option<(u64, Arc<Vec<(Arc<Shadow>, usize, usize)>>)>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -267,6 +274,8 @@ impl HostHeap {
             slots: Mutex::new(Slots {
                 made: vec![0; count as usize],
                 direct: BTreeMap::new(),
+                generation: 0,
+                merged: None,
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -674,7 +683,12 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let Slots { made, direct } = &mut *slots;
+        let Slots {
+            made,
+            direct,
+            generation: changes,
+            ..
+        } = &mut *slots;
         let view = (tag == VIEW_TAG)
             .then(|| {
                 with_view_at(i, generation, |view| {
@@ -683,6 +697,7 @@ impl HostHeap {
                     };
                     let (previous, range) = direct.entry(index).or_insert((0, None));
                     if *previous != key {
+                        *changes += 1;
                         *previous = key;
                         *range = None;
                         made[index as usize] = 0;
@@ -695,6 +710,7 @@ impl HostHeap {
                     if for_draw && range.is_none() {
                         *range = buffer_srv(parts, self.cpu(index));
                         if range.is_some() {
+                            *changes += 1;
                             made[index as usize] = key;
                         }
                     }
@@ -709,13 +725,17 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
             }
-            direct.remove(&index);
+            if direct.remove(&index).is_some() {
+                *changes += 1;
+            }
             return None;
         };
         if is_direct_srv {
             return Some(view);
         }
-        direct.remove(&index);
+        if direct.remove(&index).is_some() {
+            *changes += 1;
+        }
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
@@ -734,11 +754,29 @@ impl HostHeap {
         Some(view)
     }
 
-    /// Materialize any newly mirrored SRVs and capture the native buffers
-    /// that must live through this submission. No other slots are visited.
-    pub(crate) fn snapshot_srvs(&self, output: &mut Vec<(u64, SrvRange)>) -> usize {
+    /// The mirrored SRVs' title ranges, merged per buffer copy: ranges of
+    /// one copy that start in the page where the previous one ends are one
+    /// (each refresh asks the write watch for its pages, and the world has
+    /// over a million such slots per frame). Made again only when a slot
+    /// changed since (or one was not materialized yet): the world's 19
+    /// submissions per frame each rebuilt and sorted the whole list, ~800 ms
+    /// per frame. Also materializes slots not made yet. The number of
+    /// mirrored slots comes first.
+    pub(crate) fn merged_srvs(&self) -> (usize, Arc<Vec<(Arc<Shadow>, usize, usize)>>) {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let Slots { made, direct } = &mut *slots;
+        let Slots {
+            made,
+            direct,
+            generation,
+            merged,
+        } = &mut *slots;
+        if let Some((at, ranges)) = merged
+            && *at == *generation
+        {
+            return (direct.len(), ranges.clone());
+        }
+        let mut all = Vec::with_capacity(direct.len());
+        let mut unresolved = false;
         for (&index, (key, range)) in direct.iter_mut() {
             if range.is_none() {
                 *range = with_view_at(*key as u32, (*key >> 32) as u32, |view| {
@@ -749,11 +787,28 @@ impl HostHeap {
                     made[index as usize] = *key;
                 }
             }
-            if let Some(range) = range {
-                output.push((*key, range.clone()));
+            match range {
+                Some(r) if r.address != r.end => all.push((r.shadow.clone(), r.address, r.end)),
+                Some(_) => {}
+                None => unresolved = true,
             }
         }
-        direct.len()
+        all.sort_unstable_by_key(|(shadow, address, _)| (Arc::as_ptr(shadow), *address));
+        let mut ranges: Vec<(Arc<Shadow>, usize, usize)> = Vec::new();
+        for (shadow, address, end) in all {
+            if let Some((last, _, last_end)) = ranges.last_mut()
+                && Arc::ptr_eq(last, &shadow)
+                && address <= (*last_end).next_multiple_of(crate::watch::PAGE)
+            {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+            ranges.push((shadow, address, end));
+        }
+        let ranges = Arc::new(ranges);
+        // A slot not materialized yet is tried again next time.
+        *merged = (!unresolved).then(|| (*generation, ranges.clone()));
+        (direct.len(), ranges)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
