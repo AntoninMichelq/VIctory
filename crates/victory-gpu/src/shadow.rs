@@ -482,6 +482,21 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Loose windows copied, and the title memory they cover (less when
+/// windows overlap and copy the same bytes more than once).
+pub(crate) fn loose_cover() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut covered, mut reach) = (0u64, 0u64);
+    for &(start, len) in map.keys() {
+        let end = start + len;
+        if end > reach {
+            covered += end - start.max(reach);
+            reach = end;
+        }
+    }
+    (map.len(), covered)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;

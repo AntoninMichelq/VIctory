@@ -51,7 +51,9 @@ pub fn report() -> String {
         use std::fmt::Write;
         let _ = write!(
             line,
-            ", texture staging {} MiB, snapshots {} MiB",
+            ", loose windows {} covering {} MiB, texture staging {} MiB, snapshots {} MiB",
+            crate::shadow::loose_cover().0,
+            mib(crate::shadow::loose_cover().1),
             mib(crate::texture::staged_bytes()),
             mib(crate::shadow::pool_bytes()),
         );
