@@ -92,6 +92,21 @@ impl Op {
     }
 }
 
+/// What a reduction reduces in each lane its mask holds: a value from
+/// before the section (a lane's own, or a uniform), or a constant (1 for a
+/// count of lanes, say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Src {
+    V(Value),
+    K(u32),
+}
+
+impl From<Value> for Src {
+    fn from(v: Value) -> Src {
+        Src::V(v)
+    }
+}
+
 /// A lane's value inside a section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sym {
@@ -104,7 +119,7 @@ pub(crate) enum Sym {
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
-        src: Value,
+        src: Src,
         mask: Value,
         ident: u32,
         lanes: u64,
@@ -117,11 +132,11 @@ pub(crate) enum Shape {
     K(u32),
     Value(Value),
     /// The lane's own `mask ? src : ident`.
-    Masked(Value, Value, u32),
+    Masked(Src, Value, u32),
     /// `op` over every lane.
-    Active(Op, Value, Value, u32),
+    Active(Op, Src, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
-    Prefix(Op, Value, Value, u32, bool),
+    Prefix(Op, Src, Value, u32, bool),
 }
 
 impl Shape {
@@ -488,17 +503,23 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 };
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
-                    .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
-                            Sym::Red {
+                    .map(|l| {
+                        // The lane's own value, a uniform or a constant.
+                        let x = match b.get(l).copied() {
+                            Some(Sym::Own(x) | Sym::Uni(x)) => Some(Src::V(x)),
+                            Some(Sym::K(k)) => Some(Src::K(k)),
+                            _ => None,
+                        };
+                        match (a[l], x, mask) {
+                            (Sym::K(ident), Some(x), Some(m)) if masked.contains(&m) => Sym::Red {
                                 op: None,
                                 src: x,
                                 mask: m,
                                 ident,
                                 lanes: 1 << l,
-                            }
+                            },
+                            _ => Sym::Unknown,
                         }
-                        _ => Sym::Unknown,
                     })
                     .collect()
             }
@@ -701,7 +722,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         };
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
-    let mut found: Option<(Op, Value, Value, u32, bool)> = None;
+    let mut found: Option<(Op, Src, Value, u32, bool)> = None;
     for (l, &s) in lanes.iter().enumerate() {
         let below = (1u64 << l) - 1;
         let (op, src, mask, ident, set) = match s {
@@ -779,7 +800,7 @@ mod tests {
         let (x, m) = (Value(1), Value(2));
         let red = |lanes: u64| Sym::Red {
             op: Some(Op::AddU),
-            src: x,
+            src: x.into(),
             mask: m,
             ident: 0,
             lanes,
@@ -787,17 +808,17 @@ mod tests {
         let inclusive: Vec<Sym> = (0..64).map(|l| red(u64::MAX >> (63 - l))).collect();
         assert_eq!(
             per_lane(&inclusive, u64::MAX),
-            Some(Shape::Prefix(Op::AddU, x, m, 0, true))
+            Some(Shape::Prefix(Op::AddU, x.into(), m, 0, true))
         );
         let mut exclusive: Vec<Sym> = (0..64).map(|l| red((1u64 << l) - 1)).collect();
         exclusive[0] = Sym::K(0);
         assert_eq!(
             per_lane(&exclusive, u64::MAX),
-            Some(Shape::Prefix(Op::AddU, x, m, 0, false))
+            Some(Shape::Prefix(Op::AddU, x.into(), m, 0, false))
         );
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
-            Some(Shape::Active(Op::AddU, x, m, 0))
+            Some(Shape::Active(Op::AddU, x.into(), m, 0))
         );
     }
 
@@ -841,7 +862,32 @@ mod tests {
         let found = sections(&p, 0);
         assert_eq!(
             found[&0].shapes.get(&total),
-            Some(&Shape::Active(Op::AddU, x, saved, 0))
+            Some(&Shape::Active(Op::AddU, x.into(), saved, 0))
+        );
+    }
+
+    #[test]
+    fn a_count_of_lanes_reduces_a_constant() {
+        // The row sum with 1 for each lane active on entry (a count).
+        let mut words = ROW_SUM_WORDS.to_vec();
+        words[2] = 0x0001_0280; // v_cndmask_b32_e64 v1, 0, 1, s0
+        words.extend([
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let p = build(&words, false);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let found = sections(&p, 0);
+        let shapes = &found[&0].shapes;
+        assert_eq!(
+            shapes.get(&insts[1].write(Reg::V(1)).unwrap()),
+            Some(&Shape::Masked(Src::K(1), saved, 0))
+        );
+        assert_eq!(
+            shapes.get(&insts[8].write(Reg::V(4)).unwrap()),
+            Some(&Shape::Active(Op::AddU, Src::K(1), saved, 0))
         );
     }
 
@@ -893,7 +939,7 @@ mod tests {
         let total = insts[10].write(Reg::S(2)).unwrap();
         assert_eq!(
             shapes.get(&total),
-            Some(&Shape::Active(Op::AddU, x, saved, 0))
+            Some(&Shape::Active(Op::AddU, x.into(), saved, 0))
         );
     }
 
@@ -947,7 +993,7 @@ mod tests {
         // Lane 32 holds the upper half only.
         assert_eq!(shapes.get(&insts[8].write(Reg::S(8)).unwrap()), None);
         let total = shapes.get(&insts[10].write(Reg::S(9)).unwrap());
-        assert_eq!(total, Some(&Shape::Active(Op::AddH, x, saved, 0)));
+        assert_eq!(total, Some(&Shape::Active(Op::AddH, x.into(), saved, 0)));
         assert!(total.unwrap().low_half());
         // Lane 0's total counted again with lane 32's half: not a sum.
         assert_eq!(shapes.get(&insts[11].write(Reg::V(4)).unwrap()), None);
@@ -955,13 +1001,13 @@ mod tests {
         // not followed.
         assert_eq!(
             shapes.get(&insts[12].write(Reg::V(6)).unwrap()),
-            Some(&Shape::Active(Op::AddH, x, saved, 0))
+            Some(&Shape::Active(Op::AddH, x.into(), saved, 0))
         );
         assert_eq!(shapes.get(&insts[13].write(Reg::V(5)).unwrap()), None);
         // The 32-bit lane-own masked value is still one.
         assert_eq!(
             shapes.get(&insts[1].write(Reg::V(2)).unwrap()),
-            Some(&Shape::Masked(x, saved, 0))
+            Some(&Shape::Masked(x.into(), saved, 0))
         );
     }
 
@@ -1013,12 +1059,12 @@ mod tests {
         let inclusive = insts[9].write(Reg::V(1)).unwrap();
         assert_eq!(
             shapes.get(&inclusive),
-            Some(&Shape::Prefix(Op::AddU, x, saved, 0, true))
+            Some(&Shape::Prefix(Op::AddU, x.into(), saved, 0, true))
         );
         let exclusive = insts[13].write(Reg::V(4)).unwrap();
         assert_eq!(
             shapes.get(&exclusive),
-            Some(&Shape::Prefix(Op::AddU, x, saved, 0, false))
+            Some(&Shape::Prefix(Op::AddU, x.into(), saved, 0, false))
         );
     }
 

@@ -1726,7 +1726,11 @@ impl<'a> Lower<'a> {
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
-        use super::wave::{Op, Shape};
+        use super::wave::{Op, Shape, Src};
+        let value = |l: &mut Self, src: Src| match src {
+            Src::V(v) => l.i32_of(v),
+            Src::K(k) => Ok(l.s.m.i32(k)),
+        };
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1740,7 +1744,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
-                let x = self.i32_of(src)?;
+                let x = value(self, src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
             }
@@ -1762,7 +1766,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        let x = value(self, src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
