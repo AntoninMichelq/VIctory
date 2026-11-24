@@ -58,16 +58,23 @@ pub const POINTER: usize = usize::MAX - 0x1_0000;
 pub const SHIFTED_POINTER: usize = POINTER + 0x100;
 
 /// [`Address::param`] of an address the program computes from data (a
-/// pointer read from memory, say): this plus the high dword's value index
-/// shifted left by 31, plus the low dword's (see [`chase_values`]). The
+/// pointer read from memory, say): this plus the low dword's value index
+/// (bits 0-27) and the high dword (bits 28-59: a value index, or with bit
+/// 60 set a constant; see [`chase_values`]). The
 /// shader looks the 64-bit address up in the host's memory table
 /// (`crate::emit::MEMORY_SPACE`); loads only.
 pub const CHASE: usize = 1 << 62;
 
 /// The low and high dwords of a [`CHASE`] address.
-pub fn chase_values(param: usize) -> Option<(Value, Value)> {
-    let i = param.checked_sub(CHASE).filter(|&i| i < 1 << 62)?;
-    Some((Value((i & 0x7FFF_FFFF) as u32), Value((i >> 31) as u32)))
+pub fn chase_values(param: usize) -> Option<(Value, Term)> {
+    let i = param.checked_sub(CHASE).filter(|&i| i < 1 << 61)?;
+    let hi = (i >> 28) as u32;
+    let hi = if i & 1 << 60 != 0 {
+        Term::Const(hi)
+    } else {
+        Term::Value(Value(hi))
+    };
+    Some((Value((i & 0x0FFF_FFFF) as u32), hi))
 }
 
 /// The user-data index of the low dword of a [`POINTER`] address, or of
@@ -422,7 +429,7 @@ const OF_BUFFER_LOAD: &str = "a descriptor read from the first lane of a buffer 
 
 /// A dword after copy propagation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Term {
+pub enum Term {
     Const(u32),
     Value(Value),
 }
@@ -1014,7 +1021,12 @@ impl<'a> Tracer<'a> {
                 | "an address not from a root parameter"
                 | "an address in an SGPR that is no root parameter"
                 | "an address from a phi"),
-            ) => self.chase(lo, hi, extra).ok_or(why),
+            ) if why != "an address from a phi" || matches!(hi, Term::Value(_)) => {
+                // shortcut: a phi under a constant high dword is likely a
+                // pick between descriptor tables (offsets in the view
+                // heap), not title memory: still refused.
+                self.chase(lo, hi, extra).ok_or(why)
+            }
             r => r,
         }
     }
@@ -1025,14 +1037,17 @@ impl<'a> Tracer<'a> {
         if !crate::emit::pointer_chase() || extra.base.is_some() {
             return None;
         }
-        let (Term::Value(lo), Term::Value(hi)) = (lo, hi) else {
-            return None;
+        let Term::Value(lo) = lo else { return None };
+        let hi = match hi {
+            Term::Value(v) => v.0 as usize,
+            // A high dword the code sets (addresses in a known 4 GiB).
+            Term::Const(c) => c as usize | 1 << 32,
         };
-        if lo.0 >= 1 << 31 || hi.0 >= 1 << 31 {
+        if lo.0 >= 1 << 28 {
             return None;
         }
         Some(Address {
-            param: CHASE + ((hi.0 as usize) << 31 | lo.0 as usize),
+            param: CHASE + (hi << 28 | lo.0 as usize),
             offset: extra.offset,
             dynamic: extra.dynamic,
             includes_base: false,
@@ -3209,7 +3224,7 @@ pub(crate) mod tests {
         let a = r.scalar[0].1;
         let (lo, hi) = chase_values(a.param).unwrap();
         let input = |reg| p.inputs.iter().find(|i| i.0 == reg).unwrap().1;
-        assert_eq!((lo, hi), (input(Reg::S(2)), input(Reg::S(3))));
+        assert_eq!((lo, hi), (input(Reg::S(2)), Term::Value(input(Reg::S(3)))));
         assert_eq!((a.offset, a.dynamic), (0, None));
     }
 

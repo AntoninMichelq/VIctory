@@ -2846,9 +2846,12 @@ impl<'a> Lower<'a> {
     /// or one past 2 GiB (read as 0) when no window holds the address.
     /// shortcut: `off` adds without sign, its carry into the high dword
     /// included (negative immediate offsets would borrow instead).
-    fn chase_lookup(&mut self, lo: Value, hi: Value, off: V) -> Result<V, Why> {
+    fn chase_lookup(&mut self, lo: Value, hi: crate::resource::Term, off: V) -> Result<V, Why> {
         let lo = self.i32_of(lo)?;
-        let hi = self.i32_of(hi)?;
+        let hi = match hi {
+            crate::resource::Term::Value(v) => self.i32_of(v)?,
+            crate::resource::Term::Const(c) => self.s.m.i32(c),
+        };
         let c = self.cur;
         let table = self.s.memory_table_handle();
         let alo = self.s.m.bin(c, Bin::Add, lo, off);
@@ -15160,6 +15163,27 @@ mod tests {
             0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
             0xD834_0000,
             0x0000_0100, // ds_write_b32 v0, v1
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
+        assert!(l.memory_table);
+    }
+
+    /// A pointer whose high dword the code sets: the low dword read from
+    /// memory, the high one a constant.
+    #[test]
+    fn loads_through_a_loaded_low_dword_and_a_constant_high_one_use_the_memory_table() {
+        let words = [
+            0xF400_0100,
+            0xFA00_0000, // s_load_dword s4, s[0:1], null
+            0xBE85_0381, // s_mov_b32 s5, 1
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF400_0182,
+            0xFA00_0010, // s_load_dword s6, s[4:5], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
             0xBF06_8006, // s_cmp_eq_u32 s6, 0
             0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
             0xBE83_0380, // s_mov_b32 s3, 0

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use victory_shader::ir::{self, Program, Reg};
 use victory_shader::resource::{Address, track};
-use victory_shader::{HwStage, RootParam, RootType, ShaderError};
+use victory_shader::{HwStage, RootParam, RootType};
 
 const TABLE: RootParam = RootParam {
     root: RootType::Table,
@@ -138,12 +138,14 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
             ),
         ]
     );
-    assert_eq!(
-        track(&program, &[], HwStage::Ps).unwrap_err(),
-        ShaderError::Unsupported {
-            offset: 12,
-            what: "an address not from a root parameter",
-        }
+    // Without the parameter, the sum is an address computed from data,
+    // looked up in the memory table.
+    let chased = track(&program, &[], HwStage::Ps).unwrap();
+    assert!(
+        chased
+            .scalar
+            .iter()
+            .all(|(_, a)| victory_shader::resource::chase_values(a.param).is_some())
     );
 }
 
