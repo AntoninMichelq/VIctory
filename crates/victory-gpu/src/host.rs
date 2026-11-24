@@ -570,6 +570,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges shaders write declared since the last title copy, as
+    /// `refreshed`: a repeat would only flush and find the range taken.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1292,6 +1295,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1328,9 +1332,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        // Once per range until a title copy: at submission a repeat flushes
+        // pending refreshes (done at the next step that needs them anyway)
+        // and finds the range already snapshotted and pending.
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1449,8 +1460,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
