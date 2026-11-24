@@ -34,6 +34,8 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+/// Maximum number of detached host lists kept for reuse after pending resets.
+const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -53,6 +55,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Detached host lists whose submissions finished, ready to reuse.
+    free_lists: Mutex<Vec<HostList>>,
+    #[cfg(test)]
+    reused_lists: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -64,6 +70,52 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// Host objects the title let go of while a submission may still use them
+/// (a texture its descriptors name, a descriptor slot's old resource), by
+/// the submission count they wait for. The title's descriptor writes and
+/// releases reach the host at once, from its own threads, while the host
+/// runs a submission for most of a second in the world: freeing there was
+/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
+/// 2026-11-24, RX 7600).
+static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// Submissions started and finished (waited for).
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A retired object, dropped on whatever thread finishes the submission.
+struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+// SAFETY: what is retired is D3D12 objects (free-threaded) and the
+// reference-counted wrappers holding them, dropped once.
+unsafe impl Send for Retired {}
+
+/// Drops `object` once every submission running now has finished: at once
+/// if none is.
+pub(crate) fn retire<T: 'static>(object: T) {
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        drop(object);
+        return;
+    }
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started, Retired(Box::new(object))));
+}
+
+/// Drops what waited for submissions up to `finished`.
+fn bury(finished: u64) {
+    let done: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if retired.is_empty() {
+            return;
+        }
+        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
+        *retired = keep;
+        done
+    };
+    drop(done);
+}
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -207,8 +259,7 @@ fn create() -> windows::core::Result<Host> {
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+            let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
@@ -253,7 +304,60 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            free_lists: Mutex::default(),
+            #[cfg(test)]
+            reused_lists: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+}
+
+/// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
+/// Reject it before creating a device in diagnostics' software-only mode.
+fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+        let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            tracing::warn!(
+                vendor = format_args!("{:#x}", desc.VendorId),
+                flags = format_args!("{:#x}", desc.Flags),
+                "DXGI did not identify the WARP adapter as software; refusing device"
+            );
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        }
+        Ok(adapter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        eprintln!(
+            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
+            desc.VendorId, desc.Flags
+        );
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
     }
 }
 
@@ -275,6 +379,13 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Memory handed out for the list's recording, kept until it is finished
+    /// when the title reset or dropped the list while a submission of it was
+    /// still to run.
+    kept_uploads: Mutex<Vec<Vec<u8>>>,
+    /// Dynamic descriptor slots kept alongside `kept_uploads` until the pending
+    /// submission completes.
+    kept_dynamic: Mutex<Vec<(usize, u32, u32)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -293,6 +404,20 @@ pub(crate) struct HostList {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_kept();
+    }
+}
+
+// SAFETY: D3D12 lists and allocators may be used from any thread, one at
+// a time: the title records a list on one thread at a time, and a
+// submission runs it after its recording ended (a reset while one is to
+// run moves recording to a new list). The rest is locked.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -368,13 +493,27 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// A texture-to-buffer readback copied from a mapped readback buffer into
+/// title memory once the GPU submission completes.
+struct Readback {
+    dst: usize,
+    src: usize,
+    dst_pitch: usize,
+    src_pitch: usize,
+    lines: usize,
+    row_bytes: usize,
+    total: usize,
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
-/// the upload buffers its GPU commands read, kept until the list is reset.
+/// the upload/readback buffers its GPU commands name, kept until reset.
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Post-submission readbacks from GPU textures into title buffers.
+    readbacks: Vec<Readback>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -428,6 +567,39 @@ impl Host {
         })
     }
 
+    /// A recycled host list (reset and open), or a new one when the pool is
+    /// empty.
+    pub(crate) fn acquire_list(&self) -> windows::core::Result<HostList> {
+        let pooled = self
+            .free_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        if let Some(list) = pooled {
+            #[cfg(test)]
+            self.reused_lists.fetch_add(1, Ordering::Relaxed);
+            list.reset();
+            return Ok(list);
+        }
+        self.new_list()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_lists(&self) -> u64 {
+        self.reused_lists.load(Ordering::Relaxed)
+    }
+
+    /// Returns a finished, unreferenced host list to the pool up to
+    /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
+    /// immediately.
+    pub(crate) fn recycle_list(&self, list: HostList) {
+        list.release_kept();
+        let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < LIST_POOL_CAP {
+            pool.push(list);
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -458,6 +630,8 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                kept_uploads: Mutex::default(),
+                kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -473,6 +647,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -490,25 +665,31 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Each run (prelude and list) is a submission of its own: the host
+        // resets the device when one submission runs for about 2 s, and
+        // the world's frames (a second or more over dozens of lists) fit
+        // that only list by list. One wait at the end; with
+        // `VICTORY_GPU_TIMING` (diagnostics) each run is waited for and
+        // timed on its own.
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
+        let each = timing();
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let each = false;
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            // SAFETY: closed lists.
+            unsafe { self.queue.ExecuteCommandLists(group) };
+            if !each && i + 1 < groups.len() {
+                continue;
+            }
+            *submitted += 1;
+            // SAFETY: the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -521,7 +702,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if each && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -533,6 +714,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        FINISHED.store(this_submission, Ordering::Release);
+        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -575,6 +758,26 @@ impl Host {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
+        for list in runs {
+            for rb in &list.deferred().readbacks {
+                let written = if rb.dst_pitch == rb.src_pitch {
+                    crate::watch::writing(rb.dst, rb.total);
+                    write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
+                    rb.total
+                } else {
+                    let mut n = 0;
+                    for line in 0..rb.lines {
+                        let to = rb.dst + line * rb.dst_pitch;
+                        let from = rb.src + line * rb.src_pitch;
+                        crate::watch::writing(to, rb.row_bytes);
+                        write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
+                        n += rb.row_bytes;
+                    }
+                    n
+                };
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -838,6 +1041,41 @@ impl HostList {
         times
     }
 
+    /// Keeps `blocks` (memory handed out for the recording) until the list
+    /// finishes executing and is recycled or dropped.
+    pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
+        if !blocks.is_empty() {
+            self.kept_uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(blocks);
+        }
+    }
+
+    /// Keeps dynamic descriptor slots alive until this host list finishes
+    /// executing and is recycled or dropped.
+    pub(crate) fn keep_dynamic(&self, slots: Vec<(usize, u32, u32)>) {
+        if !slots.is_empty() {
+            self.kept_dynamic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(slots);
+        }
+    }
+
+    /// Frees kept upload blocks and returns kept dynamic descriptor slots.
+    fn release_kept(&self) {
+        self.kept_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let dynamic =
+            std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
+        for (heap, first, n) in dynamic {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -859,6 +1097,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_kept();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1044,6 +1283,30 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// Copies a GPU texture readback from `src` into title memory at `dst`
+    /// once the list has finished running on the host GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn defer_readback(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        dst_pitch: usize,
+        src_pitch: usize,
+        lines: usize,
+        row_bytes: usize,
+        total: usize,
+    ) {
+        self.deferred().readbacks.push(Readback {
+            dst: dst as usize,
+            src: src as usize,
+            dst_pitch,
+            src_pitch,
+            lines,
+            row_bytes,
+            total,
+        });
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -1051,6 +1314,15 @@ impl HostList {
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data))
+    }
+
+    /// A mapped readback buffer of `size` bytes, alive until the list is
+    /// reset.
+    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let (buffer, data) = host.readback_buffer(size)?;
+        name(&buffer, || format!("list readback {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
     }
@@ -1412,6 +1684,52 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in the readback heap, mapped for reading.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a readback buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
                 None
             }
         }
@@ -1952,7 +2270,7 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod tests {
+mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
 

@@ -77,6 +77,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Whether the last [`State::bind`] left a used unordered access view
+    /// with nothing behind it (a null view).
+    null_uav: bool,
 }
 
 impl Drop for State {
@@ -112,6 +115,41 @@ pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Groups the host runs per dimension of a dispatch (and of a mesh
+/// dispatch). A count past it is undefined behaviour on the host; drivers
+/// may run it for seconds and reset the display driver.
+const MAX_GROUPS: u32 = 65_535;
+
+/// Whether dispatches that write through a null unordered access view are
+/// dropped (the default; `VICTORY_NULL_UAV_DISPATCH=1` runs them). Reads of
+/// a null view give zeros and its atomics return zero, so a compute pass
+/// that loops on a counter or flag kept there (work queues, spin waits)
+/// never sees it move and runs to the translator's loop limit in every
+/// lane: seconds of GPU time, and the host resets the display driver
+/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, in the world on an RX 7600; the
+/// device-removed data named a dispatch with two null views in its table).
+/// shortcut: what such a pass writes to its other views is lost too.
+fn skip_null_uav_dispatches() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("VICTORY_NULL_UAV_DISPATCH").is_none_or(|v| v != "1"))
+}
+
+/// Logs, once per pipeline, a dispatch dropped for a null unordered access
+/// view.
+fn null_uav_dropped(pipeline: &str) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
+        seen.push(pipeline.to_owned());
+        tracing::warn!(pipeline, "a dispatch writing through a null unordered access view dropped");
+    }
+}
+
+/// Whether the host can run a dispatch of `x * y * z` groups.
+fn dispatch_fits(x: u32, y: u32, z: u32) -> bool {
+    x <= MAX_GROUPS && y <= MAX_GROUPS && z <= MAX_GROUPS
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -168,6 +206,12 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// Takes the dynamic descriptor slots held by this recording, so a
+    /// pending host list can keep them alive until its submission finishes.
+    pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
+        std::mem::take(&mut self.dynamic)
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -333,6 +377,10 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -400,6 +448,7 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.null_uav = false;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -489,6 +538,12 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -503,7 +558,17 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if !dispatch_fits(x, y, z) {
+            once!(x, y, z, "a dispatch past the host's group limits dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.bind(list, p, true);
+        if self.null_uav && skip_null_uav_dispatches() {
+            null_uav_dropped(&p.name);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -553,6 +618,11 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if x > MAX_GROUPS {
+            once!(x, "a mesh dispatch past the host's group limit dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -580,7 +650,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -591,33 +661,28 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        match host.mirror(index, handle, true) {
+            Some(view) => readable(list, u, &view),
+            None => self.null_uav |= u.kind == ResourceType::Uav,
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
-    ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Gives tables with shader resources or constants slots owned by the
+    /// command list. Later title descriptor writes cannot change what a
+    /// recorded draw samples. Constants also get 256-byte-aligned storage,
+    /// filled at submission. Identical descriptors share slots within a list.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
+        // are made afresh too: the title's slots there have no host slot of
+        // their own.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -664,6 +729,13 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            let last = table + u64::from(n - 1) * 32;
+            if heap.index(last).is_none() {
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -678,14 +750,19 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                    match crate::descriptor::view(handle) {
+                        Some(view) => readable(list, u, &view),
+                        None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
                 made.push((slot, first * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
+                once!(n, "descriptor table did not fit in command-list slots");
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
                 continue;
             };
             self.fresh_tables.insert(key, first);
@@ -713,8 +790,9 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if let Some(u) = used {
                             once!(slot, "a table entry without a view");
+                            self.null_uav |= u.kind == ResourceType::Uav;
                         }
                     }
                 }
@@ -927,6 +1005,12 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -966,6 +1050,11 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            crate::indirect::done(list, &args.buffer);
+            why("a rectangle list (rectangles are expanded for direct draws only)");
+            return false;
+        }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -974,7 +1063,11 @@ impl State {
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
                     self.bind(list, p, true);
-                    true
+                    let skip = self.null_uav && skip_null_uav_dispatches();
+                    if skip {
+                        null_uav_dropped(&p.name);
+                    }
+                    !skip
                 }
                 _ => false,
             },
@@ -1163,4 +1256,16 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod group_limit_tests {
+    #[test]
+    fn dispatches_past_the_host_limit_do_not_fit() {
+        assert!(super::dispatch_fits(65_535, 65_535, 65_535));
+        assert!(super::dispatch_fits(0, 0, 0));
+        assert!(!super::dispatch_fits(65_536, 1, 1));
+        assert!(!super::dispatch_fits(1, u32::MAX, 1));
+        assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
 }

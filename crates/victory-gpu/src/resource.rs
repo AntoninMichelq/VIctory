@@ -237,6 +237,69 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
+/// host cannot make (see [`target_format`]).
+const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to:
+/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+const PACKED_16: [u32; 2] = [86, 115];
+
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for `format` (asked once per format). NVIDIA has neither for
+/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
+/// 2560x1440 UI targets need; AMD has both.
+#[cfg(windows)]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else { return false };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
+        }
+        lacks
+    })
+}
+
+#[cfg(not(windows))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (each channel keeps its value, with more precision); else
+/// the format as the host has it. Textures only sampled keep theirs.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let format = pc_format(format);
+    if PACKED_16.contains(&format) && host_lacks_target(format) {
+        RGBA8_UNORM
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -316,20 +379,34 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
+    /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
+    /// pitched but the last.
+    pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        if lines == 0 {
+            return Some((0, row_bytes, 0));
+        }
+        let total = u64::from(self.row_pitch)
+            .checked_mul(lines - 1)?
+            .checked_add(row_bytes)?;
+        Some((lines, row_bytes, total))
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        self.layout().map(|(_, _, total)| total)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -850,7 +927,12 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -867,7 +949,11 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -875,21 +961,50 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+        // A clear value is only legal on render targets and depth.
+        let clear = clear_value
+            .as_ref()
+            .filter(|_| d.flags & (1 | DEPTH) != 0)
+            .map(|v| std::ptr::from_ref(v).cast());
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                    d.flags,
+                    crate::host::texture_state(state),
+                ) as i32),
+                // The same layout: format, then color or depth and stencil.
+                clear,
+                texture,
+            )
+        }
     };
+    let mut made = create(&d, &mut texture);
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Give up the uses the host refuses, UAV
+    // first; the views the host cannot make are skipped as for depth.
+    for drop in [UNORDERED, 1] {
+        if made.is_ok() || d.flags & drop == 0 {
+            continue;
+        }
+        let mut fewer = d;
+        fewer.flags &= !drop;
+        let mut retry: Option<ID3D12Resource> = None;
+        if create(&fewer, &mut retry).is_ok() {
+            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
+            d = fewer;
+            texture = retry;
+            made = Ok(());
+        } else if drop == UNORDERED {
+            d = fewer; // also try with neither
+        }
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -1007,6 +1122,10 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        // A running submission may still read the host copy.
+        if let Some(host) = self.host.take() {
+            crate::host::retire(host);
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1384,6 +1503,43 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(test)]
+pub(crate) fn test_buffer(width: u64) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -1817,6 +1973,233 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_texture_region_reads_back_into_title_buffer() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let tex_desc = ResourceDesc {
+            dimension: 3, // Texture2D
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let (mut image, mut upload_buf, mut dst_aligned, mut dst_packed, mut dst_crop) =
+            (null, null, null, null, null);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &tex_desc, 0, null.cast(), iid, &mut image),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut upload_buf),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &buffer(2048), 0, null.cast(), iid, &mut dst_aligned),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &buffer(256), 0, null.cast(), iid, &mut dst_packed),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_crop),
+            S_OK
+        );
+
+        // Fill a 4x4 RGBA8 pattern (row_pitch 256): pixel (x, y) = [x*40+1, y*50+2, (x+y)*20+3, 0xff].
+        let (up_ptr, _) = buffer_bytes(upload_buf).unwrap();
+        // SAFETY: upload_buf holds 1024 bytes.
+        let up = unsafe { std::slice::from_raw_parts_mut(up_ptr, 1024) };
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let at = y * 256 + x * 4;
+                up[at..at + 4].copy_from_slice(&[
+                    (x * 40 + 1) as u8,
+                    (y * 50 + 2) as u8,
+                    ((x + y) * 20 + 3) as u8,
+                    0xff,
+                ]);
+            }
+        }
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        let copy = slot::<Copy>(list, 0x80);
+
+        let full_rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let tex_loc = Location {
+            resource: image,
+            kind: 0,
+            footprint: PlacedFootprint { offset: 0, ..full_rows },
+        };
+        let up_loc = Location {
+            resource: upload_buf,
+            kind: 1,
+            footprint: full_rows,
+        };
+        // 1) Buffer -> Texture upload.
+        copy(list, &tex_loc, 0, 0, 0, &up_loc, std::ptr::null());
+
+        // 2) Texture -> Buffer readback at non-zero offset (256), 256-aligned row pitch.
+        let aligned_loc = Location {
+            resource: dst_aligned,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 256,
+                ..full_rows
+            },
+        };
+        copy(list, &aligned_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        // 3) Texture -> Buffer readback with unaligned row_pitch (16 bytes, packed).
+        let packed_loc = Location {
+            resource: dst_packed,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 32,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 16,
+            },
+        };
+        copy(list, &packed_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        // 4) Texture -> Buffer sub-box readback: 2x2 crop from (1, 1) to (3, 3).
+        let crop_box = [1u32, 1, 0, 3, 3, 1];
+        let crop_loc = Location {
+            resource: dst_crop,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 28,
+                width: 2,
+                height: 2,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        copy(list, &crop_loc, 0, 0, 0, &tex_loc, &crop_box);
+
+        // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
+        // (45..=47): skipped cleanly without breaking Close() or touching dst.
+        let mut dst_d16s8 = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_d16s8),
+            S_OK
+        );
+        let d16s8_loc = Location {
+            resource: dst_d16s8,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 118,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // Verify 256-aligned readback at offset 256 (leading 256 bytes untouched).
+        let (al_ptr, _) = buffer_bytes(dst_aligned).unwrap();
+        // SAFETY: dst_aligned holds 2048 bytes.
+        let al = unsafe { std::slice::from_raw_parts(al_ptr, 2048) };
+        assert!(al[..256].iter().all(|&b| b == 0), "bytes before offset touched");
+        for row in 0..4 {
+            let at = 256 + row * 256;
+            assert_eq!(al[at..at + 16], up[row * 256..row * 256 + 16], "aligned row {row}");
+        }
+
+        // Verify unaligned packed readback (row_pitch 16, offset 32).
+        let (pk_ptr, _) = buffer_bytes(dst_packed).unwrap();
+        // SAFETY: dst_packed holds 256 bytes.
+        let pk = unsafe { std::slice::from_raw_parts(pk_ptr, 256) };
+        assert!(pk[..32].iter().all(|&b| b == 0), "bytes before packed offset touched");
+        for row in 0..4 {
+            let at = 32 + row * 16;
+            assert_eq!(pk[at..at + 16], up[row * 256..row * 256 + 16], "packed row {row}");
+        }
+
+        // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
+        let (cr_ptr, _) = buffer_bytes(dst_crop).unwrap();
+        // SAFETY: dst_crop holds 1024 bytes.
+        let cr = unsafe { std::slice::from_raw_parts(cr_ptr, 1024) };
+        for row in 0..2 {
+            let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
+            let dst_at = row * 256;
+            assert_eq!(cr[dst_at..dst_at + 8], up[src_at..src_at + 8], "crop row {row}");
+        }
+
+        // Verify skipped 118..=120 readback left its buffer untouched.
+        let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
+        // SAFETY: dst_d16s8 holds 1024 bytes.
+        let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
+        assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
     }
 
     #[test]

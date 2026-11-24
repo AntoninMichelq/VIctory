@@ -50,6 +50,7 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+mod timeline;
 #[cfg(windows)]
 mod watch;
 

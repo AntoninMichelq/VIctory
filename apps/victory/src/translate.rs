@@ -330,7 +330,8 @@ fn translate(
     for p in programs {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+            Ok(mut program) => {
+                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 let res = match resource::track(&program, &p.layout, p.stage) {
@@ -560,7 +561,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            resource::Source::Phi { .. } | resource::Source::Select { .. } => {
+                unreachable!("leaves are no phis or selects")
+            }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.

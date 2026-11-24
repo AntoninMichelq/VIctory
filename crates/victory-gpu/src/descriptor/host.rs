@@ -11,14 +11,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
-use crate::host::host;
+use crate::host::{Host, host};
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
+    /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
+    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
+    /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
+    spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -64,6 +67,14 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// took until it is reset (its submissions have run) or released.
 const DYNAMIC: u32 = 1 << 16;
 
+/// The host's limit for shader-visible sampler heaps, on every binding
+/// tier.
+const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+
+/// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
+/// reaching past the title slots it keeps.
+const SAMPLER_DYNAMIC: u32 = 256;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -84,13 +95,39 @@ impl HostHeap {
                     })
             }
         };
+        if sampler && count > SAMPLERS {
+            // shortcut: samplers past the host's limit are left out; tables
+            // reaching them are made afresh in the dynamic slots.
+            tracing::warn!(count, "host sampler heap capped at {SAMPLERS}");
+            let heap = match make(SAMPLERS) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            };
+            return Some(Self::with(
+                host,
+                heap,
+                kind,
+                SAMPLERS - SAMPLER_DYNAMIC,
+                SAMPLER_DYNAMIC,
+            ));
+        }
         let extra = if sampler { 0 } else { DYNAMIC };
+        let wanted = count;
         let (heap, count) = match make(count + extra) {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                // draw::tables now remaps the root tables that reach them.
+                tracing::warn!(
+                    error = %e,
+                    wanted,
+                    made = PORTABLE_VIEWS - extra,
+                    lost = wanted + extra - PORTABLE_VIEWS,
+                    "host view heap capped at {PORTABLE_VIEWS}"
+                );
                 (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
             }
             Err(e) => {
@@ -98,6 +135,19 @@ impl HostHeap {
                 return None;
             }
         };
+        Some(Self::with(host, heap, kind, count, extra))
+    }
+
+    /// The host heap over `heap`: `count` title slots, then `extra` dynamic
+    /// ones, all made null.
+    fn with(
+        host: &Host,
+        heap: ID3D12DescriptorHeap,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+        count: u32,
+        extra: u32,
+    ) -> Self {
+        let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -119,10 +169,11 @@ impl HostHeap {
             cpu,
             step,
             count,
+            spare: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -133,7 +184,7 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
-        Some(h)
+        h
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -198,17 +249,30 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// `n` consecutive free dynamic slots (view heaps and capped sampler
+    /// heaps), taken until [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > DYNAMIC {
+        if n == 0 || self.spare == 0 {
             return None;
         }
+        if n > self.spare {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    spare = self.spare,
+                    sampler = self.sampler,
+                    "a table larger than the dynamic slots is not made"
+                );
+            });
+            return None;
+        }
+        let spare = self.spare as usize;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
+        let starts = (*next as usize..spare).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -230,7 +294,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % spare) as u32;
         Some(self.count + first as u32)
     }
 
@@ -249,7 +313,7 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(DYNAMIC) as usize;
+        let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
@@ -260,7 +324,11 @@ impl HostHeap {
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
-            null_for(view, self.cpu(index));
+            if self.sampler {
+                self.null_sampler(index);
+            } else {
+                null_for(view, self.cpu(index));
+            }
         }
         self.keep(index, kept.flatten());
     }
@@ -279,7 +347,11 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
+            // A running submission may still read the old resource through
+            // this slot.
+            if let Some(old) = std::mem::replace(slot, resource) {
+                crate::host::retire(old);
+            }
         }
     }
 
@@ -470,6 +542,15 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// Whether a raw buffer view may start at element `first` (4 bytes each):
+/// the host wants 16-byte aligned starts, the console only 4, and refuses
+/// the call (removing the device) for the rest.
+/// shortcut: a view the host refuses reads nothing (a null view); starting
+/// it 16 bytes lower would need the shader to add the difference.
+fn raw_start_fits(first: u64) -> bool {
+    first.is_multiple_of(4)
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -493,6 +574,11 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(first, "raw buffer view not on 16 bytes of its host copy");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -535,6 +621,14 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(
+            first,
+            "raw unordered buffer view not on 16 bytes of its host copy"
+        );
+        return None;
+    }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -585,6 +679,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
         return !typeless;
+    }
+    // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
+    // (`resource::target_format`): views name the format it has.
+    if view != own && crate::resource::target_format(view) == own {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -870,5 +972,33 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// A sampler heap past the host's limit is capped, not lost, and keeps
+    /// dynamic slots for the tables reaching past what it holds.
+    #[test]
+    fn large_sampler_heap_is_capped() {
+        let Some(heap) = HostHeap::new(true, 4 * SAMPLERS) else {
+            return; // no host GPU
+        };
+        let count = SAMPLERS - SAMPLER_DYNAMIC;
+        assert_eq!(heap.count(), count);
+        assert_eq!(heap.dynamic(SAMPLER_DYNAMIC + 1), None);
+        let a = heap.dynamic(SAMPLER_DYNAMIC).unwrap();
+        assert_eq!(a, count);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(a, 8);
+        assert_eq!(heap.dynamic(8), Some(count));
+    }
+
+    /// A sampler heap within the limit has a slot per title slot and no
+    /// dynamic ones.
+    #[test]
+    fn small_sampler_heap_has_no_dynamic_slots() {
+        let Some(heap) = HostHeap::new(true, 16) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), 16);
+        assert_eq!(heap.dynamic(1), None);
     }
 }

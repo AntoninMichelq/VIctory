@@ -30,6 +30,12 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// `dynamic` is a pointer the code keeps in a phi (advanced in a loop,
+    /// or picked by a branch between offsets from the parameter): it holds
+    /// the parameter's address plus a varying offset, so the byte offset
+    /// from the parameter is `dynamic` minus the parameter's first dword,
+    /// plus `offset`. Never set for [`CODE`].
+    pub includes_base: bool,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -54,13 +60,18 @@ pub enum Source {
     /// Chosen by control flow: one source per predecessor of `block`, in
     /// [`crate::ir::Block::preds`] order.
     Phi { block: usize, args: Vec<Source> },
+    /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
+    /// dword reads): the source when it is set, then when it is clear.
+    Select { scc: Value, args: Vec<Source> },
 }
 
 impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } => args.iter().flat_map(Source::leaves).collect(),
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().flat_map(Source::leaves).collect()
+            }
             s => vec![s],
         }
     }
@@ -187,6 +198,8 @@ struct Tracer<'a> {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// Steps through phis and additions when tracing a pointer kept in a phi.
+const MAX_POINTER_STEPS: usize = 256;
 
 impl<'a> Tracer<'a> {
     fn new(p: &'a Program, layout: &'a [RootParam], stage: HwStage) -> Result<Self, ShaderError> {
@@ -354,8 +367,10 @@ impl<'a> Tracer<'a> {
             dynamic: Some(v),
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
+            // A root constant is a number the code adds (a byte offset into
+            // a table, say), not a base.
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((i, 0)) if self.layout[i].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -369,6 +384,11 @@ impl<'a> Tracer<'a> {
                 offset: 0,
                 dynamic: None,
             };
+        }
+        if let Some((x, k)) = self.plus_const(v) {
+            let mut s = self.sum(x);
+            s.offset = s.offset.wrapping_add(k);
+            return s;
         }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
@@ -386,6 +406,27 @@ impl<'a> Tracer<'a> {
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
         }
+    }
+
+    /// `v` as another dword plus a constant: `s_addk_i32` (in place, a
+    /// sign-extended immediate) or `s_sub_u32`/`s_sub_i32` of a constant.
+    fn plus_const(&self, v: Value) -> Option<(Term, u32)> {
+        if let Some((_, [x, Term::Const(c)])) = self.sop2(v, &["s_sub_u32", "s_sub_i32"]) {
+            return Some((x, c.wrapping_neg()));
+        }
+        let inst = self.def(v)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            imm: Some(imm),
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        (inst.name() == "s_addk_i32" && inst.writes.first()?.1 == v).then_some((
+            self.origin(inst.read(Reg::S(code))?),
+            i32::from(imm as i16) as u32,
+        ))
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -497,6 +538,12 @@ impl<'a> Tracer<'a> {
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
+        if s.base.is_none()
+            && let Some(d) = s.dynamic
+            && self.phis[d.0 as usize].is_some()
+        {
+            return self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi);
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -510,6 +557,7 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                includes_base: false,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -537,15 +585,176 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            includes_base: false,
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// The address of a pointer `d` the code keeps in a phi, plus `offset`:
+    /// each argument of the phi is the same root parameter's address plus
+    /// offsets, or the phi itself (or another such phi) plus offsets, as a
+    /// pointer advanced in a loop or picked by a branch. `d` then holds that
+    /// parameter's address plus a varying term (see
+    /// [`Address::includes_base`]).
+    fn pointer_address(&self, d: Value, offset: u32, hi: Term) -> Result<Address, &'static str> {
+        const WHY: &str = "an address from a phi";
+        let mut budget = MAX_POINTER_STEPS;
+        let base = self
+            .pointer_base(Term::Value(d), &mut Vec::new(), &mut budget)
+            .ok()
+            .flatten()
+            .ok_or(WHY)?;
+        let reg = self.inputs[base.0 as usize].ok_or(WHY)?;
+        let (param, _) = self.param_of(reg).ok_or(WHY)?;
+        let high = match self.layout[param].root {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
+            RootType::Descriptor => {
+                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                Some(input.ok_or("a root descriptor without its high half")?.1)
+            }
+            _ => return Err("an address from a root parameter that is no address"),
+        };
+        if !self.pointer_high(hi, high, &mut Vec::new(), &mut budget) {
+            return Err("an address with an untracked high half");
+        }
+        Ok(Address {
+            param,
+            offset,
+            dynamic: Some(d),
+            includes_base: true,
+        })
+    }
+
+    /// The root parameter (its first dword) that the pointer `t` is an
+    /// offset from: `None` when it only goes around the phis in `seen`
+    /// (the back edge of a loop), an error when it is no such pointer or
+    /// mixes two parameters. `budget` bounds the walk.
+    fn pointer_base(
+        &self,
+        t: Term,
+        seen: &mut Vec<Value>,
+        budget: &mut usize,
+    ) -> Result<Option<Value>, ()> {
+        *budget = budget.checked_sub(1).ok_or(())?;
+        let Term::Value(v) = t else { return Err(()) };
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        if let Some(base) = self.sum(t).base {
+            // Program-counter tables are not tracked through phis.
+            return match self.inputs[base.0 as usize] {
+                Some(_) => Ok(Some(base)),
+                None => Err(()),
+            };
+        }
+        if let Some((block, i)) = self.phis[v.0 as usize] {
+            seen.push(v);
+            let mut found = None;
+            let mut result = Ok(());
+            for &a in &self.p.blocks[block].phis[i].args {
+                match self.pointer_base(self.vorigin(a), seen, budget) {
+                    Ok(None) => {}
+                    Ok(Some(b)) if found.is_none_or(|f| f == b) => found = Some(b),
+                    _ => {
+                        result = Err(());
+                        break;
+                    }
+                }
+            }
+            seen.pop();
+            return result.map(|()| found);
+        }
+        if let Some((x, _)) = self.plus_const(v) {
+            return self.pointer_base(x, seen, budget);
+        }
+        let [a, b] = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))
+            .ok_or(())?;
+        // One side is the pointer, the other an offset.
+        match (
+            self.pointer_base(a, seen, budget),
+            self.pointer_base(b, seen, budget),
+        ) {
+            (Ok(p), Err(())) | (Err(()), Ok(p)) => Ok(p),
+            _ => Err(()),
+        }
+    }
+
+    /// `hi` is the high half of a pointer kept in a phi: `high` (0 for a
+    /// table) through phis, carries and borrows.
+    fn pointer_high(
+        &self,
+        hi: Term,
+        high: Option<Value>,
+        seen: &mut Vec<Value>,
+        budget: &mut usize,
+    ) -> bool {
+        let Some(left) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = left;
+        if self.high_half(hi, high) || high.is_some_and(|h| self.carried(hi, h)) {
+            return true;
+        }
+        let Term::Value(v) = hi else { return false };
+        if seen.contains(&v) {
+            return true;
+        }
+        if let Some((block, i)) = self.phis[v.0 as usize] {
+            seen.push(v);
+            let ok = self.p.blocks[block].phis[i]
+                .args
+                .iter()
+                .all(|&a| self.pointer_high(self.vorigin(a), high, seen, budget));
+            seen.pop();
+            return ok;
+        }
+        let carry = self
+            .sop2(v, &["s_addc_u32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd_carry(v));
+        let borrow = self
+            .sop2(v, &["s_subb_u32"])
+            .and_then(|(_, [a, b])| (b == Term::Const(0)).then_some([a, b]));
+        match carry.or(borrow) {
+            Some([x, Term::Const(0)]) | Some([Term::Const(0), x]) => {
+                self.pointer_high(x, high, seen, budget)
+            }
+            _ => false,
+        }
+    }
+
+    /// The operands of a `v_add_co_ci_u32` writing `v` (the carry-in
+    /// aside), through VGPR copies of scalars.
+    fn vadd_carry(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32" || inst.write(Reg::V(reg)) != Some(v) {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+        ])
+    }
+
+    /// `hi` is `high` (0 for a table), possibly plus a carry or minus a
+    /// borrow.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+            ))
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_subb_u32"]).is_some_and(
+                |(_, [a, b])| a == want && b == Term::Const(0)
             ))
     }
 
@@ -644,6 +853,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.phi(words, joins)? {
             return Ok(source);
         }
+        if let Some(source) = self.select(words, joins)? {
+            return Ok(source);
+        }
         if let Some(consts) = words
             .iter()
             .map(|w| match *w {
@@ -726,6 +938,96 @@ impl<'a> Tracer<'a> {
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
+    /// per outcome (other words are the same for both).
+    fn select(
+        &self,
+        words: &[Term],
+        joins: &mut Vec<usize>,
+    ) -> Result<Option<Source>, &'static str> {
+        let picks: Vec<_> = words
+            .iter()
+            .map(|w| match *w {
+                Term::Value(v) => self.picked(v),
+                Term::Const(_) => None,
+            })
+            .collect();
+        let Some(scc) = picks.iter().flatten().map(|p| p.0).next() else {
+            return Ok(None);
+        };
+        if picks.iter().flatten().any(|p| p.0 != scc) {
+            return Err("a descriptor chosen by several conditions");
+        }
+        // Each level doubles the sources; selects count like joins (a
+        // marker no block index reaches).
+        if joins.len() >= MAX_JOINS {
+            return Err("a descriptor joined too often");
+        }
+        joins.push(usize::MAX);
+        let side = |set: bool| -> Vec<Term> {
+            words
+                .iter()
+                .zip(&picks)
+                .map(|(w, p)| match p {
+                    Some((_, t, f)) => {
+                        if set {
+                            *t
+                        } else {
+                            *f
+                        }
+                    }
+                    None => *w,
+                })
+                .collect()
+        };
+        let args = [true, false]
+            .into_iter()
+            .map(|set| self.classify(&side(set), joins))
+            .collect::<Result<_, _>>();
+        joins.pop();
+        Ok(Some(Source::Select { scc, args: args? }))
+    }
+
+    /// For `v` written by `s_cselect_b32`/`_b64` or `s_cmov_b32`/`_b64`:
+    /// the SCC it reads and the dword it is when SCC is set, then clear.
+    fn picked(&self, v: Value) -> Option<(Value, Term, Term)> {
+        let inst = self.def(v)?;
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return None;
+        };
+        let k = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        let wide = match inst.name() {
+            "s_cselect_b32" | "s_cmov_b32" => false,
+            "s_cselect_b64" | "s_cmov_b64" => true,
+            _ => return None,
+        };
+        // A dword of a 32- or 64-bit operand: 64-bit inline integers are
+        // sign-extended; 64-bit literals and float constants are not
+        // followed.
+        let dword = |op: &Operand| match *op {
+            Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+            Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + k))?)),
+            Operand::Const(c) if !wide => inline(c).map(Term::Const),
+            Operand::Const(c @ 128..=208) => {
+                let low = inline(c)?;
+                Some(Term::Const(if k == 0 {
+                    low
+                } else {
+                    ((low as i32) >> 31) as u32
+                }))
+            }
+            Operand::Literal(x) if !wide => Some(Term::Const(x)),
+            _ => None,
+        };
+        let set = dword(src.first()?)?;
+        let clear = if inst.name().starts_with("s_cmov") {
+            dword(dst.as_ref()?)?
+        } else {
+            dword(src.get(1)?)?
+        };
+        Some((inst.read(Reg::Scc)?, set, clear))
     }
 
     /// `v` as some other dword with constant bits set.
@@ -933,6 +1235,7 @@ mod tests {
             param,
             offset,
             dynamic: None,
+            includes_base: false,
         }
     }
 
@@ -1094,6 +1397,236 @@ mod tests {
         assert!(
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
+        );
+    }
+
+    #[test]
+    fn descriptors_selected_by_scc_are_traced_per_outcome() {
+        // Two buffer descriptors loaded from the table at s9 and one
+        // picked with s_cselect_b64 per half, as the compiler makes a
+        // conditional choice of resources without a branch.
+        let r = track_words(
+            &[
+                0xBE8C_0309, // s_mov_b32 s12, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0006,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+                0xF408_0106,
+                0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+                0xBF06_800E, // s_cmp_eq_u32 s14, 0
+                0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+                0x858A_0602, // s_cselect_b64 s[10:11], s[2:3], s[6:7]
+                0xF420_0404,
+                0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Select { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        // SCC set picks the first operand.
+        assert_eq!(
+            args[..],
+            [
+                Source::Loaded {
+                    load: (0, 2),
+                    first: 0
+                },
+                Source::Loaded {
+                    load: (0, 3),
+                    first: 0
+                },
+            ]
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
+    }
+
+    #[test]
+    fn a_selection_that_mixes_two_descriptors_fails() {
+        // The high half picked from the first load whatever SCC is: when
+        // clear, the descriptor is half of one load and half of the other.
+        let code: Vec<u8> = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0006,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+            0xF408_0106,
+            0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+            0xBF06_800E, // s_cmp_eq_u32 s14, 0
+            0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+            0x858A_0202, // s_cselect_b64 s[10:11], s[2:3], s[2:3]
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 36,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    #[test]
+    fn root_constants_are_offsets_added_to_a_table() {
+        let r = track_words(
+            &[
+                0x8002_0409, // s_add_u32 s2, s9, s4
+                0xB782_0100, // s_addk_i32 s2, 0x100
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0101,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(Constants, 4, 1)],
+            HwStage::Ps,
+        );
+        let constant = r.params.iter().find(|p| p.1 == 1).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 3),
+                Address {
+                    param: 0,
+                    offset: 0x100,
+                    dynamic: Some(constant),
+                    includes_base: false,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn constants_subtracted_from_a_root_descriptor_borrow_from_its_high_half() {
+        let r = track_words(
+            &[
+                0x8080_900A, // s_sub_u32 s0, s10, 16
+                0x8281_800B, // s_subb_u32 s1, s11, 0
+                0xF400_0080,
+                0xFA00_0020, // s_load_dword s2, s[0:1], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x10))]);
+    }
+
+    /// The phi a pointer address reads, and the block it joins in.
+    fn pointer_phi(p: &Program, a: &Address) -> usize {
+        let d = a.dynamic.expect("a computed term");
+        p.blocks
+            .iter()
+            .position(|b| b.phis.iter().any(|phi| phi.value == d))
+            .expect("a phi")
+    }
+
+    #[test]
+    fn pointers_advanced_in_a_loop_are_offsets_from_their_table() {
+        let code: Vec<u8> = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xF40C_0201,
+            0xFA00_0000, // 0xc: s_load_dwordx8 s[8:15], s[2:3], null
+            0x8002_A002, // s_add_u32 s2, s2, 32
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0x8004_8104, // s_add_u32 s4, s4, 1
+            0xBF07_8404, // s_cmp_lg_u32 s4, 4
+            0xBF85_FFF9, // s_cbranch_scc1 -> 0xc
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap();
+        let [(site, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0, true));
+        // The pointer is the loop header's phi of s2.
+        assert_eq!(pointer_phi(&p, &a), site.0);
+    }
+
+    #[test]
+    fn pointers_picked_by_a_branch_are_offsets_from_their_table() {
+        let code: Vec<u8> = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8002_A009, // s_add_u32 s2, s9, 32
+            0xBF82_0001, // s_branch -> 0x14
+            0x8002_C009, // 0x10: s_add_u32 s2, s9, 64
+            0xBE83_0380, // 0x14: s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0010, // s_load_dwordx8 s[8:15], s[2:3], 0x10
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap();
+        let [(site, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0x10, true));
+        assert_eq!(pointer_phi(&p, &a), site.0);
+    }
+
+    #[test]
+    fn pointers_into_a_root_descriptor_carry_into_its_high_half() {
+        let r = track_words(
+            &[
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030B, // s_mov_b32 s1, s11
+                0xF400_0080,
+                0xFA00_0000, // 0x8: s_load_dword s2, s[0:1], null
+                0x8000_9000, // s_add_u32 s0, s0, 16
+                0x8201_8001, // s_addc_u32 s1, s1, 0
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0, true));
+    }
+
+    #[test]
+    fn pointers_from_two_parameters_fail() {
+        let code: Vec<u8> = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8002_A009, // s_add_u32 s2, s9, 32
+            0xBF82_0001, // s_branch -> 0x14
+            0x8002_C008, // 0x10: s_add_u32 s2, s8, 64
+            0xBE83_0380, // 0x14: s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0000, // 0x18: s_load_dwordx8 s[8:15], s[2:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 8, 1), param(Table, 9, 1)], HwStage::Ps).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x18,
+                what: "an address from a phi"
+            }
         );
     }
 
