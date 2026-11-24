@@ -1511,6 +1511,14 @@ impl Host {
         // dropped: the submission may still be running (a page fault inside
         // a freed 256x256 texture after pooled lists cleared their holds).
         list.retire_held();
+        // Its dynamic descriptor slots go back now: only its own commands
+        // read them, and its submission has finished (`execute` waits for
+        // it before the list is recycled). Aged with the rest (four
+        // presented frames), the 2^19 slots ran out with submissions
+        // queued ahead (`VICTORY_ASYNC_SUBMIT`) and draws were dropped.
+        drop(DynamicSlots(std::mem::take(
+            &mut *list.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()),
+        )));
         list.release_kept();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < LIST_POOL_CAP {
