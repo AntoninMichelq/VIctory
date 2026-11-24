@@ -1722,8 +1722,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     let _ = this;
-    // Without a host GPU nothing runs later: write now.
-    what.write(address as *mut u8, bytes);
+    // Without a host GPU nothing runs later: write now (no lock held).
+    what.write(address as *mut u8, bytes).run();
 }
 
 /// The list methods by their slot in older titles' lists (the 2020-era

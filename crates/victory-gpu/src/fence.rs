@@ -296,6 +296,22 @@ fn run_held(queues: Vec<Arc<Timeline>>) {
     }
 }
 
+/// Queues a bottom-of-pipe write woke, to run once the writer holds no
+/// lock: their work submits lists itself (`Host::execute`'s lock).
+#[derive(Default)]
+#[must_use = "run the woken queues once no lock is held"]
+pub(crate) struct Woken(Vec<Arc<Timeline>>);
+
+impl Woken {
+    pub(crate) fn add(&mut self, other: Woken) {
+        self.0.extend(other.0);
+    }
+
+    pub(crate) fn run(self) {
+        run_held(self.0);
+    }
+}
+
 /// A reference to a fence held by a queue's work, given back on drop.
 pub(crate) struct Held(object::Held);
 
@@ -331,15 +347,15 @@ impl Held {
 }
 
 /// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
-/// fence whose value the write touched.
-pub(crate) fn written(at: usize, bytes: usize) {
+/// fence whose value the write touched, and returns its held queues.
+pub(crate) fn written(at: usize, bytes: usize) -> Woken {
     let end = at.saturating_add(bytes);
     let live = live();
     let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return;
+        return Woken::default();
     };
     if value_at + size_of::<u64>() <= at {
-        return;
+        return Woken::default();
     }
     // SAFETY: registered fences are alive until their drop, which takes
     // the registry lock we hold.
@@ -349,7 +365,7 @@ pub(crate) fn written(at: usize, bytes: usize) {
         fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
     );
     drop(live);
-    run_held(queues);
+    Woken(queues)
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {
@@ -486,9 +502,13 @@ mod tests {
         let result = blocking_wait(f, 0x1_0000_0003);
         std::thread::sleep(Duration::from_millis(50));
         // The low half alone does not reach the value.
-        crate::queue::Written::Value(3).write(address(f) as *mut u8, 4);
+        crate::queue::Written::Value(3)
+            .write(address(f) as *mut u8, 4)
+            .run();
         assert!(result.recv_timeout(Duration::from_millis(200)).is_err());
-        crate::queue::Written::Value(0x1_0000_0003).write(address(f) as *mut u8, 8);
+        crate::queue::Written::Value(0x1_0000_0003)
+            .write(address(f) as *mut u8, 8)
+            .run();
         assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(S_OK));
         release_fence(f);
     }
@@ -504,7 +524,9 @@ mod tests {
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         assert!(!event.is_null());
         assert_eq!(slot::<Wait>(f, 0x48)(f, 9, event), S_OK);
-        crate::queue::Written::Value(9).write(address(f) as *mut u8, 8);
+        crate::queue::Written::Value(9)
+            .write(address(f) as *mut u8, 8)
+            .run();
         // SAFETY: a valid event.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         // SAFETY: ours.
@@ -547,8 +569,34 @@ mod tests {
         // does not fault.
         let g = new_fence(0);
         let mut other = [0u64; 2];
-        written(other.as_mut_ptr() as usize, 16);
-        written(address(g) + 8, 8);
+        written(other.as_mut_ptr() as usize, 16).run();
+        written(address(g) + 8, 8).run();
         release_fence(g);
+    }
+
+    /// A bottom-of-pipe write at a fence a held queue waits for does not
+    /// run that queue's work inside the write: the writer (`Host::execute`)
+    /// still holds its submission lock, which the work takes again. The old
+    /// code ran it there (a deadlock on the real lock).
+    #[test]
+    fn bottom_of_pipe_writes_leave_woken_work_to_the_writer() {
+        use crate::timeline::{Op, Timeline};
+        let f = new_fence(0);
+        let submission = Arc::new(Mutex::new(()));
+        let ran = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let queue = Arc::new(Timeline::default());
+        queue.submit(Op::Wait(Held::new(f), 1));
+        let (lock, seen) = (submission.clone(), ran.clone());
+        queue.submit(Op::Run(Box::new(move || {
+            let free = lock.try_lock().is_ok();
+            seen.store(if free { 1 } else { 2 }, Ordering::SeqCst);
+        })));
+        let held = submission.lock().unwrap();
+        let woken = crate::queue::Written::Value(1).write(address(f) as *mut u8, 8);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "ran inside the write");
+        drop(held);
+        woken.run();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        release_fence(f);
     }
 }
