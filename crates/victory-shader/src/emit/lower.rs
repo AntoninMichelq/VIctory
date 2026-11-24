@@ -114,6 +114,18 @@ const GS_ALLOC_REQ: u16 = 9;
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
+/// Operand code of `src_pops_exiting_wave_id`.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+
+/// Whether `p` reads `src_pops_exiting_wave_id` (a pixel shader in
+/// primitive order).
+fn reads_pops_exiting_wave_id(p: &crate::ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(&i.fields, Fields::Sop { src, .. }
+            if src.contains(&Operand::Const(POPS_EXITING_WAVE_ID)))
+    })
+}
+
 fn inline_f16(c: u8) -> u32 {
     [
         0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
@@ -2222,6 +2234,16 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // A pixel shader in primitive order (POPS) gets its
+                    // collision wave id after the user data and waits on it
+                    // for overlapping waves to leave; the id read as zero
+                    // (bit 31 clear) skips that wait.
+                    // shortcut: no rasterizer ordering on the host (the
+                    // overlap's image reads and writes may race), as
+                    // `src_pops_exiting_wave_id` reads zero.
+                    None if self.s.pixel && reads_pops_exiting_wave_id(self.x.p) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3146,6 +3168,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // The id of the last wave out of primitive order: zero (see
+            // `inputs`).
+            Operand::Const(POPS_EXITING_WAVE_ID) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
