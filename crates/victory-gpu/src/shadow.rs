@@ -26,6 +26,9 @@ use crate::watch::PAGE;
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// The [`LOOSE_USES`] count at its last lookup (loose windows only):
+    /// the least recently used go first past [`loose_budget`].
+    used: std::sync::atomic::AtomicU64,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -268,6 +271,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            used: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -725,10 +729,89 @@ pub(crate) fn loose_cover() -> (usize, u64) {
     (map.len(), covered)
 }
 
+/// Loose window lookups so far: the clock of [`Shadow::used`].
+static LOOSE_USES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes of loose windows kept before the least recently used ones
+/// nothing holds are released: `VICTORY_LOOSE_BUDGET_MB`, 1.5 GiB by
+/// default. The world's GPU reads over 3 GB of such memory within minutes
+/// and kept a copy of all of it for good.
+fn loose_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_LOOSE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1536)
+            << 20
+    })
+}
+
+/// References to `buffer` besides the caller's: descriptor slots that
+/// view it hold one each.
+fn com_refs(buffer: &ID3D12Resource) -> u32 {
+    use windows::core::Interface;
+    // SAFETY: every COM interface's table starts with IUnknown's; an
+    // AddRef then a Release leaves the count as it was and returns it.
+    unsafe {
+        let raw = buffer.as_raw();
+        let table = &**raw.cast::<*const windows::core::IUnknown_Vtbl>();
+        (table.AddRef)(raw);
+        (table.Release)(raw)
+    }
+}
+
+/// Whether nothing but the window map holds `shadow`: no list (which
+/// holds it until reset, after its submission ran), no descriptor slot
+/// viewing its buffer, and no GPU writes waiting to go back to title
+/// memory. Title memory then holds all it has: it can be made again.
+fn idle(shadow: &Arc<Shadow>) -> bool {
+    Arc::strong_count(shadow) == 1
+        && com_refs(&shadow.buffer) == 1
+        && shadow.pending.lock().is_ok_and(|p| p.is_empty())
+        && shadow.before.lock().is_ok_and(|b| b.snapshot.is_none())
+}
+
+/// Releases the least recently used idle windows until those kept and
+/// `more` bytes fit [`loose_budget`].
+fn evict_loose(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, more: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let budget = loose_budget();
+    let kept = || crate::memstat::LOOSE.load(Relaxed);
+    if kept() + more <= budget {
+        return;
+    }
+    let mut idle: Vec<(u64, (u64, u64))> = map
+        .iter()
+        .filter(|(_, s)| idle(s))
+        .map(|(k, s)| (s.used.load(Relaxed), *k))
+        .collect();
+    idle.sort_unstable();
+    let mut freed = 0;
+    for (_, key) in idle {
+        if kept() + more <= budget {
+            break;
+        }
+        if let Some(shadow) = map.remove(&key) {
+            crate::memstat::sub(&crate::memstat::LOOSE, key.1);
+            freed += key.1;
+            crate::host::retire(shadow);
+        }
+    }
+    if freed > 0 {
+        tracing::debug!(
+            freed_mib = freed >> 20,
+            kept_mib = kept() >> 20,
+            "loose windows released"
+        );
+    }
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let end = end.max(address.saturating_add(64 << 10));
     let len = end.checked_next_multiple_of(WINDOW)? - start;
+    let now = LOOSE_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
@@ -739,11 +822,13 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        shadow.used.store(now, std::sync::atomic::Ordering::Relaxed);
         return Some(shadow);
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
+    evict_loose(&mut map, len);
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -754,6 +839,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    shadow.used.store(now, std::sync::atomic::Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     crate::memstat::add(&crate::memstat::LOOSE, len);
     Some(shadow)
