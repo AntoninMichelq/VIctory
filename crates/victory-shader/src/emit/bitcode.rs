@@ -221,6 +221,23 @@ impl Module {
         Ty(t)
     }
 
+    /// Test builds: `v` as a short expression (integer constants, binary
+    /// operations, `?` for anything else).
+    #[cfg(test)]
+    pub(crate) fn show(&self, v: V) -> String {
+        match v {
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Int(x) => x.to_string(),
+                _ => "?".into(),
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Bin(op, a, b) => format!("({} {op:?} {})", self.show(*a), self.show(*b)),
+                _ => "?".into(),
+            },
+            _ => "?".into(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn uses_of(&self, target: V) -> usize {
         let mut n = 0;

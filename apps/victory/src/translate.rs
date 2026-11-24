@@ -580,9 +580,11 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            // The previous loop pass's value or an unwritten register:
-            // no source of their own.
-            resource::Source::Carried { .. } | resource::Source::Unset => None,
+            // The previous loop pass's value, an unwritten register or a
+            // path no lane takes to the access: no source of their own.
+            resource::Source::Carried { .. }
+            | resource::Source::Unset
+            | resource::Source::NoDescriptor => None,
             resource::Source::Phi { .. }
             | resource::Source::Select { .. }
             | resource::Source::Lanes { .. }
