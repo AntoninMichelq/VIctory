@@ -255,6 +255,24 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Per-lane descriptor joins being lowered: IR block and the heap index
+    /// phi there (what [`Source::Carried`] reads).
+    lane_paths: Vec<(usize, V)>,
+    /// Heap index phis of per-lane joins with predecessors lowered later.
+    pending_paths: Vec<PendingPath>,
+}
+
+/// A heap index phi of a [`Source::Paths`], filled once every predecessor is
+/// lowered.
+struct PendingPath {
+    phi: V,
+    block: usize,
+    sampler: bool,
+    /// [`Lower::lane_paths`] where it was made, itself included.
+    outer: Vec<(usize, V)>,
+    /// Per predecessor: the index when it was lowered already, else its
+    /// source.
+    incoming: Vec<(usize, Result<V, Source>)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -743,6 +761,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            lane_paths: Vec::new(),
+            pending_paths: Vec::new(),
             dead,
         }
     }
@@ -4045,10 +4065,12 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
-            src
+        if let Source::Phi { args, .. }
+        | Source::Select { args, .. }
+        | Source::Lanes { args, .. }
+        | Source::Paths { args, .. } = src
         {
-            return self.used_kind(args.first()?);
+            return args.iter().find_map(|a| self.used_kind(a));
         }
         if let Source::Built { address, .. } = src {
             let rp = self.x.native.layout.get(address.param)?;
@@ -4184,13 +4206,25 @@ impl<'a> Lower<'a> {
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
-            Source::Fetched { .. } | Source::Lanes { .. } => {
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::Paths { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
+                let io = &self.x.io.inputs;
+                if self
+                    .x
+                    .res
+                    .waterfall
+                    .unset
+                    .iter()
+                    .any(|u| io.iter().any(|i| i.0 == *u))
+                {
+                    return Err("a per-lane descriptor joined with a VGPR the hardware sets");
+                }
                 let index = self.lane_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
+            Source::Carried { .. } | Source::Unset => Err("a per-lane descriptor out of a join"),
         }
     }
 
@@ -4222,8 +4256,97 @@ impl<'a> Lower<'a> {
                 let clear = self.lane_heap_index(b, sampler)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
+            Source::Paths { block, args } => self.paths_index(*block, args, sampler),
+            Source::Carried { block } => self
+                .lane_paths
+                .iter()
+                .rev()
+                .find(|p| p.0 == *block)
+                .map(|p| p.1)
+                .ok_or("a per-lane descriptor carried out of its loop"),
+            // Undefined: any index will do.
+            Source::Unset => Ok(self.s.m.i32(0)),
             _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
         }
+    }
+
+    /// The heap index of a descriptor joined per lane at `block`: a phi of
+    /// each predecessor's index, computed at its end (later for those not
+    /// lowered yet, as a loop's back edge).
+    fn paths_index(&mut self, block: usize, args: &[Source], sampler: bool) -> Result<V, Why> {
+        const WHY: Why = "a per-lane descriptor joined by control flow";
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.lane_paths.push((block, phi));
+        let here = self.cur;
+        let mut incoming = Vec::new();
+        let mut result = Ok(());
+        for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let Some(tail) = self.tail[q] else {
+                incoming.push((q, Err(arg.clone())));
+                continue;
+            };
+            self.cur = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let index = self.lane_heap_index(arg, sampler);
+            match index {
+                Ok(x) => incoming.push((q, Ok(x))),
+                Err(why) => {
+                    result = Err(why);
+                    break;
+                }
+            }
+        }
+        self.cur = here;
+        let outer = self.lane_paths.clone();
+        self.lane_paths.pop();
+        result?;
+        if incoming.iter().all(|i| i.1.is_ok()) {
+            let done = incoming
+                .into_iter()
+                .map(|(q, x)| (x.unwrap(), self.edge_block(q, block)));
+            let done = done.collect();
+            self.s.m.set_phi(phi, done);
+        } else {
+            self.pending_paths.push(PendingPath {
+                phi,
+                block,
+                sampler,
+                outer,
+                incoming,
+            });
+        }
+        Ok(phi)
+    }
+
+    /// The DXIL block that ends the edge from IR block `q` (lowered) to `to`.
+    fn edge_block(&self, q: usize, to: usize) -> usize {
+        let tail = self.tail[q].expect("a lowered predecessor");
+        self.edges.get(&(q, to)).copied().unwrap_or(tail)
+    }
+
+    /// Fills the heap index phis [`Self::paths_index`] left for later.
+    fn fill_paths(&mut self) -> Result<(), Why> {
+        while let Some(pending) = self.pending_paths.pop() {
+            let saved = std::mem::replace(&mut self.lane_paths, pending.outer);
+            let mut incoming = Vec::new();
+            for (q, x) in pending.incoming {
+                let at = self.edge_block(q, pending.block);
+                let x = match x {
+                    Ok(x) => x,
+                    Err(arg) => {
+                        self.cur = at;
+                        self.lane_heap_index(&arg, pending.sampler)?
+                    }
+                };
+                incoming.push((x, at));
+            }
+            self.lane_paths = saved;
+            self.s.m.set_phi(pending.phi, incoming);
+        }
+        Ok(())
     }
 
     /// The heap index of the descriptor at dword `first` of what the global
@@ -4238,6 +4361,10 @@ impl<'a> Lower<'a> {
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
+        }
+        if self.x.st.guards[load.0][load.1].is_some() {
+            // Lanes outside EXEC there keep their old dwords.
+            return Err("a per-lane descriptor loaded under a partial EXEC");
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
@@ -7718,6 +7845,7 @@ impl<'a> Lower<'a> {
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        self.fill_paths().map_err(|w| unsupported(0, w))?;
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -8503,12 +8631,16 @@ mod tests {
     #[test]
     fn waterfall_loops_over_per_lane_descriptors_sample_with_each_lanes_own() {
         use crate::resource::tests::{
-            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
+            WATERFALL_BRANCHES_WAVE32, WATERFALL_CARRIED_WAVE32, WATERFALL_FETCHED_WAVE32,
+            WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32, WATERFALL_REPLACED_WAVE32,
         };
         for (words, wave64) in [
             (WATERFALL_FETCHED_WAVE32, false),
             (WATERFALL_FETCHED_WAVE64, true),
             (WATERFALL_PICKED_WAVE32, false),
+            (WATERFALL_CARRIED_WAVE32, false),
+            (WATERFALL_BRANCHES_WAVE32, false),
+            (WATERFALL_REPLACED_WAVE32, false),
         ] {
             let (layout, used) = texture_tables();
             let l = lower_wave(words, layout, used, wave64).unwrap();
@@ -8517,6 +8649,32 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn per_lane_descriptors_loaded_under_a_partial_exec_fail() {
+        // The if/else without its s_cbranch_execz: both branches run, each
+        // loading for its lanes only, so v[4:11] after them is the second
+        // load only in the else lanes.
+        let mut words = crate::resource::tests::WATERFALL_BRANCHES_WAVE32.to_vec();
+        for k in [12, 19] {
+            assert_eq!(words[k] >> 16, 0xBF88);
+            words[k] = 0xBF80_0000; // s_nop 0
+        }
+        let (layout, used) = texture_tables();
+        let Err(e) = lower_wave(&words, layout, used, false) else {
+            panic!("lowered");
+        };
+        assert!(
+            matches!(
+                e,
+                crate::ShaderError::Unsupported {
+                    what: "a per-lane descriptor loaded under a partial EXEC",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
     }
 
     /// A table at s0 holding structured buffers of dwords.
