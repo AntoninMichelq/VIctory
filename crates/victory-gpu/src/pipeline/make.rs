@@ -417,6 +417,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, frame.saturating_add(1));
         if p.graphics.is_none() && dispatches_wait() {
             wait_made(p, Duration::from_secs(5));
+        } else if p.graphics.is_some() && draws_wait() {
+            wait_made(p, Duration::from_secs(2));
         } else {
             wait(p, frame);
         }
@@ -474,6 +476,22 @@ fn dispatches_wait() -> bool {
     })
 }
 
+/// `VICTORY_DRAW_WAIT=1` (opt-in): a draw whose graphics pipeline is not
+/// made yet waits for it (up to 2 s each, within the same 10 s per title
+/// frame as dispatch waits) instead of being dropped, so models show from
+/// the world's first frames at the cost of slower frames while pipelines
+/// are made.
+fn draws_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_DRAW_WAIT").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("VICTORY_DRAW_WAIT: draws wait for their pipeline");
+        }
+        on
+    })
+}
+
 /// Waits for `p` until it is made or `limit` passes, outside the frame
 /// budget (counted as a pipeline wait in the frame CPU split).
 fn wait_made(p: &Pending, limit: Duration) {
@@ -497,7 +515,7 @@ fn wait_made(p: &Pending, limit: Duration) {
     while p.made.get().is_none() {
         let rest = limit.saturating_sub(started.elapsed());
         if rest.is_zero() {
-            tracing::warn!(key = %p.key, "a dispatch's pipeline not made within its wait; dropped");
+            tracing::warn!(key = %p.key, "a pipeline not made within its wait; its draw or dispatch dropped");
             break;
         }
         held = p.wait_done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
