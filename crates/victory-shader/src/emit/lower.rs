@@ -562,6 +562,10 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Values a whole-wave section leaves with only their low half known
+    /// (f16 sums, [`super::wave::Op::AddH`]): that half, for the 16-bit
+    /// reads of it; any other read of the value fails.
+    low_halves: HashMap<Value, V>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1328,6 +1332,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            low_halves: HashMap::new(),
             code_table: None,
             scratch: None,
             counters: HashMap::new(),
@@ -1773,7 +1778,12 @@ impl<'a> Lower<'a> {
             for &(_, w) in &insts[j].writes {
                 let shapes = &self.sections[&b][&start].shapes;
                 let shape = need.contains(&w).then(|| shapes.get(&w).copied()).flatten();
+                let half = shape.is_some_and(|sh| sh.low_half());
                 let val = match (shape.map(|sh| self.shape(sh)), plain[j - start]) {
+                    (Some(Ok(x)), _) if half => {
+                        self.low_halves.insert(w, x);
+                        Val::Missing("the high half of a whole-wave f16 result")
+                    }
                     (Some(Ok(x)), _) => Val::I32(x),
                     (_, true) => continue,
                     (Some(Err(why)), false) => Val::Missing(why),
@@ -1790,7 +1800,11 @@ impl<'a> Lower<'a> {
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
-        use super::wave::{Op, Shape};
+        use super::wave::{Op, Shape, Src};
+        let value = |l: &mut Self, src: Src| match src {
+            Src::V(v) => l.i32_of(v),
+            Src::K(k) => Ok(l.s.m.i32(k)),
+        };
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1804,7 +1818,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
-                let x = self.i32_of(src)?;
+                let x = value(self, src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
             }
@@ -1826,17 +1840,28 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        let x = value(self, src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let half = op == Op::AddH;
+        let float = matches!(op, Op::AddF | Op::AddH | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        let arg = if float { self.as_float(x) } else { x };
+        let arg = if half {
+            // The low halves as f32 (exact), summed there and rounded once.
+            let low = self.s.m.i32(0xFFFF);
+            let h = self.s.m.bin(c, Bin::And, x, low);
+            self.s
+                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h])
+        } else if float {
+            self.as_float(x)
+        } else {
+            x
+        };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU | Op::AddF | Op::AddH, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
@@ -1865,7 +1890,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddH => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -1882,7 +1907,25 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        Ok(if half {
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
+    }
+
+    /// The low half a whole-wave section left in the value operand `op`
+    /// reads, if only that half is known ([`Self::low_halves`]).
+    fn low_half_of(&self, inst: &Inst, op: &Operand) -> Option<V> {
+        let reg = match *op {
+            Operand::Scalar { code, .. } if code != NULL => Reg::S(code),
+            Operand::Vector { reg, .. } => Reg::V(reg),
+            _ => return None,
+        };
+        self.low_halves.get(&inst.read(reg)?).copied()
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -2347,6 +2390,18 @@ impl<'a> Lower<'a> {
         if a.param == CODE {
             return Err("an address from a phi");
         }
+        // VGPRs the pointer's phis join before any write are undefined only
+        // if the hardware does not set them.
+        let io = &self.x.io.inputs;
+        if self
+            .x
+            .res
+            .pointer_unset
+            .iter()
+            .any(|u| io.iter().any(|i| i.0 == *u))
+        {
+            return Err("a pointer joined with a VGPR the hardware sets");
+        }
         let base = match self.user(a.param, 0) {
             Val::I32(x) => x,
             _ => return Err("an advanced pointer into a root descriptor"),
@@ -2368,6 +2423,11 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // An address only added to and accessed at: its accesses are
+            // the same at any value of it (`resource::address_only`).
+            RootType::Descriptor if self.x.res.address_only.contains(&param) => {
+                return Val::I32(self.s.m.i32(0));
+            }
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
@@ -7181,7 +7241,13 @@ impl<'a> Lower<'a> {
                 let mut halves = Vec::new();
                 for k in 0..2 {
                     let op = v.src.get(k).ok_or("a missing operand")?;
-                    let mut x = self.f16_operand(inst, op)?;
+                    let low = (v.opsel >> k & 1 == 0)
+                        .then(|| self.low_half_of(inst, op))
+                        .flatten();
+                    let mut x = match low {
+                        Some(x) => x,
+                        None => self.f16_operand(inst, op)?,
+                    };
                     if v.opsel >> k & 1 != 0 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -7561,9 +7627,11 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
-        let x = match (op, self.src0) {
-            (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => self.s.m.i32(inline_f16(c)),
+        let low = (!high).then(|| self.low_half_of(inst, &op)).flatten();
+        let x = match (op, self.src0, low) {
+            (_, Some(x), _) if k == 0 => x,
+            (Operand::Const(c @ 240..=248), _, _) => self.s.m.i32(inline_f16(c)),
+            (_, _, Some(x)) => x,
             _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
@@ -7921,7 +7989,10 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = self.f16_operand(inst, &op)?;
+        let x = match (!sel).then(|| self.low_half_of(inst, &op)).flatten() {
+            Some(x) => x,
+            None => self.f16_operand(inst, &op)?,
+        };
         let c = self.cur;
         let x = if sel {
             let k16 = self.s.m.i32(16);
@@ -12161,6 +12232,193 @@ mod tests {
         lowers(&words).unwrap();
     }
 
+    /// Assembled with llvm-mc (gfx1030, wave64): a whole-wave f16 sum (DPP8
+    /// swaps of 1, 2 and 4 lanes, `row_mirror`, `v_permlanex16`, then the
+    /// halves read at lanes 32 and 0 and added), written by lane 0 after
+    /// adding an element it loads when a root constant (s1) says so.
+    const HALF_SUM_WAVE64: [u32; 46] = [
+        0xBE8C_0300, // s_mov_b32 s12, s0
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF408_0106,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[12:13], 0x0
+        0x7E02_0D00, // v_cvt_f32_u32_e32 v1, v0
+        0x7E02_1501, // v_cvt_f16_f32_e32 v1, v1
+        0xBE82_25C1, // s_or_saveexec_b64 s[2:3], -1
+        0xD501_0002,
+        0x000A_0280, // v_cndmask_b32_e64 v2, 0, v1, s[2:3]
+        0x6404_04E9,
+        0xDE54_C102, // v_add_f16_dpp v2, v2, v2 dpp8:[1,0,3,2,5,4,7,6]
+        0x6404_04E9,
+        0xB3E2_1A02, // v_add_f16_dpp v2, v2, v2 dpp8:[2,3,0,1,6,7,4,5]
+        0x6404_04E9,
+        0x688F_AC02, // v_add_f16_dpp v2, v2, v2 dpp8:[4,5,6,7,0,1,2,3]
+        0x6404_04FA,
+        0xFF01_4002, // v_add_f16_dpp v2, v2, v2 row_mirror row_mask:0xf bank_mask:0xf
+        0xD778_0003,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+        0xD532_0002,
+        0x0002_0702, // v_add_f16_e64 v2, v2, v3
+        0xD760_0008,
+        0x0001_4102, // v_readlane_b32 s8, v2, 32
+        0xD532_0002,
+        0x0002_0408, // v_add_f16_e64 v2, s8, v2
+        0xD760_0009,
+        0x0001_0102, // v_readlane_b32 s9, v2, 0
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_000E, // s_cbranch_execz -> s_endpgm
+        0x8F0E_8301, // s_lshl_b32 s14, s1, 3
+        0x4A08_000E, // v_add_nc_u32_e32 v4, s14, v0
+        0x7E0A_0280, // v_mov_b32_e32 v5, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0003, // s_cbranch_scc1 -> v_add_f16
+        0xE200_2000,
+        0x8001_0504, // buffer_load_format_d16_x v5, v4, s[4:7], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x640A_0A09, // v_add_f16_e32 v5, s9, v5
+        0xD711_0006,
+        0x0002_0B05, // v_pack_b32_f16 v6, v5, v5
+        0x7E0E_0306, // v_mov_b32_e32 v7, v6
+        0xE21C_2000,
+        0x8001_0604, // buffer_store_format_d16_xyzw v[6:7], v4, s[4:7], 0 idxen
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_whole_wave_f16_sum_is_stored_by_lane_zero() {
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_wave(&HALF_SUM_WAVE64, layout.clone(), used.clone(), true).unwrap();
+        assert!(l.wave_ops);
+        // The same reduction with v_add_f32 for each add in the section
+        // (the code after it unchanged): followed as an f32 sum.
+        let mut words = HALF_SUM_WAVE64;
+        for w in &mut words[9..27] {
+            if *w == 0x6404_04E9 || *w == 0x6404_04FA {
+                *w = (*w & !0x7E00_0000) | 0x03 << 25; // v_add_f32_dpp
+            } else if *w == 0xD532_0002 {
+                *w = 0xD503_0002; // v_add_f32_e64
+            }
+        }
+        lower_wave(&words, layout.clone(), used.clone(), true).unwrap();
+        // Only the sum's low half is known (an f16 operation keeps its
+        // destination's high half): a copy of the whole dword fails.
+        let mut words = HALF_SUM_WAVE64;
+        assert_eq!(words[39], 0x640A_0A09);
+        words[39] = 0x7E0A_0209; // v_mov_b32_e32 v5, s9
+        let Err(e) = lower_wave(&words, layout, used, true) else {
+            panic!("lowered");
+        };
+        assert!(
+            matches!(
+                e,
+                crate::ShaderError::Unsupported {
+                    what: "the high half of a whole-wave f16 result",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_read_at_a_hash_of_a_loop_phi_lowers() {
+        // The root descriptor at s[2:3] plus an offset hashed from the
+        // generator state a loop phi carries.
+        let layout = vec![
+            root(RootType::Constants, 0, 0),
+            root(RootType::Constants, 1, 1),
+            root(RootType::Descriptor, 2, 2),
+        ];
+        let used = vec![root_view(ResourceType::Srv, 2, 2)];
+        let words = crate::resource::tests::RANDOM_TABLE_READ_WAVE32;
+        let l = lower_with(&words, layout.clone(), used.clone()).unwrap();
+        assert_eq!(l.root_srvs, vec![2]);
+        // Computed and loaded through in two regions, the address joined
+        // with what the VGPRs held before the loop.
+        let words = crate::resource::tests::RANDOM_TABLE_READ_SPLIT_WAVE32;
+        let l = lower_with(&words, layout, used).unwrap();
+        assert_eq!(l.root_srvs, vec![2]);
+    }
+
+    /// Assembled with llvm-mc (gfx1030, wave32): an append. The lanes below
+    /// a root constant (s1) add 1 to a counter (dword 20 of the buffer at
+    /// the table at s0) once for the wave, then each takes the counter plus
+    /// the count of active lanes below it as its index: an exclusive prefix
+    /// sum of 1 (row_shr 1, 2, 4, 8; the upper row adds lane 15 with
+    /// `v_permlanex16` fi:1 under EXEC 0xffff0000; less the lane's own 1).
+    const APPEND_WAVE32: [u32; 42] = [
+        0xBE94_0300, // s_mov_b32 s20, s0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xF408_020A,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[20:21], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0001, // v_cmp_gt_u32_e32 vcc_lo, s1, v0
+        0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+        0x7E14_0281, // v_mov_b32_e32 v10, 1
+        0x7E16_0294, // v_mov_b32_e32 v11, 20
+        0xE0C8_6000,
+        0x8002_0A0B, // buffer_atomic_add v10, v11, s[8:11], 0 idxen glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2E_050A, // v_readfirstlane_b32 s23, v10
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001,
+        0x0009_0280, // v_cndmask_b32_e64 v1, 0, 1, s2
+        0x7E18_0301, // v_mov_b32_e32 v12, v1
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4 row_mask:0xf bank_mask:0xf
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8 row_mask:0xf bank_mask:0xf
+        0xBEFE_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xD778_0802,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1 op_sel:[1,0]
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0x4C06_1901, // v_sub_nc_u32_e32 v3, v1, v12
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0x4A06_0617, // v_add_nc_u32_e32 v3, s23, v3
+        0x7E08_0D00, // v_cvt_f32_u32_e32 v4, v0
+        0x7E0A_0304, // v_mov_b32_e32 v5, v4
+        0x7E0C_0304, // v_mov_b32_e32 v6, v4
+        0x7E0E_0304, // v_mov_b32_e32 v7, v4
+        0xE01C_2000,
+        0x8002_0403, // buffer_store_format_xyzw v[4:7], v3, s[8:11], 0 idxen
+        0x887E_167E, // s_or_b32 exec_lo, exec_lo, s22
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn an_append_indexed_by_a_whole_wave_prefix_count() {
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&APPEND_WAVE32, layout, used).unwrap();
+        assert!(l.wave_ops);
+    }
+
     #[test]
     fn constants_loaded_from_a_root_view() {
         // Two dwords at byte 0x10 of the memory of a root descriptor (in
@@ -12865,9 +13123,9 @@ mod tests {
     #[test]
     fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
         // A root descriptor's address (s[0:1]) advanced in a loop and read
-        // through: its address is no value the translation has, so the
-        // offset from it is unknown.
-        let words = [
+        // through, and compared with what is read there: its address is no
+        // value the translation has, so the offset from it is unknown.
+        let mut words = [
             0xBE82_0300, // s_mov_b32 s2, s0
             0xBE83_0301, // s_mov_b32 s3, s1
             0xF400_0101,
@@ -12878,6 +13136,11 @@ mod tests {
             0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
             S_ENDPGM,
         ];
+        // Only added to and read at, the address is never seen: the offset
+        // from it is the pointer as if the address were 0.
+        lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![]).unwrap();
+        assert_eq!(words[6], 0xBF06_8004);
+        words[6] = 0xBF06_0204; // s_cmp_eq_u32 s4, s2
         let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
             .err()
             .unwrap();
