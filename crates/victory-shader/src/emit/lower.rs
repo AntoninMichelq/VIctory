@@ -4853,6 +4853,13 @@ impl<'a> Lower<'a> {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                     let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
                     let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    // DXIL's division may be off by an ulp (65535 / 65535 =
+                    // 0.99999994 on AMD); the format gives exactly 1.0 for
+                    // the largest value, which an f16 conversion keeps.
+                    let top = self.s.m.i32(((1u64 << w) - 1) as u32);
+                    let full = self.s.m.cmp(c, pred::EQ, field, top);
+                    let one = self.s.m.f32(1.0f32.to_bits());
+                    let q = self.s.m.select(c, full, one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {

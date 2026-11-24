@@ -231,7 +231,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let depth = resource(&depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     let readback = resource(&buffer_desc, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     let dsv = host.dsv(&depth, None);
-    let bind = || {
+    let bind = |l: &ID3D12GraphicsCommandList| {
         // SAFETY: an open list and the live depth buffer's descriptor.
         unsafe { l.OMSetRenderTargets(0, None, false, Some(&dsv)) };
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pso);
@@ -242,23 +242,27 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
             list, 1, &D3D12_VIEWPORT { Width: 4.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() },
         );
     };
-    let submit = || {
+    let submit = |commands: &crate::host::HostList| {
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        host.execute(&[&commands]);
+        host.execute(&[commands]);
     };
     // SAFETY: the list is open; the depth buffer is in DEPTH_WRITE.
     unsafe { l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None) };
-    bind();
+    bind(l);
     draw_pixel(0); // Default bounds on a fresh list.
     bounds(list, 0.0, 0.25);
     draw_pixel(1); // Excludes the stored depth, includes the triangle depth.
     bounds(list, 0.5, 0.75);
     draw_pixel(2); // Includes the stored depth, excludes the triangle depth.
     bounds(list, 0.0, 0.25);
-    submit();
+    submit(&commands);
 
     assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
-    bind();
+    // Resetting a list whose host list is still referenced (here by
+    // `commands`) records on into a fresh host list.
+    let commands = crate::list::host_list(list).unwrap();
+    let l = &commands.list;
+    bind(l);
     draw_pixel(3); // Reset restores the default bounds.
     let mut from = D3D12_TEXTURE_COPY_LOCATION {
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -287,7 +291,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         l.ResourceBarrier(&[crate::host::transition(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
     }
-    submit();
+    submit(&commands);
     let mut mapped = std::ptr::null_mut();
     // SAFETY: the GPU copy finished and the readback buffer holds at least four floats.
     let actual = unsafe {
