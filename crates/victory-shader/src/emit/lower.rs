@@ -6229,6 +6229,9 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            Source::Phi { block, args } if sampler && constant_leaves(src) => {
+                self.constant_sampler_phi(site, *block, args, props, 8)
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6260,6 +6263,50 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// A sampler the code builds from constants on each path to a join (an
+    /// address mode chosen by a uniform branch): each predecessor makes the
+    /// handle of its static sampler at its end, and the join picks one. One
+    /// constant on every path is that sampler alone.
+    fn constant_sampler_phi(
+        &mut self,
+        site: Site,
+        block: usize,
+        args: &[Source],
+        props: (u32, u32),
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a sampler chosen by control flow";
+        let leaves: Vec<Source> = args.iter().flat_map(|a| a.leaves()).cloned().collect();
+        if let Some(one) = leaves.first()
+            && leaves.iter().all(|l| l == one)
+        {
+            return self.handle(site, one, true, props);
+        }
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let here = std::mem::replace(&mut self.cur, at);
+            let h = match arg {
+                Source::Constant(_) => self.handle(site, arg, true, props),
+                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
+                    self.constant_sampler_phi(site, *inner, inner_args, props, depth - 1)
+                }
+                _ => Err(WHY),
+            };
+            self.cur = here;
+            incoming.push((h?, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.handle);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -11683,4 +11730,9 @@ mod tests {
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
+}
+
+/// Whether every descriptor a choice of descriptors joins is built from constants.
+fn constant_leaves(src: &Source) -> bool {
+    src.leaves().iter().all(|l| matches!(l, Source::Constant(_)))
 }
