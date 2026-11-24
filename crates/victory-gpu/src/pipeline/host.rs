@@ -519,7 +519,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        // Root SRVs become one-descriptor tables: a root view has no
+        // Root SRVs and UAVs become one-descriptor tables: a root view has no
         // bounds, and a shader reading past its title buffer faults the
         // device (D13f: a mesh draw read 32 MB past a 3.5 MB root view).
         // The shader's binding (register, space) is the same either way.
@@ -529,7 +529,8 @@ impl HostPipeline {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| {
-                    p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV
+                    (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV
+                        || p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV)
                         // SAFETY: a root descriptor parameter.
                         && unsafe { p.Anonymous.Descriptor.RegisterSpace } == ROOT_CBV_SPACE
                 })
@@ -541,7 +542,11 @@ impl HostPipeline {
         let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = srv_params
             .iter()
             .map(|&i| D3D12_DESCRIPTOR_RANGE1 {
-                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                RangeType: if params[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                    D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                } else {
+                    D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                },
                 NumDescriptors: 1,
                 // SAFETY: a root descriptor parameter.
                 BaseShaderRegister: unsafe { params[i].Anonymous.Descriptor.ShaderRegister },
@@ -881,8 +886,8 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
 /// Adds or reuses a root view parameter for `(kind, slot)`, widening its
 /// visibility to `ALL` when shared across multiple shader stages so shared
 /// root descriptors do not consume extra root signature dwords.
-/// Whether root SRVs are bound as bounds-checked one-descriptor tables
-/// (default); `VICTORY_ROOT_SRV_VIEWS=1` keeps plain root views.
+/// Whether root SRVs and UAVs are bound as bounds-checked one-descriptor
+/// tables (default); `VICTORY_ROOT_SRV_VIEWS=1` keeps plain root views.
 pub(crate) fn root_srv_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

@@ -550,6 +550,37 @@ impl HostHeap {
         };
     }
 
+    /// As [`Self::raw_srv_at`], a raw UAV: a title root UAV made a
+    /// one-descriptor table, so accesses past the title buffer are
+    /// dropped (writes) or return zero (reads) instead of faulting.
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, elements: u32) {
+        self.keep(index, Some(buffer.clone()));
+        self.set_stride(index, 0);
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer (the slot holds it).
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+    }
+
     /// Slot `index` as a null raw buffer SRV: reads return 0.
     pub(crate) fn null_raw_srv_at(&self, index: u32) {
         self.keep(index, None);

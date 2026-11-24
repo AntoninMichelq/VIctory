@@ -466,13 +466,15 @@ impl State {
     }
 
     /// The bound heap holding `handle`.
-    /// A title root shader view as a one-descriptor table in the bound
-    /// view heap: a raw view to the end of the title buffer, so reads past
-    /// it return zero (a root view reads whatever host memory is there).
+    /// A title root shader view (`uav`: unordered access view) as a
+    /// one-descriptor table in the bound view heap: a raw view to the end
+    /// of the title buffer, so reads past it return zero and writes past it
+    /// are dropped (a root view reaches whatever host memory is there).
     fn root_srv_table(
         &mut self,
         list: &HostList,
         address: u64,
+        uav: bool,
     ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         if address == 0 {
             return None;
@@ -493,24 +495,34 @@ impl State {
         // SAFETY: a live buffer.
         let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
         let elements = u32::try_from(len / 4).ok()?;
+        // The top bit of the length tells a UAV from an SRV of the same range.
         let key = (
             std::ptr::from_ref(heap) as usize,
             shadow.buffer.as_raw() as usize,
             address,
-            len,
+            len | u64::from(uav) << 63,
         );
         let first = match self.root_srv_slots.get(&key) {
             Some(&first) => first,
             None => {
                 let first = host.dynamic(1)?;
                 self.dynamic.push((key.0, first, 1));
-                host.raw_srv_at(first, &shadow.buffer, (gpu - base) / 4, elements);
+                if uav {
+                    host.raw_uav_at(first, &shadow.buffer, (gpu - base) / 4, elements);
+                } else {
+                    host.raw_srv_at(first, &shadow.buffer, (gpu - base) / 4, elements);
+                }
                 self.root_srv_slots.insert(key, first);
                 first
             }
         };
         shadow.refresh(list, address, len);
-        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+        if uav {
+            shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+        }
         Some(host.gpu_handle(first))
     }
 
@@ -764,12 +776,12 @@ impl State {
                         };
                         *address
                     };
-                    if kind == RootView::Srv && crate::pipeline::host::root_srv_tables() {
+                    if kind != RootView::Cbv && crate::pipeline::host::root_srv_tables() {
                         let table = if pointer && address == 0 {
                             // A null address the program tests before reading.
                             self.null_srv_table()
                         } else {
-                            self.root_srv_table(list, address)
+                            self.root_srv_table(list, address, kind == RootView::Uav)
                         };
                         let Some(table) = table else {
                             once!(
