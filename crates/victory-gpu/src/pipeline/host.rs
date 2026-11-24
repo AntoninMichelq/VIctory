@@ -590,13 +590,46 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
-            let made = super::library::pipeline(
-                &name,
+            // A slow compute kept as the driver's own binary by an earlier
+            // run: created from it (the driver refuses a stale one).
+            let from_blob = super::library::cached_blob(&name).and_then(|blob| {
+                let started = std::time::Instant::now();
+                let with = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    CachedPSO: D3D12_CACHED_PIPELINE_STATE {
+                        pCachedBlob: blob.as_ptr().cast(),
+                        CachedBlobSizeInBytes: blob.len(),
+                    },
+                    // SAFETY: a borrowed pointer the description never releases.
+                    pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                    CS: code(0),
+                    ..Default::default()
+                };
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
-                // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
-            );
+                let made = unsafe { host.device.CreateComputePipelineState(&with) };
+                tracing::info!(
+                    ?shaders,
+                    ms = started.elapsed().as_millis() as u64,
+                    ok = made.is_ok(),
+                    "compute pipeline from its kept driver binary"
+                );
+                made.ok()
+            });
+            let started = std::time::Instant::now();
+            let made = match from_blob {
+                Some(pso) => Ok(pso),
+                None => super::library::pipeline(
+                    &name,
+                    // SAFETY: the description points at live data.
+                    |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                    // SAFETY: as above.
+                    || unsafe { host.device.CreateComputePipelineState(&desc) },
+                ),
+            };
+            if let Ok(pso) = &made
+                && started.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                super::library::keep_blob(&name, pso);
+            }
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
