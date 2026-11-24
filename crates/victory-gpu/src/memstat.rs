@@ -57,6 +57,7 @@ pub fn report() -> String {
             mib(crate::texture::staged_bytes()),
             mib(crate::shadow::pool_bytes()),
         );
+        let _ = write!(line, ", {}", crate::shadow::loose_eviction());
         if let Some([local, system]) = crate::host::video_memory() {
             let _ = write!(
                 line,
