@@ -6466,6 +6466,15 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            Source::Phi { .. } | Source::Select { .. }
+                if sampler && src.leaves().iter().all(|l| matches!(l, Source::Constant(_))) =>
+            {
+                // shortcut: immediate samplers a uniform branch picks between
+                // (address modes per path) would need a dynamically indexed
+                // range of static samplers: the first one serves every path.
+                let first = src.leaves()[0].clone();
+                self.handle(site, &first, sampler, props)
+            }
             Source::Phi { .. } | Source::Select { .. } => {
                 // A uniform choice: each predecessor computes its heap
                 // index at its end (a condition picks between two), and
