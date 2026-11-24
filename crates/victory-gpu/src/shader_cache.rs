@@ -68,6 +68,10 @@ fn build() -> &'static [u8; 32] {
         h.update(&limit.to_le_bytes());
         h.update(&spin.to_le_bytes());
         h.update(&[u8::from(victory_shader::emit::root_uavs())]);
+        if let Some(list) = victory_shader::emit::root_uavs_only() {
+            h.update(b"root uavs only:");
+            h.update(list.as_bytes());
+        }
         h.update(&[u8::from(victory_shader::emit::pointer_views())]);
         h.update(&[u8::from(victory_shader::emit::pointer_chase())]);
         h.update(&[u8::from(victory_shader::emit::fold_branches())]);
@@ -92,7 +96,10 @@ pub fn cache_key(target: Target) -> [u8; 32] {
 
 /// The translation the runtime makes of a container (and keeps).
 fn translate_for(target: Target) -> impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync {
-    move |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string())
+    move |c: &[u8]| {
+        let hash = blake3::hash(c).to_hex();
+        victory_shader::emit::translate_named(c, target, &hash[..16]).map_err(|e| e.to_string())
+    }
 }
 
 /// The translation of a console shader container for a host that runs

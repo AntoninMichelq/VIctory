@@ -177,6 +177,10 @@ pub fn merge_repeats() -> bool {
 /// translation, so the shader cache keys on it.
 pub fn root_uavs() -> bool {
     use std::sync::atomic::Ordering;
+    if root_uavs_only().is_some() && ROOT_UAVS.load(Ordering::Relaxed) == 0 {
+        // Only the listed shaders: the one being translated decides.
+        return ONLY_THIS.with(std::cell::Cell::get);
+    }
     match ROOT_UAVS.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
@@ -192,6 +196,34 @@ pub fn root_uavs() -> bool {
             ROOT_UAVS.load(Ordering::Relaxed) == 2
         }
     }
+}
+
+/// `VICTORY_ROOT_UAVS_ONLY=<hash>,<hash>,...`: root UAVs only for the
+/// shaders whose container hash (16 hex digits, as the log names them) is
+/// listed, whatever `VICTORY_ROOT_UAVS` says; every other shader stops at
+/// "a typed root view" as with root UAVs off. To bisect which root-UAV
+/// writer breaks the title, or to run only the passes known to be safe.
+/// Part of the translation, so the shader cache keys on it (sorted).
+pub fn root_uavs_only() -> Option<&'static str> {
+    static LIST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let v = std::env::var("VICTORY_ROOT_UAVS_ONLY").ok()?;
+        let mut hashes: Vec<String> = v
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        Some(hashes.join(","))
+    })
+    .as_deref()
+}
+
+thread_local! {
+    /// Whether the shader this thread is translating is listed in
+    /// [`root_uavs_only`].
+    static ONLY_THIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`root_uavs`]: 0 not read yet, 1 off, 2 on.
@@ -368,6 +400,25 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
+    translate_inner(container, target)
+}
+
+/// [`translate_for`] for the shader `hash` names (16 hex digits of its
+/// container's BLAKE3, as the runtime logs it): with
+/// [`root_uavs_only`], it gets root UAVs only if listed.
+pub fn translate_named(
+    container: &[u8],
+    target: Target,
+    hash: &str,
+) -> Result<HostShader, ShaderError> {
+    let listed = root_uavs_only().is_some_and(|list| list.split(',').any(|h| h == hash));
+    ONLY_THIS.with(|c| c.set(listed));
+    let out = translate_inner(container, target);
+    ONLY_THIS.with(|c| c.set(false));
+    out
+}
+
+fn translate_inner(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
