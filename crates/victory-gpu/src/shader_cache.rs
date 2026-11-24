@@ -1,7 +1,7 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (the BLAKE3 of victory-shader's source, see
+//! [`build`]), so a changed translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -36,14 +36,16 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop and spin-wait limits,
-/// which `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT`
-/// change at run time).
+/// What identifies the translation: the translator's source
+/// ([`victory_shader::SOURCE_HASH`]), this file's source (the entry
+/// encoding), and the translation settings it runs with (the loop and
+/// spin-wait limits, which `VICTORY_SHADER_LOOP_LIMIT` and
+/// `VICTORY_SHADER_SPIN_LIMIT` change at run time). Not the executable: a
+/// rebuild that leaves the translator alone keeps every cached shader.
+/// `VICTORY_SHADER_CACHE_KEY=exe` keys on the executable as before.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -58,22 +60,34 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.push(u8::from(victory_shader::emit::root_uavs()));
-                bytes.extend_from_slice(&spin.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
+        let mut h = blake3::Hasher::new();
+        if std::env::var("VICTORY_SHADER_CACHE_KEY").is_ok_and(|v| v.trim() == "exe") {
+            match std::env::current_exe().and_then(std::fs::read) {
+                Ok(bytes) => {
+                    h.update(&bytes);
+                }
+                Err(e) => {
+                    // Without it no entry can be trusted: a fresh key per run.
+                    tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    h.update(&now.as_nanos().to_le_bytes());
+                }
             }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
+        } else {
+            h.update(b"victory shader cache v2\0");
+            h.update(victory_shader::SOURCE_HASH.as_bytes());
+            h.update(include_str!("shader_cache.rs").as_bytes());
+            tracing::info!(
+                translator = &victory_shader::SOURCE_HASH[..12],
+                "shader cache keyed on the translator's source"
+            );
         }
+        h.update(&limit.to_le_bytes());
+        h.update(&spin.to_le_bytes());
+        h.update(&[u8::from(victory_shader::emit::root_uavs())]);
+        *h.finalize().as_bytes()
     })
 }
 
