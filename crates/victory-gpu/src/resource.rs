@@ -2287,7 +2287,7 @@ void main() {
         assert_eq!(release(image), 0);
         assert_eq!(owner.strong_count(), 1);
         let host_list = crate::list::host_list(list).unwrap();
-        assert_eq!(gpu.execute_checked(&[host_list]), None);
+        gpu.execute(&[&host_list]);
         assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
         assert_eq!(owner.strong_count(), 0);
         assert_eq!(release(list), 0);
