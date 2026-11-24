@@ -190,6 +190,23 @@ fn make() -> windows::core::Result<Expand> {
     }
 }
 
+/// Buffers of ours the GPU may still read, with the frame presented when
+/// they were made. A list's own keep was not enough (a page fault inside a
+/// freed records buffer while the world ran), so they are also held here
+/// until 8 frames later, when every submission that named them has run.
+#[allow(clippy::type_complexity)]
+static HELD: std::sync::Mutex<std::collections::VecDeque<(u64, ID3D12Resource)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn hold(buffer: &ID3D12Resource) {
+    let now = crate::queue::presented();
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    while held.front().is_some_and(|&(at, _)| at + 8 < now) {
+        held.pop_front();
+    }
+    held.push_back((now, buffer.clone()));
+}
+
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -252,6 +269,7 @@ pub(crate) fn vertices(
     let (buffer, _) = host.shared_buffer(size).ok_or("no expansion buffer")?;
     crate::host::name(&buffer, || format!("rectangles {size:#x}"));
     list.keep(&buffer);
+    hold(&buffer);
     // SAFETY: a live buffer.
     let to = unsafe { buffer.GetGPUVirtualAddress() };
     let mut constants = [0u32; 16];
@@ -294,6 +312,7 @@ pub(crate) fn records(
     let (buffer, _) = host.shared_buffer(size).ok_or("no records buffer")?;
     crate::host::name(&buffer, || format!("rectangle records {size:#x}"));
     list.keep(&buffer);
+    hold(&buffer);
     // SAFETY: a live buffer.
     let to = unsafe { buffer.GetGPUVirtualAddress() };
     // SAFETY: an open list and live buffers.
