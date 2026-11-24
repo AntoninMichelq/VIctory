@@ -2484,11 +2484,11 @@ pub(crate) mod tests {
         assert_eq!((a.param, a.offset, a.includes_base), (1, 0, true));
         // v8 and v9 as the program starts.
         assert_eq!(r.pointer_unset.len(), 2);
-        assert!(
-            r.pointer_unset
+        assert!(r.pointer_unset.iter().all(|u| {
+            p.inputs
                 .iter()
-                .all(|u| p.inputs.iter().any(|i| i.1 == *u && matches!(i.0, Reg::V(8 | 9))))
-        );
+                .any(|i| i.1 == *u && matches!(i.0, Reg::V(8 | 9)))
+        }));
         // The descriptor's address is only added to and loaded at.
         assert_eq!(r.address_only, [1]);
         // Written to LDS as data, it is seen.
