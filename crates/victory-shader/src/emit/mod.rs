@@ -101,6 +101,7 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod scratch_tests;
 mod shader;
+mod spin;
 #[cfg(all(test, windows))]
 mod split_tests;
 mod threading;
@@ -137,9 +138,35 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// The spin-wait limit without an override: 4096.
+pub const DEFAULT_SPIN_LIMIT: u32 = 1 << 12;
+
+/// The iteration count after which a loop that only waits for memory to
+/// change (a spin wait, see `spin.rs`) is left: [`DEFAULT_SPIN_LIMIT`], or
+/// `VICTORY_SHADER_SPIN_LIMIT` (decimal or `0x` hex, at least 1), never
+/// more than [`loop_limit`]. On the console the write such a loop waits
+/// for comes within microseconds; on the host, when it never comes (the
+/// writer's view is another host resource, null, or the load was hoisted),
+/// 2^20 uncached reads per lane cost about a second per wave, which is
+/// what world frames spent per host submission. 4096 reads are a few
+/// milliseconds. Part of the translation: the shader cache keys on it.
+pub fn spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_SPIN_LIMIT").ok();
+        parse_limit(v.as_deref(), DEFAULT_SPIN_LIMIT).min(loop_limit())
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit(value, lower::LOOP_LIMIT)
+}
+
+/// A limit's value from its variable; `default` when it is unset,
+/// unreadable or 0.
+fn parse_limit(value: Option<&str>, default: u32) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
@@ -148,7 +175,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         });
     match parsed {
         Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        _ => default,
     }
 }
 

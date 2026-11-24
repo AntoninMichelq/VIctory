@@ -107,6 +107,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Back edges that count against the spin-wait limit.
+    #[cfg(test)]
+    pub spin_loops: usize,
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
@@ -578,6 +581,12 @@ struct Lower<'a> {
     finals: HashMap<Value, (Val, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Headers of loops that only wait for memory to change: they stop
+    /// at [`super::spin_limit`] instead.
+    spin: HashSet<usize>,
+    /// Back edges given the spin-wait limit.
+    #[cfg(test)]
+    spun: usize,
     /// Per-lane descriptor joins being lowered: IR block and the heap index
     /// phi there (what [`Source::Carried`] reads).
     lane_paths: Vec<(usize, V)>,
@@ -1278,6 +1287,9 @@ impl<'a> Lower<'a> {
             loop_bodies: HashMap::new(),
             finals: HashMap::new(),
             abort: None,
+            spin: HashSet::new(),
+            #[cfg(test)]
+            spun: 0,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
             dead,
@@ -1828,6 +1840,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
+            spin_loops: self.spun,
+            #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
             stride_table,
             dxil: self.s.finish(),
@@ -1869,7 +1883,8 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less).
+        self.spin = super::spin::spin_loops(p);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -11317,7 +11332,16 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = if self.spin.contains(&to) {
+            #[cfg(test)]
+            {
+                self.spun += 1;
+            }
+            super::spin_limit()
+        } else {
+            super::loop_limit()
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
