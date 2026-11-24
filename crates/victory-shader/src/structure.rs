@@ -823,7 +823,133 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
-        Some((self.b.atom(Atom::Phi(id), born), derived))
+        let m = self.b.atom(Atom::Phi(id), born);
+        // A uniform bool on some edges and data on the others is no mask.
+        if derived && self.bool_or_data(&args, k) {
+            return Some((m, false));
+        }
+        Some((m, derived))
+    }
+
+    /// Whether a join with these arguments holds a uniform bool or data,
+    /// no mask: on some edge a scalar load or a scalar operation that
+    /// makes no mask wrote the register (data), on every other edge an
+    /// `s_cselect` of -1 or EXEC and 0 (a uniform bool, set in every lane
+    /// or none of those that run), and EXEC is not made from the joined
+    /// value (a register that becomes EXEC is a mask, as before).
+    fn bool_or_data(&self, args: &[Key], k: Key) -> bool {
+        let data = |v: Value| self.data(v);
+        let uniform_bool = |v: Value| {
+            let Some(&(b, i)) = self.defs.get(&v) else {
+                return false;
+            };
+            let inst = &self.p.blocks[b].insts[i];
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return false;
+            };
+            inst.name().starts_with("s_cselect_b")
+                && src.len() == 2
+                && src.iter().all(|o| match *o {
+                    // 0 and -1.
+                    Operand::Const(128 | 193) => true,
+                    Operand::Scalar { code, .. } => code == EXEC || code == EXEC + 1,
+                    _ => false,
+                })
+        };
+        let is_data = |a: &Key| data(a.0) && !uniform_bool(a.0) || data(a.1) && !uniform_bool(a.1);
+        if !args.iter().any(is_data)
+            || !args
+                .iter()
+                .all(|a| is_data(a) || uniform_bool(a.0) && uniform_bool(a.1))
+        {
+            return false;
+        }
+        let exec = self.exec_sources();
+        !exec.contains(&k.0) && !exec.contains(&k.1)
+    }
+
+    /// The SGPR values EXEC is made from: those an instruction writing EXEC
+    /// reads, and, through scalar operations and joins, what they are made
+    /// from.
+    fn exec_sources(&self) -> HashSet<Value> {
+        let mut todo: Vec<Value> = self
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some())
+            .flat_map(|i| {
+                i.reads
+                    .iter()
+                    .filter(|r| matches!(r.0, Reg::S(_)))
+                    .map(|r| r.1)
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some(v) = todo.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if let Some(&(b, i)) = self.phis.get(&v) {
+                todo.extend(self.p.blocks[b].phis[i].args.iter().copied());
+            } else if let Some(&(b, i)) = self.defs.get(&v) {
+                let inst = &self.p.blocks[b].insts[i];
+                if matches!(inst.fields, Fields::Sop { .. }) {
+                    todo.extend(
+                        inst.reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::S(_)))
+                            .map(|r| r.1),
+                    );
+                }
+            }
+        }
+        seen
+    }
+
+    /// Whether a scalar load (`s_load`, `s_buffer_load`) or a scalar
+    /// operation that makes no mask (an addition, a shift) wrote `v`.
+    fn data(&self, v: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&v) else {
+            return false;
+        };
+        let inst = &self.p.blocks[b].insts[i];
+        match &inst.fields {
+            Fields::Smem { .. } => inst.name().contains("_load_"),
+            Fields::Sop { .. } => {
+                let width = if self.p.wave64 { "_b64" } else { "_b32" };
+                let Some(op) = inst
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|n| n.strip_suffix(width))
+                else {
+                    return true;
+                };
+                let base = op
+                    .strip_suffix("_saveexec")
+                    .or_else(|| op.strip_suffix("_wrexec"))
+                    .unwrap_or(op);
+                !matches!(
+                    base,
+                    "and"
+                        | "or"
+                        | "xor"
+                        | "andn1"
+                        | "andn2"
+                        | "orn1"
+                        | "orn2"
+                        | "nand"
+                        | "nor"
+                        | "xnor"
+                        | "not"
+                        | "mov"
+                        | "cmov"
+                        | "cselect"
+                        | "wqm"
+                )
+            }
+            _ => false,
+        }
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {

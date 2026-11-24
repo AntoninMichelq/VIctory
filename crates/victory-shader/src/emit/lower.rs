@@ -672,6 +672,23 @@ fn mask_set_op(name: &str) -> bool {
     )
 }
 
+/// Set operations ([`mask_set_op`]), and `s_cselect` of EXEC, -1 and 0 (a
+/// uniform bool): its number is that of the source SCC picks.
+fn mask_number_op(inst: &Inst) -> bool {
+    let uniform_bool = || {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        src.len() == 2
+            && src.iter().all(|o| match *o {
+                Operand::Const(128 | 193) => true,
+                Operand::Scalar { code, .. } => code == EXEC || code == EXEC + 1,
+                _ => false,
+            })
+    };
+    mask_set_op(inst.name()) || inst.name().starts_with("s_cselect_b") && uniform_bool()
+}
+
 /// Samples whose level comes from derivatives across each quad of lanes.
 fn implicit_derivatives(name: &str) -> bool {
     sample_form(name).is_some_and(|f| !f.gather && !f.c && !f.d && !f.l && !f.lz)
@@ -715,7 +732,7 @@ fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
             }
             for i in &b.insts {
                 if matches!(i.fields, Fields::Sop { .. })
-                    && mask_set_op(i.name())
+                    && mask_number_op(i)
                     && i.writes.iter().any(|w| out.contains(&w.1))
                 {
                     let read = i.reads.iter().filter(|r| matches!(r.0, Reg::S(_)));
@@ -4485,7 +4502,7 @@ impl<'a> Lower<'a> {
         // exit mask gathers lanes that left in earlier iterations. Only the
         // masks something reads as numbers get one.
         let number = self.mask_ok
-            && mask_set_op(name)
+            && mask_number_op(inst)
             && inst.writes.iter().any(|w| self.mask_numbers.contains(&w.1));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !number {
             return Err(LANE_MASK);
@@ -12169,16 +12186,24 @@ mod tests {
     /// The DXIL of a pixel shader that exports `body`'s v2, computed from
     /// a per-lane value in v3.
     fn lower_ps(body: [u32; 2]) -> Result<Vec<u8>, ShaderError> {
-        let words = [
-            // v_mbcnt_lo_u32_b32 v3, -1, 0
-            vop3(0x365, 0, 3, 193, 128)[0],
-            vop3(0x365, 0, 3, 193, 128)[1],
-            body[0],
-            body[1],
-            0xF800_180F, // exp mrt0, v2, v2, v2, v2 done vm
-            0x0202_0202,
-            0xBF81_0000, // s_endpgm
-        ];
+        lower_ps_words(
+            1,
+            &[
+                // v_mbcnt_lo_u32_b32 v3, -1, 0
+                vop3(0x365, 0, 3, 193, 128)[0],
+                vop3(0x365, 0, 3, 193, 128)[1],
+                body[0],
+                body[1],
+                0xF800_180F, // exp mrt0, v2, v2, v2, v2 done vm
+                0x0202_0202,
+                0xBF81_0000, // s_endpgm
+            ],
+        )
+    }
+
+    /// Lowers the wave32 pixel program `words`, which writes SV_Target0 to
+    /// SV_Target`targets - 1`.
+    fn lower_ps_words(targets: u8, words: &[u32]) -> Result<Vec<u8>, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = ir::build(&code, false, 256)?;
         let native = NativeProgram {
@@ -12198,13 +12223,13 @@ mod tests {
         let io = io::raise(&p, &native)?;
         let res = resource::track(&p, &native.layout, native.stage)?;
         let st = structure::structure(&p)?;
-        let target = SigElement {
+        let target = |n: u8| SigElement {
             name: "SV_Target".into(),
-            index: 0,
+            index: n.into(),
             kind: 16,
             comp: 9,
             interp: 0,
-            row: Some(0),
+            row: Some(n.into()),
             col: 0,
             cols: 4,
             usage: 15,
@@ -12217,7 +12242,7 @@ mod tests {
             io: &io,
             res: &res,
             inputs: vec![],
-            outputs: vec![target],
+            outputs: (0..targets).map(target).collect(),
             prims: vec![],
             mesh_stride: 0,
             target: crate::emit::Target::ANY,
@@ -12226,6 +12251,64 @@ mod tests {
             per_lane_only: false,
         };
         lower(&parts).map(|l| l.dxil)
+    }
+
+    /// A pixel program whose s4 joins a scalar sum (data) and a uniform
+    /// `s_cselect` -1/0, and exports it converted to float: s4 is read as
+    /// a number at the join, and the export after it is unconditional.
+    const PS_EXPORT_OF_A_DATA_AND_BOOL_JOIN: [u32; 11] = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0x7E0A_0503, // v_readfirstlane_b32 s5, v3
+        0x8004_8505, // s_add_u32 s4, s5, 5
+        0xBF06_8804, // s_cmp_eq_u32 s4, 8
+        0xBF85_0001, // s_cbranch_scc1 1
+        0x8504_80C1, // s_cselect_b32 s4, -1, 0
+        0x7E04_0A04, // v_cvt_f32_i32_e32 v2, s4
+        0xF800_180F,
+        0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn an_export_of_a_data_and_bool_join_lowers() {
+        lower_ps_words(1, &PS_EXPORT_OF_A_DATA_AND_BOOL_JOIN).unwrap();
+    }
+
+    /// As [`PS_EXPORT_OF_A_DATA_AND_BOOL_JOIN`], but s4 joins `s_cselect`
+    /// exec/0 and then becomes EXEC (`s_and_saveexec`) around a VALU write
+    /// before the export. A register EXEC is made from stays a lane mask at
+    /// the join: the rule that takes such a join as data does not apply, so
+    /// EXEC is not lost, and the export is not taken as a conditional one.
+    const PS_EXEC_FROM_A_DATA_AND_MASK_JOIN: [u32; 14] = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0x7E0A_0503, // v_readfirstlane_b32 s5, v3
+        0x8004_8505, // s_add_u32 s4, s5, 5
+        0x7E04_0280, // v_mov_b32_e32 v2, 0
+        0xBF06_8804, // s_cmp_eq_u32 s4, 8
+        0xBF85_0001, // s_cbranch_scc1 1
+        0x8504_807E, // s_cselect_b32 s4, exec_lo, 0
+        0xBE86_3C04, // s_and_saveexec_b32 s6, s4
+        0x7E04_0D03, // v_cvt_f32_u32_e32 v2, v3
+        0x887E_067E, // s_or_b32 exec_lo, exec_lo, s6
+        0xF800_180F,
+        0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn exec_from_a_data_and_mask_join_makes_no_conditional_export() {
+        let mut through_a_copy = PS_EXEC_FROM_A_DATA_AND_MASK_JOIN.to_vec();
+        // s_mov_b32 s7, s4; s_and_saveexec_b32 s6, s7
+        through_a_copy.splice(8..9, [0xBE87_0304, 0xBE86_3C07]);
+        for words in [&PS_EXEC_FROM_A_DATA_AND_MASK_JOIN[..], &through_a_copy] {
+            let r = lower_ps_words(1, words);
+            assert!(
+                !matches!(&r, Err(e) if e.to_string().contains("a conditional export")),
+                "{r:?}"
+            );
+        }
     }
 
     #[test]
@@ -12520,6 +12603,97 @@ mod tests {
         }];
         let l = lower_with(&APPEND_WAVE32, layout, used).unwrap();
         assert!(l.wave_ops);
+    }
+
+    /// Layout of the joins below: a table at s0 (a buffer descriptor at
+    /// byte 0x960), root constants at s1 and s2.
+    fn join_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+        (
+            vec![
+                root(RootType::Table, 0, 0),
+                root(RootType::Constants, 1, 1),
+                root(RootType::Constants, 2, 2),
+            ],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_register_joining_loaded_data_and_a_uniform_mask_is_data() {
+        // Assembled with llvm-mc (gfx1030, wave32): s11 holds dword 3 of a
+        // descriptor, unless a root constant (s1) is not negative: then a
+        // record is loaded through it and s11 becomes EXEC or 0 (a uniform
+        // bool), selected into v1. At the join s11 is read as data.
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_020A,
+            0xFA00_0960, // s_load_dwordx4 s[8:11], s[20:21], 0x960
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0280, // v_mov_b32_e32 v1, 0
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0008, // s_cbranch_scc1 -> 0x44
+            0xF428_0304,
+            0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[8:11], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8810_0E0C, // s_or_b32 s16, s12, s14
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0x850B_807E, // s_cselect_b32 s11, exec_lo, 0
+            0xD501_0001,
+            0x002D_8280, // v_cndmask_b32_e64 v1, 0, -1, s11
+            0xBF82_0000, // s_branch -> 0x44
+            0x7D84_02C1, // 0x44: v_cmp_eq_u32_e32 vcc_lo, -1, v1
+            0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0005, // s_cbranch_vccnz -> s_endpgm
+            0xBF06_800B, // s_cmp_eq_u32 s11, 0
+            0x8511_8281, // s_cselect_b32 s17, 1, 2
+            0x7E04_0211, // v_mov_b32_e32 v2, s17
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let (layout, used) = join_layout();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_select_by_a_register_joining_loaded_data_and_a_mask() {
+        // As above, the select made after the join, from the joined s11.
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_020A,
+            0xFA00_0960, // s_load_dwordx4 s[8:11], s[20:21], 0x960
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0006, // s_cbranch_scc1 -> 0x34
+            0xF428_0304,
+            0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[8:11], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8810_0E0C, // s_or_b32 s16, s12, s14
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0x850B_807E, // s_cselect_b32 s11, exec_lo, 0
+            0xBF82_0000, // s_branch -> 0x34
+            0xD501_0001,
+            0x002D_8280, // 0x34: v_cndmask_b32_e64 v1, 0, -1, s11
+            0x7D84_02C1, // v_cmp_eq_u32_e32 vcc_lo, -1, v1
+            0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0002, // s_cbranch_vccnz -> s_endpgm
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let (layout, used) = join_layout();
+        lower_with(&words, layout, used).unwrap();
     }
 
     #[test]
