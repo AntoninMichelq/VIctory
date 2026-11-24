@@ -12,6 +12,10 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+
+/// Why a first half of an interpolation has no value of its own: only its
+/// second half reads it (`interp`).
+const FIRST_HALF: &str = "the first half of an interpolation";
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -7038,8 +7042,16 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
+                // The half kept may be an interpolation's first half that
+                // only its second half reads (a register reused for a
+                // 16-bit result: the world's PS_DeferredTextured): its bits
+                // mean nothing, 0 here, as `low_half` does.
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => match self.i32_of(o) {
+                        Ok(x) => x,
+                        Err(FIRST_HALF) => self.s.m.i32(0),
+                        Err(why) => return Err(why),
+                    },
                     None => self.s.m.i32(0),
                 };
                 let h = self
@@ -8538,7 +8550,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
