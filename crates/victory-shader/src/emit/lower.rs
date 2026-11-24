@@ -13111,7 +13111,15 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
-                    let _ = self.lazy_barycentric(arg);
+                    // Inputs read on first use: barycentrics, and user data
+                    // (also what loads from the user-data table give) that
+                    // nothing read before the join.
+                    if let Some(&(param, dword)) = self.params.get(&arg) {
+                        let val = self.user(param, dword);
+                        self.vals.insert(arg, val);
+                    } else {
+                        let _ = self.lazy_barycentric(arg);
+                    }
                 }
                 // An edge from outside a loop takes the loop's final value.
                 let looked = match self.finals.get(&arg) {
