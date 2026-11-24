@@ -2608,6 +2608,77 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// `count` dwords a scalar load at `site` reads from a descriptor table
+    /// or the view heap at a computed offset, from the title memory they lie
+    /// in (the address from the host, `USER_TABLE_ADDRESS`); none for a load
+    /// at a fixed offset or from anything else. A heap the host placed
+    /// outside title memory reads zeros (a null descriptor).
+    fn table_words(&mut self, site: Site, count: u32) -> Result<Option<Vec<V>>, Why> {
+        use super::shader::USER_TABLE_ADDRESS;
+        let Some(a) = self.scalar.get(&site).copied() else {
+            return Ok(None);
+        };
+        let Some(value) = a.dynamic else {
+            return Ok(None);
+        };
+        let Some(&rp) = self.x.native.layout.get(a.param) else {
+            return Ok(None);
+        };
+        // dword 1: the bound view heap's first descriptor, not a table.
+        let which = match rp.root {
+            RootType::Table => 0,
+            RootType::ResourceHeap => 1,
+            _ => return Ok(None),
+        };
+        let mut d = self.i32_of(value)?;
+        let c = self.cur;
+        // A term held per lane reached the offset through `v_readfirstlane_b32`.
+        let per_lane = self.def_block.get(&value).is_some_and(|&b| {
+            let writes =
+                |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
+            self.x.p.blocks[b].insts.iter().any(writes)
+        });
+        if per_lane {
+            self.s.flags |= flags::WAVE_OPS;
+            let i32t = self.s.t.i32;
+            d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+        }
+        let lo = self.host_word(RootType::Other(USER_TABLE_ADDRESS), rp.slot, which);
+        let hi = self.host_word(RootType::Other(USER_TABLE_ADDRESS + 1), rp.slot, which);
+        let off = self.s.m.i32(a.offset);
+        let off = self.s.m.bin(c, Bin::Add, off, d);
+        let lo2 = self.s.m.bin(c, Bin::Add, lo, off);
+        let wrapped = self.s.m.cmp(c, pred::IULT, lo2, lo);
+        let i32t = self.s.t.i32;
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, one);
+        // A descriptor is 16 or 32 bytes on its size: one page holds it.
+        let (h, byte) = self.memory(lo2, hi, None);
+        let c = self.cur;
+        let res = self.s.t.res_ret;
+        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
+        let mut words = Vec::new();
+        for k0 in (0..count).step_by(4) {
+            let n = (count - k0).min(4);
+            let at = self.s.m.i32(4 * k0);
+            let at = self.s.m.bin(c, Bin::Add, byte, at);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                res,
+                139,
+                &[h, at, iu, mask, align],
+            );
+            for j in 0..n {
+                let x = self.s.m.extract(c, r, j);
+                words.push(self.as_int(x));
+            }
+        }
+        Ok(Some(words))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -5581,6 +5652,18 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
+                }
+                return Ok(());
+            }
+            // A buffer descriptor picked from a table by a computed offset and
+            // read only for its address (a ray-tracing scene's instance list:
+            // each instance's structure). The table is title memory, so its
+            // dwords are read from there as the console reads them.
+            if count <= 4
+                && let Some(words) = self.table_words(site, count)?
+            {
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
             }

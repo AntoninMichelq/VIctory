@@ -679,9 +679,27 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_MEMORY_BASE, USER_TABLE_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_TABLE_ADDRESS || kind == USER_TABLE_ADDRESS + 1 {
+            // The title address of the descriptor table the shader reads
+            // dwords of by a computed offset, through title memory.
+            let table = if dword == 1 {
+                match self.heaps[0] {
+                    0 => 0,
+                    h => crate::descriptor::heap(h as This).start,
+                }
+            } else {
+                match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::Table(table)) => table,
+                    _ => 0,
+                }
+            };
+            return if kind == USER_TABLE_ADDRESS { table as u32 } else { (table >> 32) as u32 };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
