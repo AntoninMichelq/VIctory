@@ -180,6 +180,10 @@ fn give_back(buffers: impl IntoIterator<Item = Box<[u8]>>) {
     }
 }
 
+/// A page's `copied` entry while its title memory is uncommitted and its
+/// copy holds zeros for it.
+const ZEROED: u64 = u64::MAX;
+
 const WATCH_UNKNOWN: u8 = 0;
 const WATCHED: u8 = 1;
 const NOT_WATCHED: u8 = 2;
@@ -518,12 +522,11 @@ impl Shadow {
             {
                 self.watched.store(NOT_WATCHED, Ordering::Relaxed);
             } else {
-                // Fallback can zero unreadable bytes. Ask again if a later
-                // watched request reaches any page this fallback touched.
-                let base = start / PAGE;
-                self.copied.lock().unwrap_or_else(|e| e.into_inner())
-                    [from / PAGE - base..=(to - 1) / PAGE - base]
-                    .fill(0);
+                // The range crosses memory the title has not committed (or
+                // several allocations): region by region instead of all of
+                // it every time (the world's loose windows zero-filled
+                // 4.4 GB of uncommitted memory per frame this way).
+                return self.update_by_region(from, to);
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -533,6 +536,88 @@ impl Shadow {
         }
         self.copy(from, to);
         to - from
+    }
+
+    /// [`Shadow::update_free`] of a range the write watch could not answer
+    /// for as a whole: each committed region is asked on its own (copied
+    /// whole when it is not watched either), and each uncommitted one is
+    /// zeroed in the copy once, then left alone while it stays uncommitted.
+    fn update_by_region(&self, from: usize, to: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        let start = self.start as usize;
+        let base = start / PAGE;
+        let (mut at, mut bytes) = (from, 0);
+        while at < to {
+            // SAFETY: a query of the virtual address, without reading it.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let size = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            let end = (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .min(to);
+            if size != size_of_val(&info) || end <= at {
+                // No answer: as before, all the rest copied.
+                bytes += self.copy_unwatched(at, to);
+                break;
+            }
+            let readable = info.State == MEM_COMMIT
+                && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+                && info.Protect != 0;
+            if readable {
+                bytes += match crate::watch::writes(at, end, true) {
+                    Some((now, written)) => {
+                        let copied = self.copy_stale(at, end, now, &written);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Checked, (end - at) as u64);
+                            add(C::Unchanged, (end - at).saturating_sub(copied) as u64);
+                            add(C::WatchBytes, copied as u64);
+                        }
+                        copied
+                    }
+                    None => self.copy_unwatched(at, end),
+                };
+            } else {
+                // Uncommitted: zeros in the copy. Whole pages already
+                // zeroed while uncommitted are skipped; once committed they
+                // count as never copied (see `ZEROED` in `copy_stale`).
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut a = at;
+                while a < end {
+                    let page = a / PAGE;
+                    let b = ((page + 1) * PAGE).min(end);
+                    let whole = a == page * PAGE && b == (page + 1) * PAGE;
+                    let slot = &mut copied[page - base];
+                    if !(whole && *slot == ZEROED) {
+                        // SAFETY: inside the mapping (offsets in the buffer).
+                        unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+                        *slot = if whole { ZEROED } else { 0 };
+                        #[cfg(feature = "diagnostics")]
+                        add(C::Unmapped, (b - a) as u64);
+                    }
+                    a = b;
+                }
+            }
+            at = end;
+        }
+        bytes
+    }
+
+    /// Copies `[from, to)` whole (the write watch cannot say what changed)
+    /// and marks its pages never copied, so a later watched request copies
+    /// them again.
+    fn copy_unwatched(&self, from: usize, to: usize) -> usize {
+        let base = self.start as usize / PAGE;
+        self.copied.lock().unwrap_or_else(|e| e.into_inner())
+            [from / PAGE - base..=(to - 1) / PAGE - base]
+            .fill(0);
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::UnwatchedRanges, 1);
+            add(C::UnwatchedBytes, (to - from) as u64);
+        }
+        self.copy(from, to)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -561,7 +646,7 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            if *at == 0 || *at == ZEROED || write > *at {
                 #[cfg(feature = "diagnostics")]
                 if *at == 0 {
                     initial += 1;
