@@ -405,8 +405,20 @@ pub(crate) struct HostList {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// Dynamic descriptor slots, given back when dropped.
+struct DynamicSlots(Vec<(usize, u32, u32)>);
+
+impl Drop for DynamicSlots {
+    fn drop(&mut self) {
+        for &(heap, first, n) in &self.0 {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+}
+
 impl Drop for HostList {
     fn drop(&mut self) {
+        self.retire_held();
         self.release_kept();
     }
 }
@@ -1064,15 +1076,16 @@ impl HostList {
     }
 
     /// Frees kept upload blocks and returns kept dynamic descriptor slots.
+    /// Through [`retire`]: a submission still running may read them.
     fn release_kept(&self) {
-        self.kept_uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let uploads = std::mem::take(&mut *self.kept_uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        if !uploads.is_empty() {
+            retire(uploads);
+        }
         let dynamic =
             std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
-        for (heap, first, n) in dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        if !dynamic.is_empty() {
+            retire(DynamicSlots(dynamic));
         }
     }
 
@@ -1096,7 +1109,23 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// Hands the objects the list holds for its commands (buffers it
+    /// named, textures it moved) to [`retire`]: a submission still running
+    /// may read them (a page fault inside a freed rectangle records buffer,
+    /// 2026-11-24).
+    fn retire_held(&self) {
+        let kept = std::mem::take(&mut self.deferred().kept);
+        if !kept.is_empty() {
+            retire(kept);
+        }
+        let states = std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
+        if !states.is_empty() {
+            retire(states);
+        }
+    }
+
     pub(crate) fn reset(&self) {
+        self.retire_held();
         self.release_kept();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
