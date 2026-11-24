@@ -184,8 +184,9 @@ const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
 
 #[derive(Default)]
 struct Twins {
-    /// The last 64 KiB-page reservation: base, size, GPU-only.
-    last: Option<(usize, usize, bool)>,
+    /// CPU-readable 64 KiB-page reservations without a twin yet, oldest
+    /// first: base, size.
+    open: Vec<(usize, usize)>,
     /// CPU view base to its size and GPU view base.
     gpu_of: BTreeMap<usize, (usize, usize)>,
 }
@@ -197,25 +198,40 @@ fn twins_on() -> bool {
     *ON
 }
 
+/// A GPU-only reservation twins the latest CPU-readable one of the same
+/// size that has none yet (reservations in between do not matter).
 fn note_reservation(at: usize, size: usize, protect: u32) {
     let gpu_only = protect & PAGE_GRAPHICS_NOACCESS != 0 && protect & HOST_PROTECTION <= PAGE_NOACCESS;
     let mut twins = TWINS.lock().unwrap_or_else(|e| e.into_inner());
-    if gpu_only
-        && let Some((cpu, cpu_size, false)) = twins.last
-        && cpu_size == size
-    {
-        tracing::info!(
-            cpu = format_args!("{cpu:#x}"),
-            gpu = format_args!("{at:#x}"),
-            size,
-            mirrored = twins_on(),
-            "a GPU-only reservation twins the CPU one before it"
-        );
-        twins.gpu_of.insert(cpu, (size, at));
-        twins.last = None;
+    // A new reservation at a CPU base: whatever was there was released.
+    twins.gpu_of.remove(&at);
+    twins.open.retain(|&(b, _)| b != at);
+    if !gpu_only {
+        if protect & HOST_PROTECTION > PAGE_NOACCESS {
+            twins.open.push((at, size));
+            if twins.open.len() > 256 {
+                twins.open.remove(0);
+            }
+        }
         return;
     }
-    twins.last = Some((at, size, gpu_only));
+    let Some(k) = twins.open.iter().rposition(|&(_, s)| s == size) else {
+        tracing::info!(
+            gpu = format_args!("{at:#x}"),
+            size,
+            "a GPU-only reservation without a CPU twin"
+        );
+        return;
+    };
+    let (cpu, _) = twins.open.remove(k);
+    tracing::info!(
+        cpu = format_args!("{cpu:#x}"),
+        gpu = format_args!("{at:#x}"),
+        size,
+        mirrored = twins_on(),
+        "a GPU-only reservation twins the CPU one before it"
+    );
+    twins.gpu_of.insert(cpu, (size, at));
 }
 
 /// Where `[base, base + len)` of a CPU view shows in its GPU twin, if it
