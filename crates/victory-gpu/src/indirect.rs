@@ -394,9 +394,40 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    bound_why(list, src, count, spec).ok()
+}
+
+/// As [`bound`], saying why the arguments could not be bounded.
+pub(crate) fn bound_why(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Result<ID3D12Resource, String> {
+    let (kind, stride, records) = spec;
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off)).ok_or_else(|| {
+        format!(
+            "layout (stride {stride}, records {records}, offset mod 4 {}, count offset mod 4 {:?})",
+            src.1 % 4,
+            count.map(|(_, off)| off % 4)
+        )
+    })?;
+    let c = clamp().ok_or("no clamp pipeline")?;
+    let budget = list.budget().ok_or("no budget buffer")?;
+    let dst = list
+        .indirect_scratch(bytes)
+        .ok_or_else(|| format!("no scratch buffer of {bytes} bytes"))?;
+    if !record_clamp(c, &list.list, &dst, budget, src, count, spec) {
+        // SAFETY: a live buffer.
+        let base = unsafe { src.0.GetGPUVirtualAddress() };
+        return Err(format!(
+            "clamp not recorded (kind {kind}, source base mod 4 {}, offset mod 4 {}, past 4 GiB {})",
+            base % 4,
+            src.1 % 4,
+            src.1 > u64::from(u32::MAX)
+        ));
+    }
+    Ok(dst)
 }
 
 fn record_clamp(

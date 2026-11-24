@@ -1736,14 +1736,17 @@ impl State {
         if let Some((s, _)) = &counter {
             list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
-        let Some(bounded) = crate::indirect::bound(
+        let bounded = match crate::indirect::bound_why(
             list,
             (&args.buffer, args.offset(arguments)),
             count_arg,
             (kind, stride, max),
-        ) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        ) {
+            Ok(b) => b,
+            Err(_reason) => {
+                why(&format!("not bounded: {_reason}"));
+                return false;
+            }
         };
         // Rectangle lists: their vertices expanded and the records rewritten
         // on the GPU, before the draw's own pipeline is bound.
