@@ -137,6 +137,20 @@ fn bury(finished: u64) {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Since the last frame-rate line: submissions, microseconds in
+/// `ExecuteCommandLists` (driver CPU time, part of the GPU time above) and
+/// microseconds blocked on the fence.
+static SUBMITTING: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Of the preparing: snapshots of ranges shaders write (microseconds,
+/// bytes), since the last frame-rate line.
+static SNAPSHOTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -851,6 +865,16 @@ pub(crate) fn warn_depth_bounds() {
 /// with its pipelines (every build).
 const SLOW_LIST_MS: u64 = 100;
 
+/// Adds the time since its start to the frame's fence-wait total when
+/// dropped.
+struct Timed(std::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        SUBMITTING[2].fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -1211,6 +1235,8 @@ impl Host {
     /// Waits until the queue has signalled the fence with `value` (the
     /// caller holds `submitted`, under which the event is waited on).
     fn wait_for(&self, value: u64) {
+        let waiting = std::time::Instant::now();
+        let _timed = Timed(waiting);
         // SAFETY: the fence and event are ours.
         unsafe {
             match self.fence.SetEventOnCompletion(value, self.event) {
@@ -1269,6 +1295,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
+            SUBMITTING[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             *submitted += 1;
             // SAFETY: the fence is ours.
             if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
@@ -1310,6 +1337,7 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        SUBMITTING[0].fetch_add(1, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -2334,7 +2362,9 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    let taken = shadow.writing(*address, *len);
+                    SNAPSHOTS[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    SNAPSHOTS[1].fetch_add(taken as u64, Ordering::Relaxed);
                     continue;
                 }
                 Step::Texture(staging, copy) => {
@@ -2902,6 +2932,16 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // Where a frame's CPU time goes, for slow frames: recording
+        // (title threads, summed), and of the submissions (one at a
+        // time, on the queue's thread) preparing, the driver's submit,
+        // the fence wait and copying back.
+        let per = |n: u64, scale: f64| n as f64 / scale / frames;
+        let [submissions, submit_us, wait_us] =
+            [0, 1, 2].map(|i| SUBMITTING[i].swap(0, Ordering::Relaxed));
+        let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
+        let [asks, ask_us] = crate::watch::take_asks();
+        let recording_us = crate::draw::take_recording_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -2911,6 +2951,19 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "frame CPU split: recording {:.1} ms; {:.1} submissions: preparing {cpu:.1} ms \
+                 (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks {:.1} ms), submitting \
+                 {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
+                per(recording_us, 1e3),
+                per(submissions, 1.0),
+                per(snapshot_us, 1e3),
+                per(snapshot_b, 1e6),
+                per(asks, 1.0),
+                per(ask_us, 1e3),
+                per(submit_us, 1e3),
+                per(wait_us, 1e3),
             );
             #[cfg(feature = "diagnostics")]
             {

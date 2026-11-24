@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -49,6 +50,23 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let started = std::time::Instant::now();
+    let answer = writes_now(start, end, guarded);
+    ASKS[0].fetch_add(1, Ordering::Relaxed);
+    ASKS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    answer
+}
+
+/// Calls of [`writes`] and the microseconds they took, since the last
+/// [`take_asks`].
+static ASKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Calls of [`writes`] and their microseconds since the last call.
+pub(crate) fn take_asks() -> [u64; 2] {
+    [0, 1].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
+}
+
+fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
