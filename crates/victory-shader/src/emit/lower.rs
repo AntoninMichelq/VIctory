@@ -14518,6 +14518,27 @@ mod tests {
     }
 
     #[test]
+    fn global_loads_at_a_descriptors_shifted_base_lower_to_its_buffer() {
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(
+            crate::resource::tests::GLOBAL_LOAD_AT_A_SHIFTED_BASE,
+            layout,
+            used,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn scalar_loads_at_a_descriptors_shifted_base_lower_to_its_buffer() {
         let layout = vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
         let used = vec![UsedResource {

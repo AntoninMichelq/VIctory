@@ -918,6 +918,9 @@ impl<'a> Tracer<'a> {
         let hi = self.through_firstlane(hi);
         // The low dword: the base word, with its low byte replaced by or
         // added to a constant.
+        if let Some(shifted) = self.shifted_base(lo, hi, extra) {
+            return Some(shifted);
+        }
         let (word0, k) = self.base_word(lo)?;
         // The high dword: the next base word, masked.
         let word1 = match hi {
@@ -950,9 +953,7 @@ impl<'a> Tracer<'a> {
     }
 
     /// A scalar load at a buffer descriptor's own base, the base cut to
-    /// 256 bytes with 64-bit shifts: `((d >> 8) << 8) | k` where `d` is
-    /// the descriptor's first two dwords (the high one masked to 16 bits).
-    /// shortcut: the base is taken to be 256-byte aligned.
+    /// 256 bytes with 64-bit shifts (see [`Self::shifted_base`]).
     fn described_smem(
         &self,
         inst: &Inst,
@@ -970,8 +971,47 @@ impl<'a> Tracer<'a> {
             return None;
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
+        self.shifted_base(lo, hi, extra)
+    }
+
+    /// The two operands of `v` if a plain VOP2/VOP3 `names` wrote it.
+    fn valu2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if !names.contains(&inst.name())
+            || inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some((
+            inst,
+            [
+                self.vterm(inst, f.src.first()?)?,
+                self.vterm(inst, f.src.get(1)?)?,
+            ],
+        ))
+    }
+
+    /// An address at a buffer descriptor's own base, cut to 256 bytes with
+    /// 64-bit shifts, in SGPRs or VGPRs: `lo:hi = ((d >> 8) << 8) | k`,
+    /// where `d` is the descriptor's first two dwords (the high one masked
+    /// to 16 bits) and the right shift is scalar.
+    /// shortcut: the base is taken to be 256-byte aligned.
+    fn shifted_base(&self, lo: Term, hi: Term, mut extra: Sum) -> Option<(Source, Sum)> {
         let Term::Value(v) = lo else { return None };
-        let (x, k) = match self.sop2(v, &["s_or_b32", "s_add_u32"]) {
+        let plus = self
+            .sop2(v, &["s_or_b32", "s_add_u32"])
+            .or_else(|| self.valu2(v, &["v_or_b32", "v_add_nc_u32"]));
+        let (x, k) = match plus {
             Some((_, [Term::Value(x), Term::Const(k)] | [Term::Const(k), Term::Value(x)]))
                 if k < 0x100 =>
             {
@@ -981,26 +1021,45 @@ impl<'a> Tracer<'a> {
         };
         // `x` and `hi`: a 64-bit shift left by 8 of `{y, 0}`.
         let shl = self.def(x)?;
-        if shl.name() != "s_lshl_b64"
-            || shl.writes.first()?.1 != x
-            || hi != Term::Value(shl.writes.get(1)?.1)
-        {
+        if hi != Term::Value(shl.writes.get(1)?.1) || shl.writes.first()?.1 != x {
             return None;
         }
-        let Fields::Sop { src, .. } = &shl.fields else {
-            return None;
+        let (amount, pair) = match (&shl.fields, shl.name()) {
+            (Fields::Sop { src, .. }, "s_lshl_b64") => {
+                let [Operand::Scalar { code, .. }, amount] = &src[..] else {
+                    return None;
+                };
+                (
+                    self.term(shl, amount)?,
+                    [
+                        self.origin(shl.read(Reg::S(*code))?),
+                        self.origin(shl.read(Reg::S(code + 1))?),
+                    ],
+                )
+            }
+            (Fields::Valu(f), "v_lshlrev_b64") => {
+                if f.abs != 0 || f.neg != 0 {
+                    return None;
+                }
+                let [amount, Operand::Vector { reg, .. }] = &f.src[..] else {
+                    return None;
+                };
+                (
+                    self.vterm(shl, amount)?,
+                    [
+                        self.vorigin(shl.read(Reg::V(*reg))?),
+                        self.vorigin(shl.read(Reg::V(reg + 1))?),
+                    ],
+                )
+            }
+            _ => return None,
         };
-        let [Operand::Scalar { code: s0, .. }, amount] = &src[..] else {
-            return None;
-        };
-        if self.term(shl, amount)? != Term::Const(8)
-            || self.origin(shl.read(Reg::S(s0 + 1))?) != Term::Const(0)
-        {
+        if amount != Term::Const(8) || pair[1] != Term::Const(0) {
             return None;
         }
         // `y`: the low half of a 64-bit shift right by 8 of the
         // descriptor's first two dwords.
-        let Term::Value(y) = self.origin(shl.read(Reg::S(*s0))?) else {
+        let Term::Value(y) = pair[0] else {
             return None;
         };
         let shr = self.def(y)?;
@@ -3595,6 +3654,44 @@ pub(crate) mod tests {
         0x0000_0200, // ds_write_b32 v0, v2
         0xBF81_0000, // s_endpgm
     ];
+
+    /// The same base cut in VGPRs (`v_lshlrev_b64`, `v_or_b32`) and read
+    /// by a global load, as in irradiance-cache traversal loops.
+    pub(crate) const GLOBAL_LOAD_AT_A_SHIFTED_BASE: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE8C_0308, // s_mov_b32 s12, s8
+        0x870D_FF09,
+        0x0000_FFFF, // s_and_b32 s13, s9, 0xffff
+        0x9086_880C, // s_lshr_b64 s[6:7], s[12:13], 8
+        0x7E38_0206, // v_mov_b32_e32 v28, s6
+        0x7E46_031C, // v_mov_b32_e32 v35, v28
+        0x7E48_0280, // v_mov_b32_e32 v36, 0
+        0xD6FF_0023,
+        0x0002_4688, // v_lshlrev_b64 v[35:36], 8, v[35:36]
+        0x3846_46B4, // v_or_b32_e32 v35, 52, v35
+        0xDC30_8000,
+        0x027D_0023, // global_load_dword v2, v[35:36], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn global_loads_at_a_descriptors_shifted_base_read_its_buffer() {
+        let code: Vec<u8> = GLOBAL_LOAD_AT_A_SHIFTED_BASE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (_, offset, dynamic) = r.described[0];
+        assert_eq!((offset, dynamic), (52, None));
+    }
 
     #[test]
     fn scalar_loads_at_a_descriptors_shifted_base_read_its_buffer() {
