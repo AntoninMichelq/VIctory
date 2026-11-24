@@ -6,8 +6,8 @@
 //! with "token on time-out" (starting its next frame at once) and is paced
 //! by a blocking wait for the flip before each present.
 //!
-//! shortcut: event offsets are ignored (every event is at the tick); tie
-//! the clock to presentation if a title paces by them.
+//! Events are scheduled at an offset from the tick, which waits honour;
+//! the clock is still free-running rather than tied to presentation.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -68,14 +68,20 @@ pub(crate) extern "system" fn set_interval(
     S_OK
 }
 
-/// Device method: events are scheduled at every tick.
+/// Per event kind: the offset from the tick, in nanoseconds, last scheduled.
+static OFFSETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Device method: events are scheduled at every tick, `offset` microseconds
+/// into it. The list is the event's wait list, which our clock does not use.
 pub(crate) extern "system" fn schedule(
     _: This,
-    _kind: u32,
-    _offset: u32,
+    kind: u32,
+    offset: u32,
     _list: *const u8,
     _flags: u32,
 ) -> HRESULT {
+    OFFSETS[(kind as usize).min(OFFSETS.len() - 1)]
+        .store(u64::from(offset) * 1_000, Ordering::Relaxed);
     S_OK
 }
 
@@ -92,11 +98,31 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
+/// The next event after `elapsed` nanoseconds into the clock, and how long
+/// until it. An event happens once per tick, after `offset` nanoseconds:
+/// a wait woken a little early must not let the next one end on the same
+/// tick. Offsets of a whole tick or more move the event into a later tick.
+fn event_after(
+    elapsed: u128,
+    interval: u128,
+    first: u64,
+    last: u64,
+    offset: u128,
+) -> (u64, u128) {
+    let interval = interval.max(1);
+    let extra = (offset / interval) as u64;
+    let remainder = offset % interval;
+    let tick = (first + (elapsed / interval + 1) as u64 + extra).max(last + 1);
+    let at = u128::from(tick - first) * interval + remainder;
+    (tick, at.saturating_sub(elapsed))
+}
+
 /// The next tick after now and after the last one a wait for `kind` took
 /// (an event happens once per tick: a wait woken a little early must not
-/// let the next one end on the same tick), and how long until it. A wait
-/// that comes within `limit` takes the tick here, under the clock's lock,
-/// so two threads waiting for one kind never take the same tick.
+/// let the next one end on the same tick), and how long until its scheduled
+/// offset within that tick. A wait that comes within `limit` takes the tick
+/// here, under the clock's lock, so two threads waiting for one kind never
+/// take the same tick.
 fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
@@ -107,21 +133,26 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let last_tick = last(kind).load(Ordering::Relaxed);
+    let offset =
+        u128::from(OFFSETS[(kind as usize).min(OFFSETS.len() - 1)].load(Ordering::Relaxed));
     // The tick most recently passed. A flip (or vblank) wait that begins
     // after a tick nobody has taken yet is late: the frame took longer than
-    // an interval. It ends at once on that tick instead of waiting for the
-    // following one, so a frame a little over budget costs that much more,
-    // not a whole extra interval (30 fps falling straight to 15).
+    // an interval. It ends on that tick (at once, or at the event's offset
+    // into it if that is still ahead) instead of waiting for the following
+    // one, so a frame a little over budget costs that much more, not a
+    // whole extra interval (30 fps falling straight to 15).
     let passed = c.first + (elapsed / interval) as u64;
-    if kind != ORIGIN && passed > last_tick && passed > c.first {
+    if kind != ORIGIN && offset < interval && passed > last_tick && passed > c.first {
+        let wait = Duration::from_nanos(offset.saturating_sub(elapsed % interval) as u64);
         // Taken here like any other tick, or the next wait would find the
         // same tick untaken and not wait at all.
-        last(kind).fetch_max(passed, Ordering::Relaxed);
-        return (passed, Duration::ZERO);
+        if wait <= limit {
+            last(kind).fetch_max(passed, Ordering::Relaxed);
+        }
+        return (passed, wait);
     }
-    let tick = (c.first + (elapsed / interval + 1) as u64).max(last_tick + 1);
-    let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let (tick, delay) = event_after(elapsed, interval, c.first, last_tick, offset);
+    let wait = Duration::from_nanos(delay.min(u64::MAX as u128) as u64);
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
@@ -190,6 +221,36 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_happen_at_their_offset_within_the_tick() {
+        const MS: u128 = 1_000_000;
+        // A quarter into the first millisecond after now.
+        assert_eq!(event_after(250_000, MS, 0, 0, 0), (1, 750_000));
+        assert_eq!(event_after(250_000, MS, 0, 0, 300_000), (1, 1_050_000));
+        // An offset past a tick moves the event into the next one.
+        assert_eq!(event_after(250_000, MS, 0, 0, MS + 200_000), (2, 1_950_000));
+        // A kind already woken on a tick cannot wake on it again, offset or
+        // no offset.
+        assert_eq!(event_after(250_000, MS, 0, 1, 0), (2, 1_750_000));
+        assert_eq!(event_after(250_000, MS, 0, 1, 300_000), (2, 2_050_000));
+        // The clock's first tick is carried through interval changes.
+        assert_eq!(event_after(250_000, MS, 100, 100, 0), (101, 750_000));
+        // An offset behind now never makes the wait negative.
+        assert_eq!(event_after(900_000, MS, 0, 0, 0).1, 100_000);
+    }
+
+    #[test]
+    fn scheduling_stores_the_offset_for_a_kind() {
+        let null = std::ptr::null();
+        let list = std::ptr::null::<u8>();
+        assert_eq!(schedule(null, 2, 700, list, 0), S_OK);
+        assert_eq!(OFFSETS[2].load(Ordering::Relaxed), 700_000);
+        // An unknown kind shares the last slot but still accepts the call.
+        assert_eq!(schedule(null, 99, 12, list, 0), S_OK);
+        assert_eq!(OFFSETS[2].load(Ordering::Relaxed), 12_000);
+        schedule(null, 2, 0, list, 0);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
