@@ -229,6 +229,21 @@ enum RootView {
 /// maximum; SRVs and UAVs refresh the full remaining extent of the backing
 /// buffer (dirty-page watched) and UAVs also schedule write-back.
 /// `None` for a null address or one outside title buffers.
+/// Whether what shaders write through root UAVs is copied back to the
+/// title's memory; `VICTORY_NO_ROOT_UAV_COPY_BACK=1` keeps those writes
+/// in the host's copies only (other GPU readers still see them, the CPU
+/// does not), to tell whether a title crash comes from reading them.
+fn root_uav_copy_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = std::env::var("VICTORY_NO_ROOT_UAV_COPY_BACK").is_ok_and(|v| v.trim() == "1");
+        if off {
+            tracing::warn!("VICTORY_NO_ROOT_UAV_COPY_BACK=1: root UAV writes stay on the GPU");
+        }
+        !off
+    })
+}
+
 fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     if address == 0 {
         return None;
@@ -269,7 +284,9 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             }
             let len = shadow.left(address);
             shadow.refresh(list, address, len);
-            shadow.gpu_writes(list, address, len);
+            if root_uav_copy_back() {
+                shadow.gpu_writes(list, address, len);
+            }
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             Some(gpu)
         }
@@ -563,7 +580,9 @@ impl State {
         };
         shadow.refresh(list, address, len);
         if uav {
-            shadow.gpu_writes(list, address, len);
+            if root_uav_copy_back() {
+                shadow.gpu_writes(list, address, len);
+            }
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
         } else {
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
