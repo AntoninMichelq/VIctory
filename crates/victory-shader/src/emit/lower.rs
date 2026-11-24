@@ -2302,7 +2302,65 @@ impl<'a> Lower<'a> {
     }
 
     /// The DXIL form of an IR value.
+    /// With `VICTORY_LANE_MASK_DEBUG=1`, where a value read as data that
+    /// is (or joins) a lane mask comes from: its writer or phi, and each
+    /// phi argument's writer, mask kind and value state.
+    fn lane_mask_note(&self, v: Value, at: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| {
+            std::env::var("VICTORY_LANE_MASK_DEBUG").is_ok_and(|v| v.trim() == "1")
+        }) {
+            return;
+        }
+        let p = self.x.p;
+        let describe = |v: Value| -> String {
+            let kind = if self.x.st.masks.contains_key(&v) {
+                "mask"
+            } else if self.x.st.highs.contains_key(&v) {
+                "mask-high"
+            } else {
+                "data"
+            };
+            let state = match self.vals.get(&v) {
+                Some(Val::I32(_)) => "number".to_string(),
+                Some(Val::Bit(_)) => "bit".to_string(),
+                Some(Val::Missing(w)) => format!("missing({w})"),
+                None => "unset".to_string(),
+            };
+            let from = if let Some(&(b, i)) = self.phi_at.get(&v) {
+                let phi = &p.blocks[b].phis[i];
+                format!("phi {:?} at block {:#x}", phi.reg, p.blocks[b].offset)
+            } else if let Some(i) = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+            {
+                format!("{} at {:#x}", i.name(), i.machine.offset)
+            } else {
+                "input".to_string()
+            };
+            format!("v{} {kind} {state} from {from}", v.0)
+        };
+        let mut text = format!("lane mask at {at} (block {:#x}): {}", p.blocks[self.cur_ir].offset, describe(v));
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            for (n, a) in p.blocks[b].phis[i].args.iter().enumerate() {
+                let q = p.blocks[b].preds[n];
+                text += &format!("\n  edge from {:#x}: {}", p.blocks[q].offset, describe(*a));
+            }
+        }
+        eprintln!("{text}");
+    }
+
     fn get(&mut self, v: Value) -> Result<Val, Why> {
+        let r = self.get_inner(v);
+        if matches!(r, Err(w) if w == LANE_MASK) {
+            self.lane_mask_note(v, "a read");
+        }
+        r
+    }
+
+    fn get_inner(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
@@ -12071,6 +12129,9 @@ impl<'a> Lower<'a> {
                         }
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                        if why == LANE_MASK {
+                            self.lane_mask_note(phi.value, "a join");
+                        }
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
@@ -12470,6 +12531,77 @@ mod tests {
             0xD834_0000,
             0x0000_0100, // ds_write_b32 v0, v1
             S_ENDPGM,
+        ];
+        lower_wave(&words, vec![], vec![], true).unwrap();
+    }
+
+    /// As `scalar_data_joined_with_a_dead_mask_half_is_a_number`, with the
+    /// mask a compare result a select reads (the skinning mesh shape): both
+    /// dwords of the compare's mask join data, read by an AND and by a
+    /// scalar compare after the join.
+    #[test]
+    fn scalar_data_joined_with_a_selected_compare_mask_is_a_number() {
+        let words = [
+            0x7E10_0500, // v_readfirstlane_b32 s8, v0
+            0xD4C4_000A,
+            0x0002_0085, // v_cmp_gt_u32_e64 s[10:11], 5, v0
+            0xD501_0002,
+            0x002A_0300, // v_cndmask_b32_e64 v2, v0, v1, s[10:11]
+            0xBF04_8008, // s_cmp_lt_i32 s8, 0
+            0xBF85_0002, // s_cbranch_scc1 2
+            0x7E14_0501, // v_readfirstlane_b32 s10, v1
+            0x7E16_0501, // v_readfirstlane_b32 s11, v1
+            0x8706_FF0B,
+            0x0000_0100, // s_and_b32 s6, s11, 0x100
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0002, // s_cbranch_scc1 2
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF07_800B, // s_cmp_lg_u32 s11, 0
+            0xBF85_0002, // s_cbranch_scc1 2
+            0xD834_0004,
+            0x0000_0100, // ds_write_b32 v0, v1 offset:4
+            S_ENDPGM,
+        ];
+        lower_wave(&words, vec![], vec![], true).unwrap();
+    }
+
+    /// The skinning mesh shape in full: a compare's mask (read by a select)
+    /// joins data loaded on the other path, through a block of its own on
+    /// the skip edge; after the join a uniform branch and a real mask
+    /// (`s_cselect_b64 exec, 0`) come before the AND reading the joined
+    /// high dword as data.
+    #[test]
+    fn scalar_data_joined_with_a_compare_mask_through_a_skip_block_is_a_number() {
+        let words = [
+            0x7E10_0500, // v_readfirstlane_b32 s8, v0
+            0xD4C4_000A,
+            0x0002_0085, // v_cmp_gt_u32_e64 s[10:11], 5, v0
+            0xD501_0002,
+            0x002A_0300, // v_cndmask_b32_e64 v2, v0, v1, s[10:11]
+            0xBF04_8008, // s_cmp_lt_i32 s8, 0
+            0x858C_807E, // s_cselect_b64 s[12:13], exec, 0
+            0xBF85_0006, // s_cbranch_scc1 L1
+            0x7E14_0501, // v_readfirstlane_b32 s10, v1
+            0x7E16_0501, // v_readfirstlane_b32 s11, v1
+            0xBF08_870A, // s_cmp_gt_u32 s10, 7
+            0x8506_80C1, // s_cselect_b32 s6, -1, 0
+            0x7E70_0206, // v_mov_b32_e32 v56, s6
+            0xBF82_0001, // s_branch L2
+            0xBF80_0000, // L1: s_nop 0
+            0x7D84_70C1, // L2: v_cmp_eq_u32_e32 vcc, -1, v56
+            0x8AEA_6A7E, // s_andn2_b64 vcc, exec, vcc
+            0xBF87_0009, // s_cbranch_vccnz L3
+            0x8584_807E, // s_cselect_b64 s[4:5], exec, 0
+            0x8706_FF0B,
+            0x0000_0100, // s_and_b32 s6, s11, 0x100
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0004, // s_cbranch_scc1 L3
+            0xD501_0003,
+            0x0012_0500, // v_cndmask_b32_e64 v3, v0, v2, s[4:5]
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,    // L3
         ];
         lower_wave(&words, vec![], vec![], true).unwrap();
     }
