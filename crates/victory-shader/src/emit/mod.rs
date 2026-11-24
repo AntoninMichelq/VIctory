@@ -120,6 +120,17 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Whether shaders may write or read through root UAVs (`VICTORY_ROOT_UAVS=1`).
+/// Off by default: a root view has no bounds checks on the host, and the
+/// first world run with them on an RX 7600 page-faulted the GPU 47 s in.
+/// Off, such shaders stop at "a typed root view" and their dispatches are
+/// dropped, as before root UAVs were lowered. The value is part of the
+/// translation, so the shader cache keys on it.
+pub fn root_uavs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAVS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///

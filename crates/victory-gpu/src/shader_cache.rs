@@ -53,6 +53,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(u8::from(victory_shader::emit::root_uavs()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
