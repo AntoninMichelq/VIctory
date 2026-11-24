@@ -563,6 +563,8 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
+            // The previous loop pass's value or an unwritten register:
+            // no source of their own.
             resource::Source::Carried { .. } | resource::Source::Unset => None,
             resource::Source::Phi { .. }
             | resource::Source::Select { .. }
