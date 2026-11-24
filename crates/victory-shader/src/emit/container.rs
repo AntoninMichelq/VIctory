@@ -110,6 +110,48 @@ impl SigElement {
 /// the validator rebuilds them from the module's signature metadata
 /// (`DxilProgramSignatureWriter` with validator version 1.6), so every
 /// field derives from the same [`SigElement`] the metadata does.
+/// The console packs elements of different interpolation modes into one
+/// row (a constant front face beside a linear coordinate, say); DXIL needs
+/// one mode per row. Each later mode of a row moves to a free row of its
+/// own, shared by that row's elements of the mode. Code addresses elements
+/// by id and stages link by semantic, so only the signatures change.
+/// Elements without a mode (0) are left where they are.
+pub(crate) fn separate_interpolation(elements: &mut [SigElement]) {
+    let mut next = elements
+        .iter()
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |r| r + 1);
+    // (row, the row's first mode)
+    let mut first: Vec<(u32, u8)> = Vec::new();
+    // ((old row, mode), new row)
+    let mut moved: Vec<((u32, u8), u32)> = Vec::new();
+    for e in elements.iter_mut() {
+        let (Some(row), mode) = (e.row, e.interp) else {
+            continue;
+        };
+        if mode == 0 {
+            continue;
+        }
+        match first.iter().find(|f| f.0 == row) {
+            None => first.push((row, mode)),
+            Some(&(_, m)) if m == mode => {}
+            Some(_) => {
+                let to = match moved.iter().find(|m| m.0 == (row, mode)) {
+                    Some(&(_, to)) => to,
+                    None => {
+                        moved.push(((row, mode), next));
+                        next += 1;
+                        next - 1
+                    }
+                };
+                e.row = Some(to);
+            }
+        }
+    }
+}
+
+/// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let listed: Vec<usize> = (0..elements.len())
         .filter(|&i| elements[i].in_part(input))
@@ -213,6 +255,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     u32s(&mut out, &[48]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
+    if p.stage == 0 {
+        // PSInfo.SampleFrequency: an input interpolated per sample, or the
+        // sample index.
+        info[1] = u8::from(
+            p.inputs
+                .iter()
+                .any(|e| matches!(e.interp, 6 | 7) || e.kind == 12),
+        );
+    }
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
     info[16..20].copy_from_slice(&min.to_le_bytes());
     info[20..24].copy_from_slice(&max.to_le_bytes());
@@ -507,5 +558,36 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn rows_of_mixed_interpolation_are_separated() {
+        let mut e = vec![
+            element("A", 0, 0, 2),
+            element("B", 0, 1, 1),
+            element("C", 1, 0, 2),
+            element("D", 0, 2, 1),
+            element("E", 0, 3, 2),
+            element("F", 1, 1, 0),
+        ];
+        separate_interpolation(&mut e);
+        let rows: Vec<u32> = e.iter().map(|e| e.row.unwrap()).collect();
+        // B and D (constant) share a new row; A and E stay; F has no mode.
+        assert_eq!(rows, [0, 2, 1, 2, 0, 1]);
     }
 }

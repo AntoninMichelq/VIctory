@@ -739,6 +739,8 @@ void main() {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: EnumWarpAdapter returns a DXGI adapter, which implements
+        // IDXGIAdapter1; `raw` owns that interface.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",

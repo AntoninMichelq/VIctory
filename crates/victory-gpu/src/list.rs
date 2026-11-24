@@ -6,7 +6,7 @@
 //! the table as a call.
 //!
 //! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in [`crate::draw`]. Methods not
+//! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -533,6 +533,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if !copy_compatible(to, from) {
                 return;
             }
+            if crate::texture::title_written(from) {
+                crate::texture::upload(&list, src, from);
+            }
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -857,7 +860,9 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            list.defer_copy(staging, data, bytes as usize);
+            // The list owns this mapped D3D12 upload buffer. Wine can report
+            // its address as MEM_FREE, so use the host-upload path.
+            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -870,6 +875,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(&list, src.resource, texture);
+            }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -949,7 +957,7 @@ extern "system" fn resolve(
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
+            D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
@@ -960,6 +968,11 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
+            // Mips are the low-order component of an array or plane subresource index.
+            let mip = subresource % u32::from(d.MipLevels);
+            ((d.Width >> mip).max(1), (d.Height >> mip).max(1))
+        };
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
@@ -969,8 +982,10 @@ extern "system" fn resolve(
                 stand_in if stand_in == a.Format.0 as u32 => stand_in,
                 _ => format,
             };
+            let (dst_width, dst_height) = extent(to.GetDesc(), dst_sub);
+            let (src_width, src_height) = extent(from.GetDesc(), src_sub);
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if (dst_width, dst_height) == (src_width, src_height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -978,8 +993,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_width.min(src_width) as i32,
+                    bottom: dst_height.min(src_height) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -1526,7 +1541,11 @@ mod state {
         views: *const VertexView,
     ) {
         with_state(this, |_, s| {
-            s.set_vertex_buffers(start, items(views, count))
+            if views.is_null() {
+                s.clear_vertex_buffers(start, count);
+            } else {
+                s.set_vertex_buffers(start, items(views, count));
+            }
         });
     }
     /// `(count, handles, one range, depth)`: with one range, the handles

@@ -25,6 +25,7 @@ pub const STRIDE_TABLE_SLOTS: u32 = 1 << 20;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const UAVS_64: u64 = 1 << 15;
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
@@ -375,6 +376,15 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // Out-of-bounds indices (garbage from dropped passes) read slot 0,
+        // so a heap read cannot page-fault the host GPU past the heap's end.
+        // Views: a view heap may hold more than 1,000,000 slots on resource
+        // binding tier 3 (title slots plus dynamic ones), so only indices
+        // far past any heap (negative ones, say) are clamped.
+        let limit = self.m.i32(if sampler { 2048 } else { 1 << 22 });
+        let zero = self.m.i32(0);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, zero);
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -392,6 +402,8 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        container::separate_interpolation(&mut self.inputs);
+        container::separate_interpolation(&mut self.outputs);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -621,6 +633,10 @@ impl Shader {
         } else {
             None
         };
+        // A pixel shader with an SV_StencilRef output (as DXC collects it).
+        if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+            self.flags |= flags::STENCIL_REF;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -704,6 +720,9 @@ impl Shader {
         }
         if self.flags & flags::UAVS_64 != 0 {
             features |= 0x8;
+        }
+        if self.flags & flags::STENCIL_REF != 0 {
+            features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
