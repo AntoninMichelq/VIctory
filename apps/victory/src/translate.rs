@@ -563,9 +563,11 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
+            resource::Source::Carried { .. } | resource::Source::Unset => None,
             resource::Source::Phi { .. }
             | resource::Source::Select { .. }
-            | resource::Source::Lanes { .. } => {
+            | resource::Source::Lanes { .. }
+            | resource::Source::Paths { .. } => {
                 unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };
