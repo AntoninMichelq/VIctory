@@ -128,12 +128,32 @@ const KEPT: usize = 4096;
 /// `title`; elsewhere the title's byte stays. `host` and `old` then take
 /// `title`'s bytes. Whether `title` changed. Word by word, without branches per
 /// byte (the world copies back hundreds of MB per frame).
+#[cfg(test)]
 fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    let mut runs = Vec::new();
+    merge_gpu_runs(title, host, old, &mut runs);
+    !runs.is_empty()
+}
+
+/// [`merge_gpu_writes`], recording in `runs` (cleared first) the byte
+/// ranges of `title` the GPU's bytes changed, in order and merged when
+/// adjacent: only those go back to title memory, so a title thread writing
+/// the page's other bytes meanwhile keeps its writes.
+fn merge_gpu_runs(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &mut [u8],
+    runs: &mut Vec<(usize, usize)>,
+) {
     const LO: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HI: u64 = 0x8080_8080_8080_8080;
+    runs.clear();
+    let mut push = |s: usize, e: usize| match runs.last_mut() {
+        Some((_, end)) if *end == s => *end = e,
+        _ => runs.push((s, e)),
+    };
     let n = title.len().min(host.len()).min(old.len());
     let words = n / 8;
-    let mut changed = 0u64;
     let rd = |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
     for i in 0..words {
         let (t, h, o) = (rd(title, i), rd(host, i), rd(old, i));
@@ -142,22 +162,29 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
         let nz = (((x & LO).wrapping_add(LO)) | x) & HI;
         let mask = (nz >> 7).wrapping_mul(0xff);
         let merged = (h & mask) | (t & !mask);
-        changed |= merged ^ t;
+        let changed = merged ^ t;
+        if changed != 0 {
+            // Exactly the bytes that changed (native byte order).
+            let bytes = changed.to_ne_bytes();
+            for (b, &x) in bytes.iter().enumerate() {
+                if x != 0 {
+                    push(i * 8 + b, i * 8 + b + 1);
+                }
+            }
+        }
         title[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
         host[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
         old[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
     }
-    let mut tail_changed = false;
     for j in words * 8..n {
         let (t, h, o) = (title[j], host[j], old[j]);
         if h != o && t != h {
             title[j] = h;
-            tail_changed = true;
+            push(j, j + 1);
         }
         host[j] = title[j];
         old[j] = title[j];
     }
-    changed != 0 || tail_changed
 }
 
 /// A page buffer, from the pool if it has one.
@@ -398,6 +425,7 @@ impl Shadow {
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
             let mut title = None;
+            let mut runs = Vec::new();
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -424,10 +452,15 @@ impl Shadow {
                     // they are not a shader's write to put back.
                     // Word by word (the world copies back hundreds of MB
                     // per frame).
-                    if merge_gpu_writes(title, host, old) {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    // Only the runs the GPU changed go back (upstream #1024):
+                    // writing the whole page put back what a title thread
+                    // had before its own write meanwhile (pointers and
+                    // fence lists read as -1 in root-UAV runs).
+                    merge_gpu_runs(title, host, old, &mut runs);
+                    if let (Some(&(s, _)), Some(&(_, e))) = (runs.first(), runs.last()) {
+                        crate::watch::writing(start + at + s, e - s);
+                        crate::host::write_runs((start + at) as *mut u8, title.as_ptr(), &runs);
+                        written += runs.iter().map(|(s, e)| e - s).sum::<usize>();
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -445,9 +478,21 @@ impl Shadow {
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                // Current only if title memory still holds what the copy
+                // does (upstream #1024): the query above also cleared a
+                // title write made after the page was read, and the copy
+                // would keep its older bytes until the title wrote again.
+                let mut now_title = page_buffer();
                 for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                    let at = page * PAGE - start;
+                    // SAFETY: a whole page inside the mapping (first..last).
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(at), PAGE) };
+                    let title = &mut now_title[..PAGE];
+                    if crate::host::read_into((page * PAGE) as *const u8, title) && title == host {
+                        copied[page - base] = now;
+                    }
                 }
+                give_back(Some(now_title));
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -1118,14 +1163,30 @@ mod tests {
                 let fast = super::merge_gpu_writes(&mut t1, &mut h1, &mut o1);
                 assert_eq!(o1, t1);
                 let mut slow = false;
-                for ((t, h), o) in t2.iter_mut().zip(h2.iter_mut()).zip(&old) {
+                let mut slow_runs: Vec<(usize, usize)> = Vec::new();
+                for (i, ((t, h), o)) in t2.iter_mut().zip(h2.iter_mut()).zip(&old).enumerate() {
                     if *h != *o && *t != *h {
                         *t = *h;
                         slow = true;
+                        match slow_runs.last_mut() {
+                            Some((_, end)) if *end == i => *end = i + 1,
+                            _ => slow_runs.push((i, i + 1)),
+                        }
                     }
                     *h = *t;
                 }
                 assert_eq!((fast, &t1, &h1), (slow, &t2, &h2), "len {len}");
+                let (mut t3, mut h3, mut o3) = (title.clone(), host.clone(), old.clone());
+                let mut runs = vec![(9, 9)];
+                super::merge_gpu_runs(&mut t3, &mut h3, &mut o3, &mut runs);
+                assert_eq!((&runs, &t3), (&slow_runs, &t2), "runs, len {len}");
+                // Writing only the runs over the title's bytes gives the
+                // merged page.
+                let mut back = title.clone();
+                for &(s, e) in &runs {
+                    back[s..e].copy_from_slice(&t3[s..e]);
+                }
+                assert_eq!(back, t2, "runs only, len {len}");
             }
         }
     }
