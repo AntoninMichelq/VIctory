@@ -480,6 +480,9 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// A resource handle made once: (kind, site, space, non-uniform, range).
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -512,7 +515,7 @@ struct Lower<'a> {
     described: HashMap<Site, (u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.

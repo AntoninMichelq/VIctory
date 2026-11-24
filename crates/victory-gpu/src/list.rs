@@ -976,7 +976,7 @@ extern "system" fn resolve(
         };
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
+            let (a, _b) = (to.GetDesc(), from.GetDesc());
             // An R9G9B9E5_SHAREDEXP target is made R16G16B16A16_FLOAT
             // (`resource::target_format`): resolve in the format it has.
             let format = match crate::resource::target_format(format) {

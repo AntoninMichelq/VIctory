@@ -679,6 +679,7 @@ void main() {
             )
         };
         let root: ID3D12RootSignature =
+            // SAFETY: `bytes` is a serialized root signature we just made.
             unsafe { host.device.CreateRootSignature(0, bytes) }.expect("create root signature");
         // SAFETY: the PSO description borrows the live bytecode and root signature.
         let pso: ID3D12PipelineState = unsafe {
@@ -1695,7 +1696,7 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
             // The lists that took the time, slowest first, with their
             // pipelines: a list is a run of its own on the queue.
-            ended.sort_by(|a, b| b.1.cmp(&a.1));
+            ended.sort_by_key(|a| std::cmp::Reverse(a.1));
             for &(i, took) in ended.iter().take(4) {
                 if took < std::time::Duration::from_millis(SLOW_LIST_MS) {
                     break;
@@ -2863,7 +2864,7 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 /// GPU work. Retain the resources until the submission has finished.
 fn refresh_direct_srvs(
     runs: &[&HostList],
-) -> Vec<std::sync::Arc<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>>> {
+) -> Vec<std::sync::Arc<crate::descriptor::host::MergedSrvs>> {
     use std::sync::Arc;
 
     let started = std::time::Instant::now();
@@ -3061,6 +3062,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; the query does not read the address.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);

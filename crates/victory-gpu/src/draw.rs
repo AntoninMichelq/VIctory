@@ -961,7 +961,7 @@ impl State {
             .map(|p| {
                 p.stages
                     .iter()
-                    .map(|s| format!("{}", s.shader.hash))
+                    .map(|s| s.shader.hash.to_string())
                     .collect()
             })
             .unwrap_or_default();
@@ -1529,7 +1529,7 @@ impl State {
                 .map(|p| {
                     p.stages
                         .iter()
-                        .map(|s| format!("{}", s.shader.hash))
+                        .map(|s| s.shader.hash.to_string())
                         .collect()
                 })
                 .unwrap_or_default();

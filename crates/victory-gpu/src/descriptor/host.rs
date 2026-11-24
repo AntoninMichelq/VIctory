@@ -103,6 +103,9 @@ impl Drop for HostHeap {
     }
 }
 
+/// A heap's indexed SRV ranges merged per buffer: (shadow, from, to).
+pub(crate) type MergedSrvs = Vec<(Arc<Shadow>, usize, usize)>;
+
 struct Slots {
     /// The record (view index and generation) each slot was last made from.
     made: Vec<u64>,
@@ -114,7 +117,7 @@ struct Slots {
     /// Ranges of `direct` merged per buffer copy (see `merged_srvs`), at the
     /// generation they were made for; `None` while a slot was not
     /// materialized (tried again at each submission).
-    merged: Option<(u64, Arc<Vec<(Arc<Shadow>, usize, usize)>>)>,
+    merged: Option<(u64, Arc<MergedSrvs>)>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -762,7 +765,7 @@ impl HostHeap {
     /// submissions per frame each rebuilt and sorted the whole list, ~800 ms
     /// per frame. Also materializes slots not made yet. The number of
     /// mirrored slots comes first.
-    pub(crate) fn merged_srvs(&self) -> (usize, Arc<Vec<(Arc<Shadow>, usize, usize)>>) {
+    pub(crate) fn merged_srvs(&self) -> (usize, Arc<MergedSrvs>) {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let Slots {
             made,

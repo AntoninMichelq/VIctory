@@ -441,6 +441,7 @@ fn with_view_at<T>(i: u32, generation: u32, f: impl FnOnce(&View) -> T) -> Optio
 /// Protect object-backed title memory from release during CPU refresh.
 /// Take snapshots of heap metadata before entering this section.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn with_live_views<T>(f: impl FnOnce(&dyn Fn(u64) -> bool) -> T) -> T {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     f(&|key| {

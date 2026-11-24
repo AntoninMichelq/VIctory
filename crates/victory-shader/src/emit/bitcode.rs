@@ -356,6 +356,7 @@ impl Module {
     }
 
     /// The value of an integer constant; `None` for anything else.
+    #[allow(dead_code)]
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
             V::Const(i) => match self.consts[i as usize].1 {
@@ -705,11 +706,9 @@ impl Module {
                 }
             }
         }
-        for k in 0..n {
-            if !reach[k] {
-                self.blocks[k].phis.clear();
-                self.blocks[k].body.clear();
-            }
+        for (block, _) in self.blocks.iter_mut().zip(&reach).take(n).filter(|(_, r)| !**r) {
+            block.phis.clear();
+            block.body.clear();
         }
     }
 

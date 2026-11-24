@@ -576,6 +576,7 @@ impl Shadow {
         while at < to {
             // SAFETY: a query of the virtual address, without reading it.
             let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above; the query does not read the address.
             let size = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
             let end = (info.BaseAddress as usize)
                 .saturating_add(info.RegionSize)
@@ -1048,6 +1049,13 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+/// Whether a range refreshed already in the watch generation is skipped:
+/// `VICTORY_REFRESH_MEMO=0` turns it off.
+fn memo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_MEMO").map_or(true, |v| v.trim() != "0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,9 +1480,3 @@ mod tests {
     }
 }
 
-/// Whether a range refreshed already in the watch generation is skipped:
-/// `VICTORY_REFRESH_MEMO=0` turns it off.
-fn memo() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_MEMO").map_or(true, |v| v.trim() != "0"))
-}
