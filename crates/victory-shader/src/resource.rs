@@ -1008,6 +1008,12 @@ impl<'a> Tracer<'a> {
             }
             return Some(());
         }
+        if self.unset_input(t) {
+            // A VGPR no instruction wrote yet on that path: undefined
+            // there, unless the hardware sets it ([`Resources::pointer_unset`]).
+            self.pointer_unset.borrow_mut().push(v);
+            return Some(());
+        }
         out.push(t);
         Some(())
     }
@@ -3806,6 +3812,55 @@ pub(crate) mod tests {
         0x0000_1F00, // ds_write_b32 v0, v31
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`GLOBAL_LOAD_AT_A_CARRIED_SHIFTED_BASE`] with the VGPR written
+    /// in some lanes only before the loop.
+    pub(crate) const GLOBAL_LOAD_AT_A_SOMETIMES_SET_SHIFTED_BASE: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE8C_0308, // s_mov_b32 s12, s8
+        0x870D_FF09,
+        0x0000_FFFF, // s_and_b32 s13, s9, 0xffff
+        0x9086_880C, // s_lshr_b64 s[6:7], s[12:13], 8
+        0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x7E38_0206, // v_mov_b32_e32 v28, s6
+        0x887E_147E, // s_or_b32 exec_lo, exec_lo, s20
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x7E46_031C, // loop: v_mov_b32_e32 v35, v28
+        0x7E48_0280, // v_mov_b32_e32 v36, 0
+        0xD6FF_0023,
+        0x0002_4688, // v_lshlrev_b64 v[35:36], 8, v[35:36]
+        0x383A_46B4, // v_or_b32_e32 v29, 52, v35
+        0x7E3C_0324, // v_mov_b32_e32 v30, v36
+        0xDC30_8000,
+        0x1F7D_001D, // global_load_dword v31, v[29:30], off
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D84_3E80, // v_cmp_eq_u32_e32 vcc_lo, 0, v31
+        0xD501_001C,
+        0x01A8_0D1C, // v_cndmask_b32_e64 v28, v28, s6, vcc_lo
+        0x8002_8102, // s_add_u32 s2, s2, 1
+        0xBF0A_8402, // s_cmp_lt_u32 s2, 4
+        0xBF85_FFF1, // s_cbranch_scc1 loop
+        0xD834_0000,
+        0x0000_1F00, // ds_write_b32 v0, v31
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn global_loads_at_a_sometimes_set_shifted_base_read_its_buffer() {
+        let code: Vec<u8> = GLOBAL_LOAD_AT_A_SOMETIMES_SET_SHIFTED_BASE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (_, offset, dynamic) = r.described[0];
+        assert_eq!((offset, dynamic), (52, None));
+    }
 
     #[test]
     fn global_loads_at_a_carried_shifted_base_read_its_buffer() {

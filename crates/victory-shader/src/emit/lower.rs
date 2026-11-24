@@ -14538,6 +14538,12 @@ mod tests {
         .unwrap();
         lower_with(
             crate::resource::tests::GLOBAL_LOAD_AT_A_CARRIED_SHIFTED_BASE,
+            layout.clone(),
+            used.clone(),
+        )
+        .unwrap();
+        lower_with(
+            crate::resource::tests::GLOBAL_LOAD_AT_A_SOMETIMES_SET_SHIFTED_BASE,
             layout,
             used,
         )
