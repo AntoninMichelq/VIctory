@@ -439,6 +439,7 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        one_mode_per_register(&mut self.inputs);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -877,5 +878,28 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// DXIL wants the elements of one register interpolated one way. An
+/// element the program never reads takes the mode of the ones it reads in
+/// its register (the title's packing put them together, so the source gave
+/// them one mode; the read ones' mode comes from their barycentrics).
+fn one_mode_per_register(elements: &mut [SigElement]) {
+    for i in 0..elements.len() {
+        let e = &elements[i];
+        if e.kind != 0 || e.usage != 0 {
+            continue;
+        }
+        let Some(row) = e.row else { continue };
+        let mut modes = elements
+            .iter()
+            .filter(|o| o.kind == 0 && o.usage != 0 && o.row == Some(row))
+            .map(|o| o.interp);
+        if let Some(m) = modes.next()
+            && modes.all(|n| n == m)
+        {
+            elements[i].interp = m;
+        }
     }
 }
