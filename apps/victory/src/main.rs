@@ -90,6 +90,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Instead of the report: translate every container as a run on
+        /// this host would and keep it in the runtime's shader cache
+        /// (`<cache>/shaders`), so the run finds it instead of translating.
+        /// Use the same build, `victory.toml` and VICTORY_* settings as the
+        /// run.
+        #[arg(long)]
+        write_cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -159,7 +166,8 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+            write_cache,
+        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes, write_cache),
         Command::Run {
             exe,
             unimplemented,
