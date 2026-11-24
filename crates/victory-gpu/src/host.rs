@@ -1362,6 +1362,8 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Bound view heaps, including the slots mirrored after recording.
     view_heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
+    /// Textures named by aliasing and UAV barriers without a state transition.
+    barrier_textures: std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2638,6 +2640,14 @@ impl HostList {
         {
             deferred.view_heaps.push(heap.clone());
         }
+    }
+
+    /// Retains the host texture named by an aliasing or UAV barrier.
+    pub(crate) fn keep_barrier_texture(&self, texture: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred()
+            .barrier_textures
+            .entry(std::sync::Arc::as_ptr(&texture) as usize)
+            .or_insert(texture);
     }
 
     /// Whether this is the first time since the reset that the list asks
