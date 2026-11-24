@@ -117,6 +117,43 @@ static PAGES: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
 /// 174 MB heap would otherwise keep all of theirs for good.
 const KEPT: usize = 4096;
 
+/// Merges what the GPU wrote into title bytes: where `host` differs from
+/// `old` (its bytes before the submission) the GPU's byte goes into
+/// `title`; elsewhere the title's byte stays. `host` and `old` then take
+/// `title`'s bytes. Whether `title` changed. Word by word, without branches per
+/// byte (the world copies back hundreds of MB per frame).
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    const LO: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let n = title.len().min(host.len()).min(old.len());
+    let words = n / 8;
+    let mut changed = 0u64;
+    let rd = |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    for i in 0..words {
+        let (t, h, o) = (rd(title, i), rd(host, i), rd(old, i));
+        // 0xff in each byte where h != o, 0 elsewhere.
+        let x = h ^ o;
+        let nz = (((x & LO).wrapping_add(LO)) | x) & HI;
+        let mask = (nz >> 7).wrapping_mul(0xff);
+        let merged = (h & mask) | (t & !mask);
+        changed |= merged ^ t;
+        title[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
+        host[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
+        old[i * 8..i * 8 + 8].copy_from_slice(&merged.to_ne_bytes());
+    }
+    let mut tail_changed = false;
+    for j in words * 8..n {
+        let (t, h, o) = (title[j], host[j], old[j]);
+        if h != o && t != h {
+            title[j] = h;
+            tail_changed = true;
+        }
+        host[j] = title[j];
+        old[j] = title[j];
+    }
+    changed != 0 || tail_changed
+}
+
 /// A page buffer, from the pool if it has one.
 fn page_buffer() -> Box<[u8]> {
     let kept = PAGES.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -373,16 +410,9 @@ impl Shadow {
                     // takes the title's bytes in turn, and so does the
                     // snapshot: to a later range that overlaps this one,
                     // they are not a shader's write to put back.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                        *o = *t;
-                    }
-                    if changed {
+                    // Word by word (the world copies back hundreds of MB
+                    // per frame).
+                    if merge_gpu_writes(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -776,6 +806,38 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_merge_matches_byte_merge() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 4) as u8
+        };
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 1000] {
+            for _ in 0..100 {
+                let old: Vec<u8> = (0..len).map(|_| next()).collect();
+                let host: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let title: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let (mut t1, mut h1) = (title.clone(), host.clone());
+                let (mut t2, mut h2) = (title.clone(), host.clone());
+                let mut o1 = old.clone();
+                let fast = super::merge_gpu_writes(&mut t1, &mut h1, &mut o1);
+                assert_eq!(o1, t1);
+                let mut slow = false;
+                for ((t, h), o) in t2.iter_mut().zip(h2.iter_mut()).zip(&old) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        slow = true;
+                    }
+                    *h = *t;
+                }
+                assert_eq!((fast, &t1, &h1), (slow, &t2, &h2), "len {len}");
+            }
+        }
+    }
     use std::ops::Range;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
