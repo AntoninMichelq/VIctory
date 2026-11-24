@@ -1591,6 +1591,12 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            why(&format!(
+                "no host pipeline: {}",
+                crate::pipeline::drop_reason(self.pipeline as This)
+            ));
+            #[cfg(not(feature = "diagnostics"))]
             why("no host pipeline (not translated, or still compiling)");
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
