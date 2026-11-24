@@ -607,6 +607,29 @@ fn emit_program(
             e.interp = 1;
         }
     }
+    // The front face is constant; the title packs it beside interpolated
+    // generic elements (a register of its own leaves those their mode). The
+    // rasterizer gives it, so its register links to no producer's.
+    if pixel {
+        let generic_rows: Vec<u32> = inputs
+            .iter()
+            .filter(|e| e.kind == 0)
+            .filter_map(|e| e.row)
+            .collect();
+        let mut free = inputs
+            .iter()
+            .filter_map(|e| e.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        for e in inputs.iter_mut().filter(|e| e.kind == 13) {
+            if e.row.is_some_and(|r| generic_rows.contains(&r)) {
+                e.row = Some(free);
+                e.col = 0;
+                free += 1;
+            }
+        }
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
