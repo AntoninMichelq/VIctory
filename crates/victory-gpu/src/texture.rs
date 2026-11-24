@@ -393,10 +393,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // a raw detile would write as garbage over what the host rendered.
     // shortcut: not converted; the host's contents stay.
     if crate::resource::substituted(resource) {
-        once!(
-            ?desc,
-            "contents of a texture made in a stand-in format not uploaded"
-        );
+        once!(?desc, "contents of a texture made in a stand-in format not uploaded");
         return None;
     }
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -789,16 +786,8 @@ mod tests {
             fill_linear_rgba(&layout, mem, v1);
         }
 
-        let staging = create_staging(
-            &host,
-            None,
-            0,
-            std::ptr::null(),
-            &copy.texture,
-            layout.clone(),
-            raw,
-        )
-        .expect("create staging");
+        let staging = create_staging(&host, None, 0, std::ptr::null(), &copy.texture, layout.clone(), raw)
+            .expect("create staging");
 
         let run_once = || {
             let list = host.new_list().expect("new list");

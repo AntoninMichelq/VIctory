@@ -52,10 +52,7 @@ pub(crate) fn frames_in_flight() -> u64 {
             .unwrap_or(0)
             .min(3);
         if n > 0 {
-            tracing::info!(
-                frames = n,
-                "VICTORY_ASYNC_SUBMIT: queues run their work on their own threads"
-            );
+            tracing::info!(frames = n, "VICTORY_ASYNC_SUBMIT: queues run their work on their own threads");
         }
         n
     })

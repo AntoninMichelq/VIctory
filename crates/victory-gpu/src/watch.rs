@@ -194,9 +194,7 @@ pub(crate) fn uncover(at: usize, len: usize) {
 
 /// Whether pages `[first, last)` were asked in this epoch.
 fn covered(runs: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
-    runs.range(..=first)
-        .next_back()
-        .is_some_and(|(_, &end)| end >= last)
+    runs.range(..=first).next_back().is_some_and(|(_, &end)| end >= last)
 }
 
 /// Notes pages `[first, last)` asked in this epoch, merging runs.
@@ -223,9 +221,7 @@ fn allocation(j: &mut Journal, at: usize) -> Option<(usize, usize, bool)> {
     {
         return Some((base, end, watched));
     }
-    use windows_sys::Win32::System::Memory::{
-        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
-    };
+    use windows_sys::Win32::System::Memory::{MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
     // SAFETY: describes an address without dereferencing it; the output
@@ -246,12 +242,7 @@ fn allocation(j: &mut Journal, at: usize) -> Option<(usize, usize, bool)> {
         return None;
     }
     // Entries overlapping it are gone (the cache keeps disjoint ones).
-    let stale: Vec<usize> = j
-        .allocations
-        .range(..end)
-        .filter(|(_, (e, _))| *e > base)
-        .map(|(&b, _)| b)
-        .collect();
+    let stale: Vec<usize> = j.allocations.range(..end).filter(|(_, (e, _))| *e > base).map(|(&b, _)| b).collect();
     for b in stale {
         j.allocations.remove(&b);
     }
@@ -393,35 +384,18 @@ fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usiz
             }
         },
     };
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// Notes `pages` written as of a new asking; its number and the journal's
 /// entries for pages `[first, last)`.
-fn record(
-    j: &mut Journal,
-    pages: Vec<usize>,
-    first: usize,
-    last: usize,
-) -> (u64, Vec<(usize, u64)>) {
+fn record(j: &mut Journal, pages: Vec<usize>, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
     j.asked += 1;
     let now = j.asked;
     for page in pages {
         j.written.insert(page, now);
     }
-    (
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    )
+    (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
 }
 
 /// Guarded blocks of view memory.
@@ -623,12 +597,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         // Its allocations are new too.
         let end = at.saturating_add(len);
         let mut j = journal();
-        let gone: Vec<usize> = j
-            .allocations
-            .range(..end)
-            .filter(|(_, (e, _))| *e > at)
-            .map(|(&b, _)| b)
-            .collect();
+        let gone: Vec<usize> =
+            j.allocations.range(..end).filter(|(_, (e, _))| *e > at).map(|(&b, _)| b).collect();
         for b in gone {
             j.allocations.remove(&b);
         }

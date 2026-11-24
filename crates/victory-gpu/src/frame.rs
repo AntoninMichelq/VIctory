@@ -85,6 +85,7 @@ fn parse_fps(value: Option<&str>) -> Option<Duration> {
         .then(|| Duration::from_nanos((1e9 / fps) as u64))
 }
 
+
 /// Per event kind: the offset from the tick, in nanoseconds, last scheduled.
 static OFFSETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -126,11 +127,7 @@ fn preload() {
         }
         if logged.elapsed() >= Duration::from_secs(2) {
             logged = Instant::now();
-            tracing::info!(
-                left,
-                waited_s = spent.as_secs(),
-                "preloading pipelines before the next frame"
-            );
+            tracing::info!(left, waited_s = spent.as_secs(), "preloading pipelines before the next frame");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -176,7 +173,13 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// until it. An event happens once per tick, after `offset` nanoseconds:
 /// a wait woken a little early must not let the next one end on the same
 /// tick. Offsets of a whole tick or more move the event into a later tick.
-fn event_after(elapsed: u128, interval: u128, first: u64, last: u64, offset: u128) -> (u64, u128) {
+fn event_after(
+    elapsed: u128,
+    interval: u128,
+    first: u64,
+    last: u64,
+    offset: u128,
+) -> (u64, u128) {
     let interval = interval.max(1);
     let extra = (offset / interval) as u64;
     let remainder = offset % interval;
@@ -407,23 +410,9 @@ mod fps_tests {
 
     #[test]
     fn fps_override_parses() {
-        assert_eq!(
-            parse_fps(Some("60")),
-            Some(Duration::from_nanos(16_666_666))
-        );
-        assert_eq!(
-            parse_fps(Some(" 120 ")),
-            Some(Duration::from_nanos(8_333_333))
-        );
-        for bad in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("-5"),
-            Some("abc"),
-            Some("inf"),
-            Some("5000"),
-        ] {
+        assert_eq!(parse_fps(Some("60")), Some(Duration::from_nanos(16_666_666)));
+        assert_eq!(parse_fps(Some(" 120 ")), Some(Duration::from_nanos(8_333_333)));
+        for bad in [None, Some(""), Some("0"), Some("-5"), Some("abc"), Some("inf"), Some("5000")] {
             assert_eq!(parse_fps(bad), None, "{bad:?}");
         }
     }

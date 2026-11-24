@@ -64,10 +64,7 @@ fn build() -> &'static [u8; 32] {
         h.update(b"victory shader cache v2");
         h.update(victory_shader::SOURCE_HASH.as_bytes());
         h.update(include_str!("shader_cache.rs").as_bytes());
-        h.update(&[
-            u8::from(cfg!(debug_assertions)),
-            u8::from(cfg!(feature = "diagnostics")),
-        ]);
+        h.update(&[u8::from(cfg!(debug_assertions)), u8::from(cfg!(feature = "diagnostics"))]);
         h.update(&limit.to_le_bytes());
         h.update(&spin.to_le_bytes());
         h.update(&[u8::from(victory_shader::emit::root_uavs())]);
@@ -460,37 +457,19 @@ mod tests {
         let build = key(&[7; 32], Target::ANY);
         let container = b"a console container".as_slice();
         let ok = |_: &[u8]| Ok(shader());
-        assert_eq!(
-            store_with(&cache, &build, container, ok),
-            Ok(Stored::Written)
-        );
-        assert_eq!(
-            store_with(&cache, &build, container, ok),
-            Ok(Stored::AlreadyCached)
-        );
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::Written));
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::AlreadyCached));
         // The runtime's lookup with the same key does not translate.
         let never = |_: &[u8]| -> Result<HostShader, String> { panic!("translated again") };
         assert_eq!(cached(&cache, &build, container, never), Ok(shader()));
         // Another host's waves are another entry.
-        let other = key(
-            &[7; 32],
-            Target {
-                lanes_min: 32,
-                lanes_max: 32,
-            },
-        );
-        assert_eq!(
-            store_with(&cache, &other, container, ok),
-            Ok(Stored::Written)
-        );
+        let other = key(&[7; 32], Target { lanes_min: 32, lanes_max: 32 });
+        assert_eq!(store_with(&cache, &other, container, ok), Ok(Stored::Written));
         // A damaged entry is written again; failures are not stored.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH3 broken").unwrap();
         }
-        assert_eq!(
-            store_with(&cache, &build, container, ok),
-            Ok(Stored::Written)
-        );
+        assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::Written));
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(store_with(&cache, &build, b"other", fail).is_err());
         assert!(cached(&cache, &build, b"other", fail).is_err());

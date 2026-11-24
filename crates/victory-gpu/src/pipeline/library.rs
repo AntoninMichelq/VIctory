@@ -194,18 +194,14 @@ fn blob_path(name: &str) -> Option<PathBuf> {
 
 /// The driver binary kept for `name` by [`keep_blob`], if any.
 pub(crate) fn cached_blob(name: &str) -> Option<Vec<u8>> {
-    std::fs::read(blob_path(name)?)
-        .ok()
-        .filter(|b| !b.is_empty())
+    std::fs::read(blob_path(name)?).ok().filter(|b| !b.is_empty())
 }
 
 /// Keeps `pso`'s driver binary for the next run (see [`cached_blob`]).
 pub(crate) fn keep_blob(name: &str, pso: &ID3D12PipelineState) {
     let Some(path) = blob_path(name) else { return };
     // SAFETY: a live pipeline.
-    let Ok(blob) = (unsafe { pso.GetCachedBlob() }) else {
-        return;
-    };
+    let Ok(blob) = (unsafe { pso.GetCachedBlob() }) else { return };
     // SAFETY: the blob's own pointer and size.
     let bytes = unsafe {
         std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
@@ -218,11 +214,7 @@ pub(crate) fn keep_blob(name: &str, pso: &ID3D12PipelineState) {
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| write_atomically(&path, bytes));
     match done {
-        Ok(()) => tracing::info!(
-            name,
-            bytes = bytes.len(),
-            "slow pipeline's driver binary kept"
-        ),
+        Ok(()) => tracing::info!(name, bytes = bytes.len(), "slow pipeline's driver binary kept"),
         Err(e) => tracing::warn!(name, error = %e, "slow pipeline's driver binary not kept"),
     }
 }
@@ -252,11 +244,7 @@ fn load_or_create(
     // the lock, loads (seconds each when the driver rebuilds the pipeline)
     // queued every worker behind one another: the world made one pipeline
     // per 5 s with a thousand waiting.
-    let shared = library
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .library
-        .clone();
+    let shared = library.lock().unwrap_or_else(|e| e.into_inner()).library.clone();
     let loading = std::time::Instant::now();
     let loaded = load(&shared, PCWSTR(wide.as_ptr()));
     let load_us = loading.elapsed().as_micros() as u64;
@@ -633,12 +621,10 @@ mod tests {
         assert_eq!(published.len(), 64 * 1024);
         assert!(published.iter().all(|&byte| byte == published[0]));
         assert!((1..=8).contains(&published[0]));
-        assert!(
-            !std::fs::read_dir(dir.path())
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-        );
+        assert!(!std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
     }
 
     #[test]
@@ -648,12 +634,10 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         assert!(write_atomically(&path, b"not published").is_err());
-        assert!(
-            !std::fs::read_dir(dir.path())
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-        );
+        assert!(!std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
     }
 
     #[test]

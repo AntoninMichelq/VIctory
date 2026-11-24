@@ -134,8 +134,7 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
     let n = title.len().min(host.len()).min(old.len());
     let words = n / 8;
     let mut changed = 0u64;
-    let rd =
-        |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let rd = |b: &[u8], i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
     for i in 0..words {
         let (t, h, o) = (rd(title, i), rd(host, i), rd(old, i));
         // 0xff in each byte where h != o, 0 elsewhere.
@@ -227,8 +226,7 @@ impl Shadow {
     #[cfg(test)]
     pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
         // SAFETY: inside the mapping; no submission runs while tests read.
-        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }
-            .to_vec()
+        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
     #[cfg(test)]
@@ -785,50 +783,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let end = address.checked_add(len.max(1))?;
-    match buffer_covering(address, end) {
-        Some(found) => found,
-        None => loose(address, end),
-    }
-}
-
-/// The copy a root shader view at `address` reads through when its program
-/// reaches up to `reach` bytes past it: the copy [`find`] gives when it
-/// holds that much, else a title buffer or a window of title memory that
-/// does (uncommitted parts read as zeros). Mesh programs keep a table of
-/// stream offsets of up to 32 MiB at the view's start; a copy ending
-/// sooner (a small title buffer, a 4 MiB window) read the rest as zeros
-/// and left the model's vertices in one point.
-pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
-    let near = find(address, 1)?;
-    if near.left(address) >= reach {
-        return Some(near);
-    }
-    let end = address.checked_add(reach)?;
-    let far = match buffer_covering(address, end) {
-        Some(found) => found,
-        None => loose(address, end),
-    };
-    let Some(far) = far else {
-        return Some(near);
-    };
-    static LONGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = LONGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 16 || n.is_power_of_two() {
-        tracing::info!(
-            address = format_args!("{address:#x}"),
-            was_kb = near.left(address) >> 10,
-            now_kb = far.left(address) >> 10,
-            reach_kb = reach >> 10,
-            views = n + 1,
-            "root view copy made longer for what its program reads"
-        );
-    }
-    Some(far)
-}
-
-/// The copy of the innermost title buffer holding `[address, end)` (made
-/// on first use; inner `None` if that fails), or `None` if no buffer does.
-fn buffer_covering(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
     let mut map = buffers();
     // Called for every buffer a draw reads: one pass, no allocation.
     let (mut innermost, mut made) = (None, None);
@@ -842,17 +796,17 @@ fn buffer_covering(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
         }
         innermost.get_or_insert(*k);
     }
-    let key = made.or(innermost)?;
-    let Some(entry) = map.get_mut(&key) else {
-        return Some(None);
+    let key = made.or(innermost);
+    let Some(key) = key else {
+        drop(map);
+        return loose(address, end);
     };
+    let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let Some((buffer, data)) = allocate_buffer(len.next_multiple_of(1 << 16)) else {
-            return Some(None);
-        };
+        let (buffer, data) = allocate_buffer(len.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -871,7 +825,7 @@ fn buffer_covering(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
         }
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
-    Some(entry.shadow.clone())
+    entry.shadow.clone()
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -956,11 +910,7 @@ fn idle(shadow: &Arc<Shadow>) -> bool {
         1
     } else if !shadow.pending.lock().is_ok_and(|p| p.is_empty()) {
         2
-    } else if !shadow
-        .before
-        .lock()
-        .is_ok_and(|b| b.pages.is_empty() && b.spans.is_empty())
-    {
+    } else if !shadow.before.lock().is_ok_and(|b| b.pages.is_empty() && b.spans.is_empty()) {
         3
     } else {
         return true;
@@ -1114,14 +1064,8 @@ mod tests {
         for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 1000] {
             for _ in 0..100 {
                 let old: Vec<u8> = (0..len).map(|_| next()).collect();
-                let host: Vec<u8> = old
-                    .iter()
-                    .map(|&o| if next() == 0 { next() } else { o })
-                    .collect();
-                let title: Vec<u8> = old
-                    .iter()
-                    .map(|&o| if next() == 0 { next() } else { o })
-                    .collect();
+                let host: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
+                let title: Vec<u8> = old.iter().map(|&o| if next() == 0 { next() } else { o }).collect();
                 let (mut t1, mut h1) = (title.clone(), host.clone());
                 let (mut t2, mut h2) = (title.clone(), host.clone());
                 let mut o1 = old.clone();
@@ -1274,6 +1218,7 @@ mod tests {
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
     }
+
 
     /// Three pages of title memory on page bounds (plain heap memory, so
     /// not write-watched: refreshes copy whole ranges) and their host

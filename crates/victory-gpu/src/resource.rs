@@ -269,9 +269,7 @@ fn host_lacks_target(format: u32) -> bool {
         return false;
     };
     *LACKS[i].get_or_init(|| {
-        let Some(host) = crate::host::host() else {
-            return false;
-        };
+        let Some(host) = crate::host::host() else { return false };
         let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
             Format: DXGI_FORMAT(format as i32),
             ..Default::default()
@@ -284,14 +282,10 @@ fn host_lacks_target(format: u32) -> bool {
                 size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
             )
         };
-        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
-            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
         let lacks = asked.is_err() || support.Support1.0 & needed != needed;
         if lacks {
-            tracing::info!(
-                format,
-                "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU"
-            );
+            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
         }
         lacks
     })
@@ -901,7 +895,8 @@ impl Resource {
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
                 let texture = host_texture(&self.desc, state, clear)?;
-                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                let state =
+                    crate::host::legal_state(&texture, crate::host::texture_state(state));
                 let bytes = allocation_bytes(&texture);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
@@ -935,10 +930,7 @@ static ALIASES: std::sync::Mutex<
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn alias_report(address: u64) -> String {
     let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let near = map
-        .range(..=address)
-        .next_back()
-        .or_else(|| map.range(address..).next());
+    let near = map.range(..=address).next_back().or_else(|| map.range(address..).next());
     let Some((&at, list)) = near else {
         return "no host texture anywhere".into();
     };
@@ -954,10 +946,7 @@ pub(crate) fn alias_report(address: u64) -> String {
             )
         })
         .collect();
-    format!(
-        "nearest host texture at {at:#x} ({:+}): {descs:?}",
-        at as i64 - address as i64
-    )
+    format!("nearest host texture at {at:#x} ({:+}): {descs:?}", at as i64 - address as i64)
 }
 
 /// For a view-only texture: a host texture the GPU writes (render target or
@@ -1034,11 +1023,7 @@ fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTextu
     let own = pc_format(desc.format);
     let mips = u32::from(desc.mip_levels).max(1).min(mip_count(desc));
     let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let live: Vec<_> = map
-        .get(&address)?
-        .iter()
-        .filter_map(|w| w.upgrade())
-        .collect();
+    let live: Vec<_> = map.get(&address)?.iter().filter_map(|w| w.upgrade()).collect();
     let shared = live.iter().find(|h| {
         // SAFETY: a live resource.
         let d = unsafe { h.texture.GetDesc() };
@@ -2313,18 +2298,13 @@ void main() {
                 (D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, copy),
             ]
         );
-        assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(image, 0x10)(image),
-            0
-        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
     }
 
     #[cfg(windows)]
     #[test]
     fn recorded_uav_barrier_retains_the_released_texture() {
-        use windows::Win32::Graphics::Direct3D12::{
-            ID3D12CommandAllocator, ID3D12GraphicsCommandList,
-        };
+        use windows::Win32::Graphics::Direct3D12::{ID3D12CommandAllocator, ID3D12GraphicsCommandList};
         use windows::core::Interface;
 
         let Some(gpu) = crate::host::host() else {
@@ -2333,66 +2313,33 @@ void main() {
         };
         let null = std::ptr::null();
         let (mut image, mut allocator, mut list) = (null, null, null);
-        let rgba = ResourceDesc {
-            flags: 4,
-            ..texture(4, 4, 28, 1)
-        };
+        let rgba = ResourceDesc { flags: 4, ..texture(4, 4, 28, 1) };
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &rgba,
-                8,
-                null.cast(),
-                &RESOURCE_IIDS[0],
-                &mut image
-            ),
+            create_committed(null, &PROPERTIES, 0, &rgba, 8, null.cast(), &RESOURCE_IIDS[0], &mut image),
             S_OK,
         );
         let owner = std::sync::Arc::downgrade(&host_copy(image).unwrap());
         let allocator_iid = ID3D12CommandAllocator::IID;
         assert_eq!(
-            crate::list::create_allocator(
-                null,
-                0,
-                (&raw const allocator_iid).cast(),
-                &mut allocator
-            ),
+            crate::list::create_allocator(null, 0, (&raw const allocator_iid).cast(), &mut allocator),
             S_OK,
         );
         let list_iid = ID3D12GraphicsCommandList::IID;
         assert_eq!(
-            crate::list::create_list(
-                null,
-                0,
-                0,
-                allocator,
-                null,
-                (&raw const list_iid).cast(),
-                &mut list
-            ),
+            crate::list::create_list(null, 0, 0, allocator, null, (&raw const list_iid).cast(), &mut list),
             S_OK,
         );
         // Legacy barrier layout: UAV kind 2, flags 0, and the title resource.
         let barrier = [2u64, image as u64, 0, 0];
         let record = slot::<extern "system" fn(This, u32, *const u64) -> u32>(list, 0xd0);
         assert_eq!(record(list, 1, barrier.as_ptr()), 0);
-        assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
-            S_OK
-        );
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(image), 0);
         assert_eq!(owner.strong_count(), 1);
         let host_list = crate::list::host_list(list).unwrap();
         gpu.execute(&[&host_list]);
-        assert_eq!(
-            slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
-                list, allocator, null
-            ),
-            S_OK
-        );
+        assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
         assert_eq!(owner.strong_count(), 0);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
@@ -2620,68 +2567,23 @@ void main() {
         let (mut image, mut upload_buf, mut dst_aligned, mut dst_packed, mut dst_crop) =
             (null, null, null, null, null);
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &tex_desc,
-                0,
-                null.cast(),
-                iid,
-                &mut image
-            ),
+            create_committed(null, &PROPERTIES, 0, &tex_desc, 0, null.cast(), iid, &mut image),
             S_OK
         );
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &buffer(1024),
-                0,
-                null.cast(),
-                iid,
-                &mut upload_buf
-            ),
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut upload_buf),
             S_OK
         );
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &buffer(2048),
-                0,
-                null.cast(),
-                iid,
-                &mut dst_aligned
-            ),
+            create_committed(null, &PROPERTIES, 0, &buffer(2048), 0, null.cast(), iid, &mut dst_aligned),
             S_OK
         );
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &buffer(256),
-                0,
-                null.cast(),
-                iid,
-                &mut dst_packed
-            ),
+            create_committed(null, &PROPERTIES, 0, &buffer(256), 0, null.cast(), iid, &mut dst_packed),
             S_OK
         );
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &buffer(1024),
-                0,
-                null.cast(),
-                iid,
-                &mut dst_crop
-            ),
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_crop),
             S_OK
         );
 
@@ -2740,15 +2642,8 @@ void main() {
             kind: u32,
             footprint: PlacedFootprint,
         }
-        type Copy = extern "system" fn(
-            This,
-            *const Location,
-            u32,
-            u32,
-            u32,
-            *const Location,
-            *const [u32; 6],
-        );
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
         let copy = slot::<Copy>(list, 0x80);
 
         let full_rows = PlacedFootprint {
@@ -2762,10 +2657,7 @@ void main() {
         let tex_loc = Location {
             resource: image,
             kind: 0,
-            footprint: PlacedFootprint {
-                offset: 0,
-                ..full_rows
-            },
+            footprint: PlacedFootprint { offset: 0, ..full_rows },
         };
         let up_loc = Location {
             resource: upload_buf,
@@ -2830,14 +2722,7 @@ void main() {
                 let mut output = null;
                 assert_eq!(
                     create_committed(
-                        null,
-                        &PROPERTIES,
-                        0,
-                        &buffer(size),
-                        0,
-                        null.cast(),
-                        iid,
-                        &mut output,
+                        null, &PROPERTIES, 0, &buffer(size), 0, null.cast(), iid, &mut output,
                     ),
                     S_OK
                 );
@@ -2859,16 +2744,7 @@ void main() {
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
         assert_eq!(
-            create_committed(
-                null,
-                &PROPERTIES,
-                0,
-                &buffer(1024),
-                0,
-                null.cast(),
-                iid,
-                &mut dst_d16s8
-            ),
+            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_d16s8),
             S_OK
         );
         let d16s8_loc = Location {
@@ -2885,44 +2761,27 @@ void main() {
         };
         copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
 
-        assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
-            S_OK
-        );
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Verify 256-aligned readback at offset 256 (leading 256 bytes untouched).
         let (al_ptr, _) = buffer_bytes(dst_aligned).unwrap();
         // SAFETY: dst_aligned holds 2048 bytes.
         let al = unsafe { std::slice::from_raw_parts(al_ptr, 2048) };
-        assert!(
-            al[..256].iter().all(|&b| b == 0),
-            "bytes before offset touched"
-        );
+        assert!(al[..256].iter().all(|&b| b == 0), "bytes before offset touched");
         for row in 0..4 {
             let at = 256 + row * 256;
-            assert_eq!(
-                al[at..at + 16],
-                up[row * 256..row * 256 + 16],
-                "aligned row {row}"
-            );
+            assert_eq!(al[at..at + 16], up[row * 256..row * 256 + 16], "aligned row {row}");
         }
 
         // Verify unaligned packed readback (row_pitch 16, offset 32).
         let (pk_ptr, _) = buffer_bytes(dst_packed).unwrap();
         // SAFETY: dst_packed holds 256 bytes.
         let pk = unsafe { std::slice::from_raw_parts(pk_ptr, 256) };
-        assert!(
-            pk[..32].iter().all(|&b| b == 0),
-            "bytes before packed offset touched"
-        );
+        assert!(pk[..32].iter().all(|&b| b == 0), "bytes before packed offset touched");
         for row in 0..4 {
             let at = 32 + row * 16;
-            assert_eq!(
-                pk[at..at + 16],
-                up[row * 256..row * 256 + 16],
-                "packed row {row}"
-            );
+            assert_eq!(pk[at..at + 16], up[row * 256..row * 256 + 16], "packed row {row}");
         }
 
         // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
@@ -2932,21 +2791,14 @@ void main() {
         for row in 0..2 {
             let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
             let dst_at = row * 256;
-            assert_eq!(
-                cr[dst_at..dst_at + 8],
-                up[src_at..src_at + 8],
-                "crop row {row}"
-            );
+            assert_eq!(cr[dst_at..dst_at + 8], up[src_at..src_at + 8], "crop row {row}");
         }
 
         // Verify skipped 118..=120 readback left its buffer untouched.
         let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
         // SAFETY: dst_d16s8 holds 1024 bytes.
         let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
-        assert!(
-            d16.iter().all(|&b| b == 0),
-            "mismatched format 118 buffer touched"
-        );
+        assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
 
         for (output, footprint, dst_x, dst_y, region) in partials {
             let [left, top, _, right, bottom, _] = region.unwrap_or([0, 0, 0, 4, 4, 1]);
@@ -2965,8 +2817,7 @@ void main() {
                         &[0xa5; 4]
                     };
                     assert_eq!(
-                        &pixels[at..at + 4],
-                        expected,
+                        &pixels[at..at + 4], expected,
                         "pixel ({x}, {y}) in {footprint:?}"
                     );
                 }
