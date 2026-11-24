@@ -1072,6 +1072,8 @@ struct Deferred {
     /// Ranges shaders write declared since the last title copy, as
     /// `refreshed`: a repeat would only flush and find the range taken.
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffers over direct title memory the list uses, kept alive.
+    direct: std::collections::HashSet<usize>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2269,6 +2271,17 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// Keeps a buffer over direct title memory (and its heap, which the
+    /// title's pages stay pinned by) alive until the list is reset.
+    pub(crate) fn keep_direct(&self, buffer: &ID3D12Resource) {
+        let mut deferred = self.deferred();
+        if deferred.direct.insert(buffer.as_raw() as usize)
+            && let Ok(object) = buffer.cast::<windows::core::IUnknown>()
+        {
+            deferred.kept.push(object);
+        }
+    }
+
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);

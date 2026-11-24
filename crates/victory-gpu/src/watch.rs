@@ -477,6 +477,7 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::shadow::direct_remapped(at as u64, len as u64);
     {
         // Its allocations are new too.
         let end = at.saturating_add(len);

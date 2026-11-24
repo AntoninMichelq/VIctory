@@ -15,7 +15,7 @@
 //! still need read/write tracking independent of conventional table use.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -42,6 +42,14 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
+    /// Where `start` is in `buffer` (0 but for direct title memory).
+    base: u64,
+    /// With `VICTORY_DIRECT_MEMORY`: no copy, `buffer` shows title memory
+    /// itself ([`crate::direct`]); nothing is refreshed or copied back.
+    direct: Option<Arc<crate::direct::Heap>>,
+    /// Direct only: the title mapped other pages over part of the range
+    /// since, so `buffer` no longer shows it ([`direct_remapped`]).
+    stale: AtomicBool,
 }
 
 #[derive(Default)]
@@ -209,6 +217,9 @@ unsafe impl Sync for Shadow {}
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.direct.is_some() {
+            return;
+        }
         // SAFETY: a live resource.
         let bytes = unsafe { self.buffer.GetDesc() }.Width;
         crate::memstat::sub(&crate::memstat::SHADOWS, bytes);
@@ -227,16 +238,21 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// Offset of a title address from the buffer's start.
+    /// Offset of a title address in the buffer.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        self.base + address - self.start
+    }
+
+    /// Whether this shows title memory in place (no copy).
+    fn stale(&self) -> bool {
+        self.direct.is_some() && self.stale.load(Ordering::Relaxed)
     }
 
     /// The copy's bytes at `[address, address + len)` (inside the buffer).
     #[cfg(test)]
     pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
         // SAFETY: inside the mapping; no submission runs while tests read.
-        unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
+        unsafe { std::slice::from_raw_parts(self.data.add((address - self.start) as usize), len) }.to_vec()
     }
 
     #[cfg(test)]
@@ -249,6 +265,10 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct.is_some() {
+            list.keep_direct(&self.buffer);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -269,7 +289,38 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            base: 0,
+            direct: None,
+            stale: AtomicBool::new(false),
         }
+    }
+
+    /// Title memory `[start, start + len)` shown in place, if it can be
+    /// ([`crate::direct`]); registered so that remapping it is noticed.
+    fn direct(start: u64, len: u64) -> Option<Arc<Shadow>> {
+        if !crate::direct::enabled() {
+            return None;
+        }
+        let (heap, buffer, gpu, at) = crate::direct::resolve(start, len)?;
+        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        let shadow = Arc::new(Shadow {
+            buffer,
+            data: start as *mut u8,
+            gpu: gpu + at,
+            start,
+            len,
+            copied: Mutex::new(vec![0; pages as usize]),
+            watched: AtomicU8::new(NOT_WATCHED),
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            base: at,
+            direct: Some(heap),
+            stale: AtomicBool::new(false),
+        });
+        let mut all = DIRECT.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|(_, _, s)| s.strong_count() > 0);
+        all.push((start, start + len, Arc::downgrade(&shadow)));
+        Some(shadow)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -289,6 +340,11 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct.is_some() {
+            // The GPU writes title memory itself, as the console's does.
+            list.keep_direct(&self.buffer);
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -663,7 +719,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         if e.end < end {
             continue;
         }
-        if e.shadow.is_some() {
+        if e.shadow.as_ref().is_some_and(|s| !s.stale()) {
             made = Some(*k);
             break;
         }
@@ -675,8 +731,12 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
+    if entry.shadow.as_ref().is_none_or(|s| s.stale()) {
         let len = entry.end - key.0;
+        if let Some(direct) = Shadow::direct(key.0, len) {
+            entry.shadow = Some(direct);
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -719,16 +779,20 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
     if let Some(shadow) = map
-        .range(..=(start, u64::MAX))
+        .range(..=(address, u64::MAX))
         .rev()
         .take(64)
-        .find(|((s, l), _)| *s <= address && s + l >= end)
+        .find(|((s, l), shadow)| *s <= address && s + l >= end && !shadow.stale())
         .map(|(_, shadow)| shadow.clone())
     {
         return Some(shadow);
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
+    }
+    if let Some(direct) = Shadow::direct(start, len).or_else(|| Shadow::direct(address, end - address)) {
+        map.insert((direct.start, direct.len), direct.clone());
+        return Some(direct);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -742,6 +806,31 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Direct shadows by title range, to notice remapping.
+type DirectRanges = Vec<(u64, u64, std::sync::Weak<Shadow>)>;
+static DIRECT: Mutex<DirectRanges> = Mutex::new(Vec::new());
+
+/// The title mapped or unmapped `[at, at + len)`: direct shadows over it
+/// no longer show it and are made again on next use. Lists recorded with
+/// them already keep the old pages (shortcut).
+pub(crate) fn direct_remapped(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let mut all = DIRECT.lock().unwrap_or_else(|e| e.into_inner());
+    if all.is_empty() {
+        return;
+    }
+    all.retain(|(s, e, shadow)| {
+        let Some(shadow) = shadow.upgrade() else {
+            return false;
+        };
+        if *s < end && at < *e {
+            shadow.stale.store(true, Ordering::Relaxed);
+            return false;
+        }
+        true
+    });
 }
 
 /// For device-removed reports: the copy of title memory whose host range
