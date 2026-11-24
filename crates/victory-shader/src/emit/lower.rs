@@ -5918,6 +5918,41 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A buffer the program picks from the view heap by an index it
+        // computes (`ResourceHeap`) has no used-resource entry, and the
+        // slot may hold a buffer view, not a constant buffer. Read as a
+        // constant buffer, a buffer view's loads give nothing: Grand Theft
+        // Auto VI's meshlet culling (BatchCullMeshlets and its variants)
+        // reads its batch records, mesh headers and instance transforms
+        // this way, so it passed no meshlet and every indirect mesh draw of
+        // the world (buildings, ground) ran empty. The host's stride table
+        // by heap slot tells a buffer view (not 0) from a constant buffer
+        // (0); only the load that fits the slot runs. Same finding as
+        // fxceless/victory-gta6 578d459 (GPL-3), written for this tree.
+        if kind.is_none()
+            && let Some(stride) = self.heap_buffer_stride(src)?
+        {
+            let zero = self.s.m.i32(0);
+            let is_buffer = self.s.m.cmp(c, pred::NE, stride, zero);
+            let at = self.begin_guarded(Some(is_buffer));
+            let h = self.handle(site, src, false, (11, 0))?;
+            let words = self.view_dwords(h, Some(0), addr, None, count);
+            let pairs: Vec<(V, V)> = words.into_iter().map(|w| (w, zero)).collect();
+            let from_buffer = self.end_guarded(at, &pairs);
+            let c = self.cur;
+            let is_constant = self.s.m.cmp(c, pred::EQ, stride, zero);
+            let at = self.begin_guarded(Some(is_constant));
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let words = self.view_dwords(h, None, addr, None, count);
+            let pairs: Vec<(V, V)> = words.into_iter().map(|w| (w, zero)).collect();
+            let from_constant = self.end_guarded(at, &pairs);
+            let c = self.cur;
+            for (k, (b, cb)) in from_buffer.into_iter().zip(from_constant).enumerate() {
+                let x = self.s.m.select(c, is_buffer, b, cb);
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         // A raw or structured buffer view (an SRV, or a UAV the code also
         // reads through scalar memory), else a constant buffer view.
         let raw = kind
@@ -7265,6 +7300,47 @@ impl<'a> Lower<'a> {
             }
             _ => Err(WHY),
         }
+    }
+
+    /// The byte stride the host's table holds for the view-heap slot of
+    /// `src` (0: not a buffer view), when the program picks it from the
+    /// view heap at an index it computes (root type `ResourceHeap`); read
+    /// in the current block. `None` for any other descriptor.
+    fn heap_buffer_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        let heap = self
+            .scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let slot = self.heap_index(*load, *first, false)?;
+        let c = self.cur;
+        let table = self.s.stride_table_handle();
+        // Slots past the table read its last entry, zero (a root view has
+        // no bounds check).
+        let slots = self.s.m.i32(super::shader::STRIDE_TABLE_SLOTS);
+        let inside = self.s.m.cmp(c, pred::IULT, slot, slots);
+        let slot = self.s.m.select(c, inside, slot, slots);
+        let four = self.s.m.i32(4);
+        let addr = self.s.m.bin(c, Bin::Mul, slot, four);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let res = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, addr, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, res, 0);
+        Ok(Some(self.as_int(f)))
     }
 
     /// Byte offset `index * stride + off` for a structured buffer whose
