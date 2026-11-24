@@ -11950,6 +11950,17 @@ mod tests {
         }];
         let l = lower_wave(&HALF_SUM_WAVE64, layout.clone(), used.clone(), true).unwrap();
         assert!(l.wave_ops);
+        // The same reduction with v_add_f32 for each add in the section
+        // (the code after it unchanged): followed as an f32 sum.
+        let mut words = HALF_SUM_WAVE64;
+        for w in &mut words[9..27] {
+            if *w == 0x6404_04E9 || *w == 0x6404_04FA {
+                *w = (*w & !0x7E00_0000) | 0x03 << 25; // v_add_f32_dpp
+            } else if *w == 0xD532_0002 {
+                *w = 0xD503_0002; // v_add_f32_e64
+            }
+        }
+        lower_wave(&words, layout.clone(), used.clone(), true).unwrap();
         // Only the sum's low half is known (an f16 operation keeps its
         // destination's high half): a copy of the whole dword fails.
         let mut words = HALF_SUM_WAVE64;
