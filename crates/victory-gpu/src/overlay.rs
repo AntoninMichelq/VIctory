@@ -124,6 +124,13 @@ fn tick(hwnd: HWND) {
         }
         let mut corner = POINT { x: client.right, y: client.top };
         let _ = ClientToScreen(game, &mut corner);
+        // A maximized or borderless window's client area can start above
+        // or right of its screen: keep the box on the screen.
+        let mut screen = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST), &mut screen).as_bool() {
+            corner.x = corner.x.min(screen.rcWork.right);
+            corner.y = corner.y.max(screen.rcWork.top);
+        }
         let text = stats().text();
         *TEXT.lock().unwrap_or_else(|e| e.into_inner()) = text;
         let _ = SetWindowPos(
