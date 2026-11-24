@@ -1451,7 +1451,25 @@ impl<'a> Tracer<'a> {
                 .position(|w| w.1 == v)?;
             Some((site, k))
         };
-        let Some(sites) = words.iter().map(at).collect::<Option<Vec<_>>>() else {
+        // Dwords that are the same in every lane (constants, SGPRs) may
+        // stand in for some of the loaded ones (a fixed format or size
+        // word): the descriptor is then the one fetched, with those words
+        // as the heap's copy has them.
+        let mut sites = Vec::with_capacity(words.len());
+        let same = |w: Term| {
+            !self.varies(w)
+                || matches!(w, Term::Value(v) if self.def(v).is_some_and(|i| {
+                    i.name() == "v_mov_b32" && !i.reads.iter().any(|r| matches!(r.0, Reg::V(_)))
+                }))
+        };
+        for (i, w) in words.iter().enumerate() {
+            match at(w) {
+                Some(s) => sites.push(Some(s)),
+                None if i > 0 && same(*w) => sites.push(None),
+                None => return Ok(None),
+            }
+        }
+        let Some(&Some((load, first))) = sites.first() else {
             return Ok(None);
         };
         let address = |site: Site| {
@@ -1470,9 +1488,8 @@ impl<'a> Tracer<'a> {
             };
             self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
         };
-        let (load, first) = sites[0];
         let a0 = address(load)?;
-        for (k, &(site, dword)) in sites.iter().enumerate() {
+        for (k, (site, dword)) in sites.iter().enumerate().filter_map(|(k, s)| Some((k, (*s)?))) {
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
             if (a.param, a.dynamic, a.includes_base) != (a0.param, a0.dynamic, a0.includes_base)
@@ -2685,6 +2702,22 @@ pub(crate) mod tests {
         assert_eq!((a.param, a.offset, a.includes_base), (0, 0, false));
         assert!(a.dynamic.is_some());
         assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_buffer_loads_mixed_with_constant_words_are_fetched() {
+        // waterfall_buffer_wave32 with dword 3 replaced by a constant
+        // before the loop: v_mov_b32 v7, 0x31016fac after the loads.
+        let mut words = waterfall_buffer_wave32();
+        let at = words.iter().position(|&w| w == 0x8006_0801).unwrap() + 1;
+        words.splice(at..at, [0x7E0E_02FF, 0x3101_6FAC]);
+        let r = waterfall(&words, false).unwrap();
+        let image = &r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::Fetched { .. }))
+            .unwrap();
+        assert!(matches!(image.source, Source::Fetched { first: 0, .. }), "{:?}", image.source);
     }
 
     #[test]
