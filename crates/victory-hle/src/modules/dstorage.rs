@@ -990,6 +990,8 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            numbers = format_args!("{:x?}", &pages[..pages.len().min(8)]),
+            source = format_args!("{:#x}+{:#x} ({} bytes)", request.source as usize, request.offset, request.source_size),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
