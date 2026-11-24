@@ -47,6 +47,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Ranges refreshed whole in one watch generation (see
+    /// [`crate::watch::generation`]): asked again in it, nothing changed.
+    refreshed: Mutex<(u64, Vec<(usize, usize)>)>,
     /// The copy's bytes before the submission ran, by title page, covering
     /// the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
@@ -255,6 +258,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(WATCH_UNKNOWN),
             pending: Mutex::default(),
+            refreshed: Mutex::default(),
             before: Mutex::default(),
             used: std::sync::atomic::AtomicU64::new(0),
         }
@@ -489,6 +493,26 @@ impl Shadow {
             }
             if at < to {
                 bytes += self.update_free(at, to);
+            }
+            return bytes;
+        }
+        let generation = crate::watch::generation();
+        if generation != 0 && memo() {
+            {
+                let r = self.refreshed.lock().unwrap_or_else(|e| e.into_inner());
+                if r.0 == generation && r.1.iter().any(|&(a, e)| a <= from && e >= to) {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::Memoized, (to - from) as u64);
+                    return 0;
+                }
+            }
+            let bytes = self.update_free(from, to);
+            let mut r = self.refreshed.lock().unwrap_or_else(|e| e.into_inner());
+            if r.0 != generation {
+                *r = (generation, Vec::new());
+            }
+            if r.1.len() < 64 {
+                r.1.push((from, to));
             }
             return bytes;
         }
@@ -1446,4 +1470,11 @@ mod tests {
         let kept = unsafe { t.shadow.data.add(PAGE + 1024).cast::<u32>().read() };
         assert_eq!(kept, 7);
     }
+}
+
+/// Whether a range refreshed already in the watch generation is skipped:
+/// `VICTORY_REFRESH_MEMO=0` turns it off.
+fn memo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_MEMO").map_or(true, |v| v.trim() != "0"))
 }

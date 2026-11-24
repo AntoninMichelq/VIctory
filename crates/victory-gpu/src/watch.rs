@@ -131,6 +131,7 @@ pub(crate) fn begin_epoch() {
         return;
     }
     EPOCH.with_borrow_mut(|e| *e = Some(BTreeMap::new()));
+    new_generation();
     let mut j = journal();
     // Memory that was not watched may be by now (remapped, reallocated).
     j.allocations.retain(|_, (_, watched)| *watched);
@@ -139,6 +140,28 @@ pub(crate) fn begin_epoch() {
 /// Ends the epoch: asks go to the kernel again.
 pub(crate) fn end_epoch() {
     EPOCH.with_borrow_mut(|e| *e = None);
+    GENERATION.set(0);
+}
+
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+std::thread_local! {
+    /// This thread's epoch generation: 0 outside an epoch, else a value
+    /// unique to the epoch, changed by each of our own title writes in it
+    /// ([`uncover`]). Within one generation title memory, as the journal
+    /// answers for it, does not change.
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn new_generation() {
+    GENERATION.set(GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+}
+
+/// See [`GENERATION`]: shadows refreshing a range twice in one generation
+/// can skip the second time (the world asks for one 174 MB range 22-48
+/// times per frame).
+pub(crate) fn generation() -> u64 {
+    GENERATION.get()
 }
 
 /// Our own write of title memory `[at, at + len)` inside an epoch: the
@@ -151,6 +174,7 @@ pub(crate) fn uncover(at: usize, len: usize) {
     let (first, last) = (at / PAGE, (at + len).div_ceil(PAGE));
     EPOCH.with_borrow_mut(|runs| {
         let Some(runs) = runs else { return };
+        new_generation();
         let hit: Vec<(usize, usize)> = runs
             .range(..last)
             .filter(|&(_, &e)| e > first)
