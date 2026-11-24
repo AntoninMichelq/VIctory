@@ -131,6 +131,42 @@ const KEPT: usize = 4096;
 /// `VICTORY_COPY_BACK_RUNS=1`: copy-back writes only the exact bytes the
 /// GPU changed and marks a page current only if title memory still matches
 /// (upstream #1024's idea). Off by default: slower in world play runs.
+/// Per root-UAV address: the furthest byte past it the GPU was seen to
+/// write ([`Shadow::copy_back`]), and how often it was bound since that was
+/// last measured over the whole range.
+static REACH: Mutex<Option<std::collections::HashMap<usize, (usize, u32)>>> = Mutex::new(None);
+
+fn learned_reach(address: usize, reach: usize) {
+    // Only addresses bound as root UAVs (other views have their size).
+    let mut map = REACH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = map.as_mut().and_then(|m| m.get_mut(&address)) {
+        e.0 = e.0.max(reach);
+    }
+}
+
+/// How much of a root UAV's `len` bytes from `address` to declare written
+/// (refreshed before, compared and copied back after). A root view has no
+/// size: every bind declared all that is left of the title's buffer (25 GB
+/// of refreshes a frame, 0.23 fps, "10 calculs" 2026-11-24). Bound by
+/// twice the furthest write seen (at least 1 MiB, on 64 KiB), the whole
+/// range again every 64th bind and until something was measured.
+/// shortcut: a write past the bound between two whole-range binds is not
+/// put back into title memory. VICTORY_ROOT_UAV_LEARN=0: whole range.
+pub(crate) fn root_uav_extent(address: u64, len: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_LEARN").map_or(true, |v| v != "0")) {
+        return len;
+    }
+    let mut map = REACH.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(Default::default).entry(address as usize).or_insert((0, 0));
+    e.1 = e.1.wrapping_add(1);
+    if e.1 % 64 == 1 {
+        return len;
+    }
+    let bound = ((e.0 as u64).saturating_mul(2).max(1 << 20)).next_multiple_of(1 << 16);
+    len.min(bound)
+}
+
 fn exact_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_COPY_BACK_RUNS").is_ok_and(|v| v.trim() == "1"))
@@ -413,6 +449,13 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let mut reach = address;
+        let written = self.copy_back_inner(address, len, &mut reach);
+        learned_reach(address, reach - address);
+        written
+    }
+
+    fn copy_back_inner(&self, address: usize, len: usize, reach: &mut usize) -> usize {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
             pages,
@@ -473,6 +516,7 @@ impl Shadow {
                     // 2-5x the copy-back time in world play runs.
                     merge_gpu_runs(title, host, old, &mut runs);
                     if let (Some(&(s, _)), Some(&(_, e))) = (runs.first(), runs.last()) {
+                        *reach = (*reach).max(start + at + e);
                         if exact_runs() {
                             crate::watch::writing(start + at + s, e - s);
                             crate::host::write_runs((start + at) as *mut u8, title.as_ptr(), &runs);

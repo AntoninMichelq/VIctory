@@ -327,6 +327,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView, copy_back: bool) -> 
             }
             let len = shadow.left(address);
             if copy_back {
+                let len = crate::shadow::root_uav_extent(address, len);
                 shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
             } else if root_uav_first_bind(gpu, address) {
@@ -634,6 +635,7 @@ impl State {
         };
         if uav {
             if copy_back {
+                let len = crate::shadow::root_uav_extent(address, len);
                 shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
             } else if root_uav_first_bind(gpu, address) {
