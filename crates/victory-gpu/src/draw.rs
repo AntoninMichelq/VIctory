@@ -180,6 +180,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -405,6 +406,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -423,6 +426,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1116,7 +1120,6 @@ impl State {
                     rect_vertices = views;
                 }
                 Err(_reason) => {
-                    crate::indirect::done(list, &args.buffer);
                     why(&format!("a rectangle list not expanded: {_reason}"));
                     return false;
                 }
@@ -1151,7 +1154,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1163,23 +1165,33 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        let (arg_buffer, arg_offset) = match &rect_args {
-            Some(a) => (a, 0),
-            None => (&args.buffer, args.offset(arguments)),
-        };
-        unsafe {
-            list.list.ExecuteIndirect(
+        match &rect_args {
+            // Our rewritten records, already in the argument state.
+            Some(a) => {
+                if let Some((s, _)) = &counter {
+                    list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+                }
+                // SAFETY: an open list with everything set; our buffer and
+                // a host copy the list keeps alive, a cached signature.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        &signature,
+                        max,
+                        a,
+                        0,
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                };
+            }
+            None => crate::indirect::execute(
+                list,
                 &signature,
                 max,
-                arg_buffer,
-                arg_offset,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        crate::indirect::done(list, &args.buffer);
+                (&args.buffer, args.offset(arguments)),
+                counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+            ),
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1243,6 +1255,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

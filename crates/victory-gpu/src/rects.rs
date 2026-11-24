@@ -272,8 +272,8 @@ pub(crate) fn vertices(
 }
 
 /// Records the rewrite of `records` draw records `stride` bytes apart at
-/// host address `from` in `args` (left in the indirect-argument state, as
-/// [`crate::indirect::bound`] leaves it) for the expanded vertex buffers: a
+/// host address `from` in `args` (a title buffer's host copy, whose state
+/// the list tracks) for the expanded vertex buffers: a
 /// buffer of the new records, ready to be read as arguments.
 pub(crate) fn records(
     list: &HostList,
@@ -296,31 +296,20 @@ pub(crate) fn records(
     list.keep(&buffer);
     // SAFETY: a live buffer.
     let to = unsafe { buffer.GetGPUVirtualAddress() };
-    // SAFETY: an open list and live buffers.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            args,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )]);
-    }
+    // The list tracks the title buffer's state (unordered access while
+    // shaders write it, generic read while it is read).
+    list.buffer_state(args, crate::host::BUFFER_WRITE);
     let mut constants = [0u32; 16];
     constants[..3].copy_from_slice(&[1, stride, records]);
     run(list, e, &constants, from, to, records);
-    // SAFETY: as above.
+    list.buffer_state(args, crate::host::BUFFER_READ);
+    // SAFETY: an open list and our own buffer, made for this draw.
     unsafe {
-        list.list.ResourceBarrier(&[
-            transition(
-                args,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-            transition(
-                &buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        list.list.ResourceBarrier(&[transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     Ok(buffer)
 }
