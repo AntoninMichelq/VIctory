@@ -85,12 +85,19 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
+        let wanted = count;
         let (heap, count) = match make(count + extra) {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                // draw::tables now remaps the root tables that reach them.
+                tracing::warn!(
+                    error = %e,
+                    wanted,
+                    made = PORTABLE_VIEWS - extra,
+                    lost = wanted + extra - PORTABLE_VIEWS,
+                    "host view heap capped at {PORTABLE_VIEWS}"
+                );
                 (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
             }
             Err(e) => {
