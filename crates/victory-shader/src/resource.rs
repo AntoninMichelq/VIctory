@@ -16,7 +16,7 @@ use std::cell::RefCell;
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
@@ -86,6 +86,13 @@ pub enum Source {
     /// undefined unless the hardware loads them (listed in
     /// [`Waterfall::unset`], checked when lowering).
     Unset,
+    /// In a [`Source::Paths`] arg: a path no lane takes to the use. Its
+    /// dwords cannot be a descriptor (computed values, vertex data, inputs:
+    /// whatever the VGPRs held on a path that never reaches the access),
+    /// and a lane that brought them to the access would make the hardware
+    /// read garbage as a resource, which a correct program never does. Like
+    /// [`Source::Unset`], any descriptor will do there.
+    NoDescriptor,
 }
 
 impl Source {
@@ -97,6 +104,21 @@ impl Source {
             | Source::Lanes { args, .. }
             | Source::Paths { args, .. } => args.iter().flat_map(Source::leaves).collect(),
             s => vec![s],
+        }
+    }
+
+    /// Whether this source brings a descriptor on some path, to the join
+    /// at `block` (whose own value on the previous pass, [`Source::Carried`],
+    /// brings one only if another of its paths does).
+    fn descriptor_for(&self, block: usize) -> bool {
+        match self {
+            Source::Loaded { .. } | Source::Built { .. } | Source::Fetched { .. } => true,
+            Source::Carried { block: b } => *b != block,
+            Source::Phi { args, .. }
+            | Source::Select { args, .. }
+            | Source::Lanes { args, .. }
+            | Source::Paths { args, .. } => args.iter().any(|a| a.descriptor_for(block)),
+            Source::Constant(_) | Source::Unset | Source::NoDescriptor => false,
         }
     }
 }
@@ -166,8 +188,9 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     };
     // `v_readfirstlane_b32` results descriptors are read from.
     let mut first_lane: Vec<Value> = Vec::new();
-    // Per descriptor read from the first lane: where, and those results.
-    let mut first_lane_at: Vec<(usize, Vec<Value>)> = Vec::new();
+    // Per descriptor read from the first lane: where, those results, and
+    // the source traced through them.
+    let mut first_lane_at: Vec<(usize, Vec<Value>, Source)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -179,7 +202,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 let source = t.descriptor(inst, op).map_err(fail)?;
                 let words = t.first_lane_words(inst, op).unwrap_or_default();
                 if !words.is_empty() {
-                    first_lane_at.push((inst.machine.offset, words.clone()));
+                    first_lane_at.push((inst.machine.offset, words.clone(), source.clone()));
                 }
                 first_lane.extend(words);
                 out.descriptors.push(Descriptor { site, role, source });
@@ -233,9 +256,12 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     out.waterfall.unset = t.unset.take();
     // Taking the first lane's descriptor as each lane's own holds only in
     // a waterfall loop: one whose compare of the first lane's dwords with
-    // the lane's own repeats the access until every lane has had its turn.
-    for (offset, words) in first_lane_at {
-        if words.iter().any(|w| !out.waterfall.reads.contains(w)) {
+    // the lane's own repeats the access until every lane has had its turn;
+    // or where every lane holds the same dwords (see `Tracer::uniform`).
+    for (offset, words, source) in first_lane_at {
+        if words.iter().any(|w| !out.waterfall.reads.contains(w))
+            && !t.uniform_first_lane(&words, &source)
+        {
             return Err(ShaderError::Unsupported {
                 offset,
                 what: "a descriptor read from the first lane outside a waterfall loop",
@@ -244,6 +270,19 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     }
     Ok(out)
 }
+
+/// A per-lane trace that failed: why, and whether the dwords cannot be a
+/// descriptor at all (`junk`: computed VGPRs, a buffer load, an input VGPR,
+/// a partial or mixed load, constants with other scalars), which a join
+/// takes as a path no lane brings to the access (see `Tracer::lane_phi`).
+#[derive(Debug, Clone, Copy)]
+struct Fail {
+    what: &'static str,
+    junk: bool,
+}
+
+const NEITHER: &str = "a descriptor neither loaded nor built";
+const OF_BUFFER_LOAD: &str = "a descriptor read from the first lane of a buffer load";
 
 /// A dword after copy propagation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,7 +638,7 @@ impl<'a> Tracer<'a> {
     /// that address plus the VGPR offset (`offen`), `soffset` and the
     /// immediate. None of indexed (`idxen`) or formatted loads.
     fn buffer_address(&self, inst: &Inst) -> Result<Address, &'static str> {
-        const WHY: &str = "a descriptor read from the first lane of a buffer load";
+        const WHY: &str = OF_BUFFER_LOAD;
         let Fields::Buffer {
             addr,
             rsrc,
@@ -1080,7 +1119,7 @@ impl<'a> Tracer<'a> {
         Err(if words.iter().any(loaded) {
             "a descriptor changed after loading"
         } else {
-            "a descriptor neither loaded nor built"
+            NEITHER
         })
     }
 
@@ -1297,46 +1336,87 @@ impl<'a> Tracer<'a> {
     /// every lane, loaded per lane from memory a heap address points to, or
     /// picked per lane between such sources.
     fn per_lane(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Source, &'static str> {
+        self.lane_source(words, joins).map_err(|f| f.what)
+    }
+
+    /// [`Self::per_lane`], telling apart failures on dwords that cannot be
+    /// a descriptor ([`Fail::junk`]).
+    fn lane_source(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Source, Fail> {
+        let hard = |what| Fail { what, junk: false };
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
-            return self.classify(words, joins);
+            // Constants with other scalars: no constant descriptor, and
+            // nothing loaded or built either (failing here, not in a join
+            // or choice of the scalars).
+            let plain = |w: &Term| match *w {
+                Term::Value(v) => {
+                    self.phis[v.0 as usize].is_none()
+                        && self.picked(v).is_none()
+                        && self.first_lane_source(v).is_none()
+                }
+                Term::Const(_) => true,
+            };
+            let constants = words.iter().any(|w| matches!(w, Term::Const(_)));
+            return self.classify(words, joins).map_err(|what| Fail {
+                what,
+                junk: what == NEITHER && constants && words.iter().all(plain),
+            });
         };
         if let Some(source) = self.lane_phi(words, joins)? {
             return Ok(source);
         }
-        if let Some(source) = self.fetched(words)? {
+        if let Some(source) = self.fetched(words).map_err(|what| Fail {
+            what,
+            junk: what == OF_BUFFER_LOAD,
+        })? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_select(words, joins)? {
+        if let Some(source) = self.lane_select(words, joins).map_err(hard)? {
             return Ok(source);
         }
         let Term::Value(v) = lane else { unreachable!() };
         let name = self.def(v).map(|i| i.name());
-        Err(match name {
-            _ if self.inputs[v.0 as usize].is_some() => {
-                "a descriptor read from the first lane of an input VGPR"
-            }
-            None => "a descriptor read from the first lane of a phi",
-            Some(n) if n.starts_with("ds_read") => {
-                "a descriptor read from the first lane of an LDS read"
-            }
-            Some(n) if n.starts_with("buffer_load") => {
-                "a descriptor read from the first lane of a buffer load"
-            }
-            Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => {
-                "a descriptor read from the first lane of a partial or mixed load"
-            }
-            Some(_) => "a descriptor read from the first lane of computed VGPRs",
-        })
+        let (what, junk) = match name {
+            _ if self.inputs[v.0 as usize].is_some() => (
+                "a descriptor read from the first lane of an input VGPR",
+                true,
+            ),
+            None => ("a descriptor read from the first lane of a phi", false),
+            // Not junk: a program can hand descriptors around in LDS, and
+            // one there is a descriptor this tracer cannot follow.
+            Some(n) if n.starts_with("ds_read") => (
+                "a descriptor read from the first lane of an LDS read",
+                false,
+            ),
+            Some(n) if n.starts_with("buffer_load") => (OF_BUFFER_LOAD, true),
+            Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => (
+                "a descriptor read from the first lane of a partial or mixed load",
+                true,
+            ),
+            Some(_) => (
+                "a descriptor read from the first lane of computed VGPRs",
+                true,
+            ),
+        };
+        Err(Fail { what, junk })
     }
 
     /// Per-lane words that phis join: a phi that carries one dword is that
     /// dword, other joins are traced per path into their block
     /// ([`Source::Paths`]).
-    fn lane_phi(
-        &self,
-        words: &[Term],
-        joins: &mut Vec<usize>,
-    ) -> Result<Option<Source>, &'static str> {
+    ///
+    /// A path whose dwords cannot be a descriptor ([`Fail::junk`]: computed
+    /// VGPRs, vertex data, inputs) is a path no lane takes to the use
+    /// ([`Source::NoDescriptor`]) when another path brings a descriptor:
+    /// registers are reused, so the VGPRs that hold the descriptor on the
+    /// paths to the access hold other values on paths that never get there
+    /// (a branch on the same condition skips the access), and SSA joins
+    /// them. A lane that did bring such dwords to the access would make the
+    /// hardware read garbage as a resource, which a correct program never
+    /// does. When no path brings a descriptor, the join fails as the first
+    /// path does; so does it when a path fails any other way (a loop, too
+    /// many joins, a load this tracer cannot follow).
+    fn lane_phi(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Option<Source>, Fail> {
+        let hard = |what| Fail { what, junk: false };
         let phi_of = |w: &Term| match *w {
             Term::Value(v) => self.phis[v.0 as usize],
             Term::Const(_) => None,
@@ -1352,51 +1432,71 @@ impl<'a> Tracer<'a> {
             })
             .collect();
         if carried != words {
-            return self.per_lane(&carried, joins).map(Some);
+            return self.lane_source(&carried, joins).map(Some);
         }
         let Some((block, _)) = words.iter().find_map(phi_of) else {
             unreachable!()
         };
         if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a per-lane descriptor joined in several blocks");
+            return Err(hard("a per-lane descriptor joined in several blocks"));
         }
         if joins.contains(&block) {
             // Back at a join being traced: through a loop's back edge, the
             // dwords it joined on the previous pass.
             return match self.lane_joins.borrow().iter().find(|j| j.0 == block) {
                 Some((_, w)) if w == words => Ok(Some(Source::Carried { block })),
-                _ => Err("a per-lane descriptor that changes in a loop"),
+                _ => Err(hard("a per-lane descriptor that changes in a loop")),
             };
         }
         if joins.len() >= MAX_JOINS {
-            return Err("a descriptor joined too often");
+            return Err(hard("a descriptor joined too often"));
         }
         joins.push(block);
         self.lane_joins.borrow_mut().push((block, words.to_vec()));
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.lane_term(Term::Value(phis[i].args[j])),
-                        None => *w,
-                    })
-                    .collect();
-                if edge.iter().all(|&t| self.unset_input(t)) {
-                    let mut unset = self.unset.borrow_mut();
-                    unset.extend(edge.iter().filter_map(|t| match *t {
-                        Term::Value(v) => Some(v),
-                        Term::Const(_) => None,
-                    }));
-                    return Ok(Source::Unset);
+        let mut args = Vec::new();
+        // The first failure, and whether every failure so far is junk.
+        let mut failed: Option<Fail> = None;
+        for j in 0..self.p.blocks[block].preds.len() {
+            let edge: Vec<Term> = words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.lane_term(Term::Value(phis[i].args[j])),
+                    None => *w,
+                })
+                .collect();
+            if edge.iter().all(|&t| self.unset_input(t)) {
+                let mut unset = self.unset.borrow_mut();
+                unset.extend(edge.iter().filter_map(|t| match *t {
+                    Term::Value(v) => Some(v),
+                    Term::Const(_) => None,
+                }));
+                args.push(Source::Unset);
+                continue;
+            }
+            let unset = self.unset.borrow().len();
+            match self.lane_source(&edge, joins) {
+                Ok(source) => args.push(source),
+                Err(f) if f.junk => {
+                    // What the path's own joins took as unset is no VGPR
+                    // the access reads.
+                    self.unset.borrow_mut().truncate(unset);
+                    failed.get_or_insert(f);
+                    args.push(Source::NoDescriptor);
                 }
-                self.per_lane(&edge, joins)
-            })
-            .collect::<Result<_, _>>();
+                Err(f) => {
+                    let first = failed.unwrap_or(f);
+                    failed = Some(hard(first.what));
+                    break;
+                }
+            }
+        }
         self.lane_joins.borrow_mut().pop();
         joins.pop();
-        Ok(Some(Source::Paths { block, args: args? }))
+        match failed {
+            Some(f) if !f.junk || !args.iter().any(|a| a.descriptor_for(block)) => Err(f),
+            _ => Ok(Some(Source::Paths { block, args })),
+        }
     }
 
     /// The one dword the phi `t` carries: what the arguments of the phis it
@@ -1638,6 +1738,158 @@ impl<'a> Tracer<'a> {
             }
         }
         out
+    }
+
+    /// Whether the dwords that the `v_readfirstlane_b32` results `reads`
+    /// read are the same in every lane active there, so that the first
+    /// lane's are each lane's own without a waterfall loop: `source`, what
+    /// they were traced to, brings only scalars (loaded or built
+    /// descriptors), copied to VGPRs under the EXEC the reads run with, and
+    /// every join of them ([`Source::Paths`]) comes after that EXEC was
+    /// set. Lanes part ways only where EXEC changes: with none from before
+    /// the branches into a join to the reads, every active lane takes the
+    /// path the wave takes, and on each path the copies write every one of
+    /// them. Paths no lane takes to the access ([`Source::NoDescriptor`])
+    /// are skipped.
+    fn uniform_first_lane(&self, reads: &[Value], source: &Source) -> bool {
+        let mut exec: Option<Vec<Value>> = None;
+        let mut words = Vec::new();
+        for &r in reads {
+            let (Some(inst), Some(v)) = (self.def(r), self.first_lane_source(r)) else {
+                return false;
+            };
+            let Some(e) = self.exec(inst) else {
+                return false;
+            };
+            if *exec.get_or_insert_with(|| e.clone()) != e {
+                return false;
+            }
+            words.push(Term::Value(v));
+        }
+        let Some(exec) = exec else { return false };
+        let order = crate::ir::reverse_postorder(&self.p.blocks);
+        let mut index = vec![usize::MAX; self.p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            index[b] = n;
+        }
+        let idom = crate::ir::idoms(&self.p.blocks, &order, &index);
+        self.uniform(&words, source, &exec, &idom)
+    }
+
+    /// See [`Self::uniform_first_lane`]: `words` hold `source` in every
+    /// lane active under `exec`.
+    fn uniform(&self, words: &[Term], source: &Source, exec: &[Value], idom: &[usize]) -> bool {
+        let words: Vec<Term> = words.iter().map(|&w| self.copied(w, exec)).collect();
+        match source {
+            Source::Paths { block, args } => {
+                let phis = &self.p.blocks[*block].phis;
+                let mut at = Vec::new();
+                for &w in &words {
+                    match w {
+                        Term::Value(v)
+                            if let Some((b, i)) = self.phis[v.0 as usize]
+                                && b == *block =>
+                        {
+                            at.push(Some(i))
+                        }
+                        w if !self.varies(w) => at.push(None),
+                        _ => return false,
+                    }
+                }
+                exec.iter().all(|&e| self.set_above(e, *block, idom))
+                    && args.iter().enumerate().all(|(j, arg)| {
+                        if *arg == Source::NoDescriptor {
+                            return true;
+                        }
+                        let edge: Vec<Term> = words
+                            .iter()
+                            .zip(&at)
+                            .map(|(&w, i)| match *i {
+                                Some(i) => Term::Value(phis[i].args[j]),
+                                None => w,
+                            })
+                            .collect();
+                        self.uniform(&edge, arg, exec, idom)
+                    })
+            }
+            Source::Loaded { .. }
+            | Source::Built { .. }
+            | Source::Constant(_)
+            | Source::Phi { .. }
+            | Source::Select { .. } => words.iter().all(|&w| !self.varies(w)),
+            _ => false,
+        }
+    }
+
+    /// The EXEC dwords `inst` reads, past phis that join one value.
+    fn exec(&self, inst: &Inst) -> Option<Vec<Value>> {
+        (0..1 + u8::from(self.p.wave64))
+            .map(|k| {
+                let mut v = inst.read(Reg::S(EXEC + k))?;
+                let mut seen = Vec::new();
+                while let Some((b, i)) = self.phis[v.0 as usize]
+                    && !seen.contains(&v)
+                {
+                    seen.push(v);
+                    let mut args = self.p.blocks[b].phis[i].args.iter().filter(|&&a| a != v);
+                    let Some(&first) = args.next() else { break };
+                    if !args.all(|&a| a == first) {
+                        break;
+                    }
+                    v = first;
+                }
+                Some(v)
+            })
+            .collect()
+    }
+
+    /// `t` through `v_mov_b32` copies that run under `exec` (so write
+    /// every lane active there).
+    fn copied(&self, mut t: Term, exec: &[Value]) -> Term {
+        for _ in 0..MAX_JOINS * 2 {
+            let Term::Value(v) = t else { break };
+            let Some(inst) = self.def(v) else { break };
+            let Fields::Valu(f) = &inst.fields else { break };
+            if inst.name() != "v_mov_b32"
+                || f.abs != 0
+                || f.neg != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+                || self.exec(inst).as_deref() != Some(exec)
+            {
+                break;
+            }
+            let next = match f.src.first() {
+                Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)).map(Term::Value),
+                Some(op) => self.term(inst, op),
+                None => None,
+            };
+            let Some(next) = next else { break };
+            t = next;
+        }
+        t
+    }
+
+    /// Whether `v` is set in a block that strictly dominates `block` (or
+    /// on entry).
+    fn set_above(&self, v: Value, block: usize, idom: &[usize]) -> bool {
+        if self.inputs[v.0 as usize].is_some() {
+            return true;
+        }
+        let Some(home) = self.phis[v.0 as usize]
+            .map(|p| p.0)
+            .or_else(|| self.defs[v.0 as usize].map(|s| s.0))
+        else {
+            return false;
+        };
+        let mut d = block;
+        while idom[d] != usize::MAX && idom[d] != d {
+            d = idom[d];
+            if d == home {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether blocks `a` and `b` are in one loop: each reaches the other
@@ -2640,6 +2892,115 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
+    /// A descriptor loaded into SGPRs (entry 0 of the table at s0) and
+    /// copied to v[4:7] by lanes below 16; the other lanes load vertex data
+    /// into v[4:6] there (a buffer_load_dwordx3 through the table at s1).
+    /// Only lanes below 16 reach the waterfall over v[4:7], behind a second
+    /// branch on the same condition.
+    pub(crate) const PHI_JUNK_WATERFALL_WAVE32: &[u32] = &[
+        0xBE84_0300, // 0x0: s_mov_b32 s4, s0
+        0xBE85_0380, // 0x4: s_mov_b32 s5, 0
+        0xBE86_0301, // 0x8: s_mov_b32 s6, s1
+        0xBE87_0380, // 0xc: s_mov_b32 s7, 0
+        0x3402_0084, // 0x10: v_lshlrev_b32 v1, 4, v0
+        0xF408_0202,
+        0xFA00_0000, // 0x14: s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xF408_0403,
+        0xFA00_0000, // 0x1c: s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x7D88_0090, // 0x24: v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE98_3C6A, // 0x28: s_and_saveexec_b32 s24, vcc_lo
+        0x8918_187E, // 0x2c: s_xor_b32 s24, exec_lo, s24
+        0xBF88_0005, // 0x30: s_cbranch_execz 5
+        0xBF8C_C07F, // 0x34: s_waitcnt lgkmcnt(0)
+        0x7E08_0208, // 0x38: v_mov_b32 v4, s8
+        0x7E0A_0209, // 0x3c: v_mov_b32 v5, s9
+        0x7E0C_020A, // 0x40: v_mov_b32 v6, s10
+        0x7E0E_020B, // 0x44: v_mov_b32 v7, s11
+        0xBE98_3D18, // 0x48: s_or_saveexec_b32 s24, s24
+        0x897E_187E, // 0x4c: s_xor_b32 exec_lo, exec_lo, s24
+        0xBF88_0003, // 0x50: s_cbranch_execz 3
+        0xBF8C_C07F, // 0x54: s_waitcnt lgkmcnt(0)
+        0xE03C_1000,
+        0x8004_0401, // 0x58: buffer_load_dwordx3 v[4:6], v1, s[16:19], 0 offen
+        0x887E_187E, // 0x60: s_or_b32 exec_lo, exec_lo, s24
+        0x7D88_0090, // 0x64: v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE99_3C6A, // 0x68: s_and_saveexec_b32 s25, vcc_lo
+        0xBF88_0014, // 0x6c: s_cbranch_execz 20
+        0xBF8C_3F70, // 0x70: s_waitcnt vmcnt(0)
+        0xBE94_037E, // 0x74: s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x78: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // 0x7c: v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // 0x80: v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // 0x84: v_readfirstlane_b32 s15, v7
+        0xD4E2_0015,
+        0x0002_080C, // 0x88: v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+        0xD4E2_0016,
+        0x0002_0C0E, // 0x90: v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // 0x98: s_and_b32 s21, s21, s22
+        0xBE95_3C15, // 0x9c: s_and_saveexec_b32 s21, s21
+        0xE030_1000,
+        0x8003_0801, // 0xa0: buffer_load_dword v8, v1, s[12:15], 0 offen
+        0xBF8C_3F70, // 0xa8: s_waitcnt vmcnt(0)
+        0x897E_157E, // 0xac: s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFF1, // 0xb0: s_cbranch_execnz -15
+        0xBEFE_0314, // 0xb4: s_mov_b32 exec_lo, s20
+        0xD834_0000,
+        0x0000_0800, // 0xb8: ds_write_b32 v0, v8
+        0x887E_197E, // 0xc0: s_or_b32 exec_lo, exec_lo, s25
+        0xBF81_0000, // 0xc4: s_endpgm
+    ];
+
+    /// The same choice made by a uniform branch on a root constant (s2): entry 0 or entry 1 (byte 32) of the table at s0 copied to
+    /// v[4:7] when s2 is 1 or 2, vertex data (unless bit 4 of s2 is set)
+    /// and a product there when s2 is 0. The access is skipped when s2 is
+    /// 0, and reads the first lane with no waterfall loop.
+    pub(crate) const PHI_JUNK_UNIFORM_WAVE32: &[u32] = &[
+        0xBE84_0300, // 0x0: s_mov_b32 s4, s0
+        0xBE85_0380, // 0x4: s_mov_b32 s5, 0
+        0xBE86_0301, // 0x8: s_mov_b32 s6, s1
+        0xBE87_0380, // 0xc: s_mov_b32 s7, 0
+        0x3402_0084, // 0x10: v_lshlrev_b32 v1, 4, v0
+        0xF408_0202,
+        0xFA00_0000, // 0x14: s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xF408_0302,
+        0xFA00_0020, // 0x1c: s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0xF408_0403,
+        0xFA00_0000, // 0x24: s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0xBF8C_C07F, // 0x2c: s_waitcnt lgkmcnt(0)
+        0xBF06_8002, // 0x30: s_cmp_eq_u32 s2, 0
+        0xBF85_000C, // 0x34: s_cbranch_scc1 12
+        0xBF06_8102, // 0x38: s_cmp_eq_u32 s2, 1
+        0xBF85_0005, // 0x3c: s_cbranch_scc1 5
+        0x7E08_0208, // 0x40: v_mov_b32 v4, s8
+        0x7E0A_0209, // 0x44: v_mov_b32 v5, s9
+        0x7E0C_020A, // 0x48: v_mov_b32 v6, s10
+        0x7E0E_020B, // 0x4c: v_mov_b32 v7, s11
+        0xBF82_0004, // 0x50: s_branch 4
+        0x7E08_020C, // 0x54: v_mov_b32 v4, s12
+        0x7E0A_020D, // 0x58: v_mov_b32 v5, s13
+        0x7E0C_020E, // 0x5c: v_mov_b32 v6, s14
+        0x7E0E_020F, // 0x60: v_mov_b32 v7, s15
+        0xBF82_0006, // 0x64: s_branch 6
+        0xBF0D_8402, // 0x68: s_bitcmp1_b32 s2, 4
+        0xBF85_0003, // 0x6c: s_cbranch_scc1 3
+        0xE03C_1000,
+        0x8004_0401, // 0x70: buffer_load_dwordx3 v[4:6], v1, s[16:19], 0 offen
+        0xBF8C_3F70, // 0x78: s_waitcnt vmcnt(0)
+        0x0E0E_0B04, // 0x7c: v_mul_legacy_f32 v7, v4, v5
+        0xBF06_8002, // 0x80: s_cmp_eq_u32 s2, 0
+        0xBF85_0009, // 0x84: s_cbranch_scc1 9
+        0x7E28_0504, // 0x88: v_readfirstlane_b32 s20, v4
+        0x7E2A_0505, // 0x8c: v_readfirstlane_b32 s21, v5
+        0x7E2C_0506, // 0x90: v_readfirstlane_b32 s22, v6
+        0x7E2E_0507, // 0x94: v_readfirstlane_b32 s23, v7
+        0xE030_1000,
+        0x8005_0801, // 0x98: buffer_load_dword v8, v1, s[20:23], 0 offen
+        0xBF8C_3F70, // 0xa0: s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0800, // 0xa4: ds_write_b32 v0, v8
+        0xBF81_0000, // 0xac: s_endpgm
+    ];
+
     fn waterfall(words: &[u32], wave64: bool) -> Result<Resources, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, wave64, 256).unwrap();
@@ -2778,8 +3139,9 @@ pub(crate) mod tests {
     }
 
     /// The byte offset in the table of each per-lane load `s` picks from,
-    /// per path (`C` for the join itself on the previous pass, `U` for
-    /// unset VGPRs).
+    /// per path (`L` before it for a scalar load, `C` for the join itself
+    /// on the previous pass, `U` for unset VGPRs, `N` for a path no lane
+    /// takes to the access).
     fn paths(r: &Resources, s: &Source) -> String {
         match s {
             Source::Fetched { load, first: 0 } => {
@@ -2791,8 +3153,13 @@ pub(crate) mod tests {
                 let args: Vec<String> = args.iter().map(|a| paths(r, a)).collect();
                 format!("[{}]", args.join(" "))
             }
+            Source::Loaded { load, first: 0 } => {
+                let a = r.scalar.iter().find(|x| x.0 == *load).unwrap().1;
+                format!("L{}", a.offset)
+            }
             Source::Carried { .. } => "C".into(),
             Source::Unset => "U".into(),
+            Source::NoDescriptor => "N".into(),
             s => panic!("{s:?}"),
         }
     }
@@ -2840,6 +3207,88 @@ pub(crate) mod tests {
                 err,
                 ShaderError::Unsupported {
                     what: "a descriptor read from the first lane of an LDS read",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_brings_vertex_data_to_a_joined_descriptor_is_none_lanes_take() {
+        let r = waterfall(PHI_JUNK_WATERFALL_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.site.1 != 0 && matches!(d.source, Source::Paths { .. }))
+            .unwrap();
+        // Through the then branch, or past it into the else branch, whose
+        // buffer_load_dwordx3 brings no descriptor.
+        assert_eq!(paths(&r, &image.source), "[L0 N]");
+        assert_eq!(r.waterfall.compares.len(), 2);
+        assert_eq!(r.waterfall.reads.len(), 4);
+        // v[4:7] as no one set them in lanes that skip the then branch; the
+        // else branch's own (v7, kept from there) are not listed. (The
+        // buffer access traces its descriptor twice, so each is listed
+        // twice.)
+        let mut unset = r.waterfall.unset.clone();
+        unset.sort();
+        unset.dedup();
+        assert_eq!(unset.len(), 4);
+    }
+
+    #[test]
+    fn a_join_of_paths_that_bring_no_descriptor_fails_as_its_first_path() {
+        // The then branch converts lane indices in place of copying the
+        // descriptor: v_cvt_f32_u32 v4..v7, v0.
+        let mut words = PHI_JUNK_WATERFALL_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x7E08_0208).unwrap();
+        words[at..at + 4].copy_from_slice(&[0x7E08_0D00, 0x7E0A_0D00, 0x7E0C_0D00, 0x7E0E_0D00]);
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane of computed VGPRs",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_uniform_join_of_scalar_descriptors_needs_no_waterfall() {
+        let r = waterfall(PHI_JUNK_UNIFORM_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| matches!(d.source, Source::Paths { .. }))
+            .unwrap();
+        // Entry 0 or entry 1, or the vertex data path, which skips the
+        // access.
+        assert_eq!(paths(&r, &image.source), "[[L0 L32] N]");
+        assert!(r.waterfall.compares.is_empty());
+        // Nor are the VGPRs the vertex data path skips the load of (v[4:6])
+        // unset ones: that path is no descriptor's.
+        assert!(r.waterfall.unset.is_empty());
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_join_under_a_narrower_exec_is_no_waterfall() {
+        // The access behind EXEC narrowed to lanes below 16 in place of the
+        // uniform branch: v_cmp_gt_u32 vcc_lo, 16, v0 and
+        // s_and_saveexec_b32 s24, vcc_lo. Lanes that took different paths
+        // may hold different descriptors there.
+        let mut words = PHI_JUNK_UNIFORM_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0xBF85_0009).unwrap();
+        words[at - 1..=at].copy_from_slice(&[0x7D88_0090, 0xBE98_3C6A]);
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane outside a waterfall loop",
                     ..
                 }
             ),

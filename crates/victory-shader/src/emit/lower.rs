@@ -110,6 +110,10 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: per heap index joined per lane by control flow, the
+    /// index each path brings, in predecessor order.
+    #[cfg(test)]
+    pub heap_paths: Vec<Vec<String>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -581,6 +585,9 @@ struct Lower<'a> {
     /// Per-lane descriptor joins being lowered: IR block and the heap index
     /// phi there (what [`Source::Carried`] reads).
     lane_paths: Vec<(usize, V)>,
+    /// See [`Lowered::heap_paths`].
+    #[cfg(test)]
+    heap_paths: Vec<Vec<String>>,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
 }
@@ -1313,6 +1320,8 @@ impl<'a> Lower<'a> {
             finals: HashMap::new(),
             abort: None,
             lane_paths: Vec::new(),
+            #[cfg(test)]
+            heap_paths: Vec::new(),
             pending_paths: Vec::new(),
             dead,
         }
@@ -1877,6 +1886,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
+            #[cfg(test)]
+            heap_paths: std::mem::take(&mut self.heap_paths),
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -5993,7 +6004,9 @@ impl<'a> Lower<'a> {
                 let index = self.lane_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
-            Source::Carried { .. } | Source::Unset => Err("a per-lane descriptor out of a join"),
+            Source::Carried { .. } | Source::Unset | Source::NoDescriptor => {
+                Err("a per-lane descriptor out of a join")
+            }
         }
     }
 
@@ -6033,8 +6046,9 @@ impl<'a> Lower<'a> {
                 .find(|p| p.0 == *block)
                 .map(|p| p.1)
                 .ok_or("a per-lane descriptor carried out of its loop"),
-            // Undefined: any index will do.
-            Source::Unset => Ok(self.s.m.i32(0)),
+            // Undefined, or a path no lane takes to the access: any index
+            // will do.
+            Source::Unset | Source::NoDescriptor => Ok(self.s.m.i32(0)),
             _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
         }
     }
@@ -6076,7 +6090,10 @@ impl<'a> Lower<'a> {
             let done = incoming
                 .into_iter()
                 .map(|(q, x)| (x.unwrap(), self.edge_block(q, block)));
-            let done = done.collect();
+            let done: Vec<(V, usize)> = done.collect();
+            #[cfg(test)]
+            self.heap_paths
+                .push(done.iter().map(|d| self.s.m.show(d.0)).collect());
             self.s.m.set_phi(phi, done);
         } else {
             self.pending_paths.push(PendingPath {
@@ -6113,6 +6130,9 @@ impl<'a> Lower<'a> {
                 incoming.push((x, at));
             }
             self.lane_paths = saved;
+            #[cfg(test)]
+            self.heap_paths
+                .push(incoming.iter().map(|d| self.s.m.show(d.0)).collect());
             self.s.m.set_phi(pending.phi, incoming);
         }
         Ok(())
@@ -12702,6 +12722,36 @@ mod tests {
             ),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn descriptors_joined_with_paths_no_lane_takes_take_heap_index_0_there() {
+        use crate::resource::tests::{PHI_JUNK_UNIFORM_WAVE32, PHI_JUNK_WATERFALL_WAVE32};
+        // Tables of structured buffers of dwords at s0 and s1 (and a root
+        // constant at s2 that picks without the waterfall).
+        let buffers = |user_data, slot| UsedResource {
+            user_data,
+            slot,
+            ..dword_buffers()[0]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+        let used = || vec![buffers(0, 0), buffers(1, 1)];
+        // In the waterfall, lanes through the then branch take entry 0 of
+        // the table at s0 (its address over 32 bytes); the else branch's
+        // vertex data is no descriptor, so heap index 0.
+        let l = lower_with(PHI_JUNK_WATERFALL_WAVE32, layout(), used()).unwrap();
+        assert_eq!(l.nonuniform_handles, 1);
+        assert!(!l.wave_ops);
+        let index = |offset| format!("((? Add {offset}) LShr 5)");
+        assert_eq!(l.heap_paths, [vec![index(0), "0".into()]]);
+        // Without the waterfall: entry 0 or 1 when the uniform branch picks
+        // one, heap index 0 on the vertex data path.
+        let mut with_constant = layout();
+        with_constant.push(root(RootType::Constants, 2, 0));
+        let l = lower_with(PHI_JUNK_UNIFORM_WAVE32, with_constant, used()).unwrap();
+        assert_eq!(l.heap_paths.len(), 2);
+        assert!(l.heap_paths.contains(&vec![index(0), index(32)]));
+        assert!(l.heap_paths.iter().any(|p| p.len() == 2 && p[1] == "0"));
     }
 
     /// A table at s0 holding structured buffers of dwords.
