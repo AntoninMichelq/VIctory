@@ -54,6 +54,7 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(u8::from(victory_shader::emit::root_uavs()));
+                bytes.push(u8::from(victory_shader::emit::pointer_views()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

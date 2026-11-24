@@ -45,6 +45,20 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of an address the program keeps in two dwords of
+/// root constants: this plus the user-data index of the low dword (see
+/// [`pointer_user_data`]). The host binds a raw view at the address those
+/// dwords hold (`crate::emit::POINTER_SLOT`).
+pub const POINTER: usize = usize::MAX - 0x1_0000;
+
+/// The user-data index of the low dword of a [`POINTER`] address.
+pub fn pointer_user_data(param: usize) -> Option<u32> {
+    param
+        .checked_sub(POINTER)
+        .filter(|&i| i < 0x100)
+        .map(|i| i as u32)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -1032,6 +1046,11 @@ impl<'a> Tracer<'a> {
                 return Ok(a);
             }
         }
+        if s.base.is_none()
+            && let Some(a) = self.constant_pointer(lo, hi, extra)
+        {
+            return Ok(a);
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -1075,6 +1094,82 @@ impl<'a> Tracer<'a> {
             dynamic: s.dynamic.or(extra.dynamic),
             includes_base: false,
         })
+    }
+
+    /// The address `lo`/`hi` (plus `extra`) when it is a 64-bit address the
+    /// program keeps in two consecutive dwords of root constants, plus a
+    /// constant and at most one computed term: a [`POINTER`] address.
+    fn constant_pointer(&self, lo: Term, hi: Term, extra: Sum) -> Option<Address> {
+        if !crate::emit::pointer_views() {
+            return None;
+        }
+        let Term::Value(v) = self.through_firstlane(lo) else {
+            return None;
+        };
+        let (low, rest) = self.pointer_split(v, 4)?;
+        let reg = self.inputs[low.0 as usize]?;
+        let (param, dword) = self.param_of(reg)?;
+        let rp = self.layout[param];
+        if rp.root != RootType::Constants || dword + 1 >= rp.sgprs {
+            return None;
+        }
+        let Reg::S(code) = reg else { return None };
+        let high = self.p.inputs.iter().find(|i| i.0 == Reg::S(code + 1))?.1;
+        if rest.dynamic.is_some() && extra.dynamic.is_some() {
+            return None;
+        }
+        let dynamic = rest.dynamic.or(extra.dynamic);
+        if !self.high_half(hi, Some(high)) && !(dynamic.is_some() && self.carried(hi, high)) {
+            return None;
+        }
+        Some(Address {
+            param: POINTER + (u32::from(rp.user_data) + dword) as usize,
+            offset: rest.offset.wrapping_add(extra.offset),
+            dynamic,
+            includes_base: false,
+        })
+    }
+
+    /// `v` as a root-constant input plus the rest of a sum (a constant and
+    /// at most one computed term), through additions.
+    fn pointer_split(&self, v: Value, depth: u8) -> Option<(Value, Sum)> {
+        let zero = Sum {
+            base: None,
+            offset: 0,
+            dynamic: None,
+        };
+        if self.inputs[v.0 as usize].is_some() {
+            return Some((v, zero));
+        }
+        let depth = depth.checked_sub(1)?;
+        if let Some((Term::Value(x), k)) = self.plus_const(v) {
+            let (low, mut rest) = self.pointer_split(x, depth)?;
+            rest.offset = rest.offset.wrapping_add(k);
+            return Some((low, rest));
+        }
+        let [a, b] = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))?;
+        for (x, y) in [(a, b), (b, a)] {
+            let Term::Value(x) = x else { continue };
+            let Some((low, rest)) = self.pointer_split(x, depth) else {
+                continue;
+            };
+            let other = self.sum(y);
+            if other.base.is_some() || rest.dynamic.is_some() && other.dynamic.is_some() {
+                return None;
+            }
+            return Some((
+                low,
+                Sum {
+                    base: None,
+                    offset: rest.offset.wrapping_add(other.offset),
+                    dynamic: rest.dynamic.or(other.dynamic),
+                },
+            ));
+        }
+        None
     }
 
     /// The address of a pointer `d` the code keeps in a phi, plus `offset`:
