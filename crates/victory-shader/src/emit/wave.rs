@@ -34,6 +34,10 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// A sum of the 64-bit float 1.0 over the lanes (`v_add_f64`, the compiler's
+    /// `WaveActiveSum(1.0)` of a double): the number of lanes as a double; its low (`false`)
+    /// or high (`true`) dword. The only 64-bit float sum followed: exact, whatever the order.
+    CountD(bool),
 }
 
 impl Op {
@@ -60,7 +64,7 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU | Op::CountD(_) => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
@@ -72,7 +76,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor | Op::CountD(_))
     }
 }
 
@@ -139,6 +143,28 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
+    // Values set to a constant (`v_mov_b32` / `s_mov_b32`), for the 64-bit sums.
+    let consts: HashMap<Value, u32> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i.name(), "v_mov_b32" | "s_mov_b32") && i.writes.len() == 1)
+        .filter_map(|i| {
+            let k = match &i.fields {
+                Fields::Valu(v)
+                    if v.abs == 0 && v.neg == 0 && !v.clamp && v.omod == 0 && v.sdwa.is_none() && v.dpp.is_none() =>
+                {
+                    match *v.src.first()? {
+                        Operand::Const(c) => crate::resource::inline(c)?,
+                        Operand::Literal(x) => x,
+                        _ => return None,
+                    }
+                }
+                _ => constant(i)? as u32,
+            };
+            Some((i.writes[0].1, k))
+        })
+        .collect();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
@@ -169,7 +195,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let shapes = simulate(&insts[i + 1..end], wave, saved, &consts);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -257,7 +283,45 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// One lane's term of a 64-bit float sum of 1.0 ([`Op::CountD`]), from its two dwords: none
+/// (+0.0), or the sources of the two dwords, the mask, the lanes summed and whether a sum.
+type CountTerm = Option<(Value, Value, Value, u64)>;
+
+fn count_term(lo: Sym, hi: Sym, consts: &HashMap<Value, u32>) -> Option<CountTerm> {
+    match (lo, hi) {
+        (Sym::K(0), Sym::K(0)) => Some(None),
+        (
+            Sym::Red { op: a, src: sl, mask, ident: 0, lanes },
+            Sym::Red { op: b, src: sh, mask: mh, ident: 0, lanes: lh },
+        ) if mask == mh && lanes == lh => {
+            let one = a.is_none()
+                && b.is_none()
+                && consts.get(&sl) == Some(&0)
+                && consts.get(&sh) == Some(&0x3FF0_0000);
+            let sum = a == Some(Op::CountD(false)) && b == Some(Op::CountD(true));
+            (one || sum).then_some(Some((sl, sh, mask, lanes)))
+        }
+        _ => None,
+    }
+}
+
+/// The two dwords of a lane's `v_add_f64` of two count terms.
+fn add_counts(a: Option<CountTerm>, b: Option<CountTerm>) -> (Sym, Sym) {
+    let red = |op, src, mask, lanes| Sym::Red { op: Some(op), src, mask, ident: 0, lanes };
+    match (a, b) {
+        (Some(None), Some(None)) => (Sym::K(0), Sym::K(0)),
+        (Some(Some(t)), Some(None)) | (Some(None), Some(Some(t))) => {
+            (red(Op::CountD(false), t.0, t.2, t.3), red(Op::CountD(true), t.1, t.2, t.3))
+        }
+        (Some(Some(x)), Some(Some(y))) if (x.0, x.1, x.2) == (y.0, y.1, y.2) && x.3 & y.3 == 0 => (
+            red(Op::CountD(false), x.0, x.2, x.3 | y.3),
+            red(Op::CountD(true), x.1, x.2, x.3 | y.3),
+        ),
+        _ => (Sym::Unknown, Sym::Unknown),
+    }
+}
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value, consts: &HashMap<Value, u32>) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -304,6 +368,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            // A copy keeps what it copies (a 64-bit sum's dwords moved to their register).
+            if name == "s_mov_b32"
+                && let [Operand::Scalar { code, .. }] = src[..]
+                && code != NULL
+                && let (Some(r), [(_, w)]) = (inst.read(Reg::S(code)), &inst.writes[..])
+            {
+                uni.insert(*w, uni.get(&r).copied().unwrap_or(Sym::Uni(r)));
+                continue;
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -365,6 +438,42 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             continue;
         };
+        if name == "v_add_f64" {
+            let pair = |op: Option<&Operand>| -> Option<(Vec<Sym>, Vec<Sym>)> {
+                let (lo, hi) = match *op? {
+                    Operand::Vector { reg, .. } => (
+                        Operand::Vector { reg, dwords: 1 },
+                        Operand::Vector { reg: reg + 1, dwords: 1 },
+                    ),
+                    Operand::Scalar { code, .. } if code != NULL && code < 105 => (
+                        Operand::Scalar { code, dwords: 1 },
+                        Operand::Scalar { code: code + 1, dwords: 1 },
+                    ),
+                    Operand::Const(128) => (Operand::Const(128), Operand::Const(128)),
+                    _ => return None,
+                };
+                Some((lanes(&lo, &vec, &uni), lanes(&hi, &vec, &uni)))
+            };
+            let (a, b) = (pair(v.src.first()), pair(v.src.get(1)));
+            let (mut lo, mut hi) = (vec![Sym::Unknown; wave as usize], vec![Sym::Unknown; wave as usize]);
+            if !modifiers
+                && v.dpp.is_none()
+                && exec == all
+                && let (Some(a), Some(b)) = (a, b)
+            {
+                for l in 0..wave as usize {
+                    let ta = count_term(a.0[l], a.1[l], consts);
+                    let tb = count_term(b.0[l], b.1[l], consts);
+                    (lo[l], hi[l]) = add_counts(ta, tb);
+                }
+            }
+            for (k, x) in [(0u8, lo), (1, hi)] {
+                if let Some(w) = inst.write(Reg::V(dreg + k)) {
+                    vec.insert(w, x);
+                }
+            }
+            continue;
+        }
         let Some(dst) = inst.write(Reg::V(dreg)) else {
             continue;
         };

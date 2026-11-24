@@ -1901,7 +1901,16 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        // A double's sum of 1.0: the count of the lanes, made a double at the end.
+        let count_d = match op {
+            Op::CountD(high) if prefix.is_none() => Some(high),
+            Op::CountD(_) => return Err("a wave prefix of an operation other than a sum"),
+            _ => None,
+        };
+        let (op, x) = match count_d {
+            Some(_) => (Op::AddU, self.s.m.i32(1)),
+            None => (op, self.i32_of(src)?),
+        };
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
@@ -2024,7 +2033,31 @@ impl<'a> Lower<'a> {
         } else {
             r
         };
+        if let Some(high) = count_d {
+            return Ok(self.count_as_double(r, high));
+        }
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// A dword of `n` (a lane count, below 2^24) as a 64-bit float: by way of its f32, whose
+    /// exponent and mantissa move over (0 stays all zeros).
+    fn count_as_double(&mut self, n: V, high: bool) -> V {
+        let c = self.cur;
+        let f = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
+        let bits = self.as_int(f);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k3, k29, k7) = (k(self, 3), k(self, 29), k(self, 7));
+        if !high {
+            let m = self.s.m.bin(c, Bin::And, bits, k7);
+            return self.s.m.bin(c, Bin::Shl, m, k29);
+        }
+        // sign and exponent (bits 23-31, re-biased by 1023 - 127) and the mantissa's top 20 bits
+        let rebias = k(self, (1023 - 127) << 20);
+        let top = self.s.m.bin(c, Bin::LShr, bits, k3);
+        let x = self.s.m.bin(c, Bin::Add, top, rebias);
+        let zero = k(self, 0);
+        let none = self.s.m.cmp(c, pred::EQ, n, zero);
+        self.s.m.select(c, none, zero, x)
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
