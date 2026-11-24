@@ -24,8 +24,14 @@ pub fn run(
     // The title's exe is hundreds of MB: keep no copy of it for the run.
     drop(original);
     let hash = prepared.original_hash.to_hex();
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
+        Some(build) => {
+            println!("build          {} ({hash})", build.label);
+            if execute {
+                check_startup_archive(&title_dir.join(build.startup_archive))?;
+            }
+        }
         None => println!("build          unknown ({hash})"),
     }
 
@@ -46,7 +52,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -103,6 +108,7 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    report_commit();
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -126,6 +132,55 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+#[cfg(windows)]
+fn check_startup_archive(path: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let mut magic = [0; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .with_context(|| {
+            format!(
+                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        magic == *b"9FPR",
+        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The bytes the title asks Windows for in one mapping on its first boot:
+/// 99,776 64 KiB physical pages (issue #23).
+#[cfg(windows)]
+const FIRST_BOOT_BYTES: usize = 99_776 * (64 << 10);
+
+/// The host's commit headroom, and a warning when the title's first big
+/// mapping will not fit: its paging file is the usual reason (README,
+/// Getting started).
+#[cfg(windows)]
+fn report_commit() {
+    let Some((available, limit)) = victory_hle::modules::xmem::commit_headroom() else {
+        return;
+    };
+    let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+    println!(
+        "commit         {:.1} GiB available of {:.1} GiB (first boot asks {:.1} GiB)",
+        gib(available),
+        gib(limit),
+        gib(FIRST_BOOT_BYTES)
+    );
+    if available < FIRST_BOOT_BYTES {
+        println!(
+            "               short of it: the title may stop here; \
+             raise the paging file (README, Getting started)"
+        );
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

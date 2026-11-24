@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -49,6 +50,23 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let started = std::time::Instant::now();
+    let answer = writes_now(start, end, guarded);
+    ASKS[0].fetch_add(1, Ordering::Relaxed);
+    ASKS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    answer
+}
+
+/// Calls of [`writes`] and the microseconds they took, since the last
+/// [`take_asks`].
+static ASKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Calls of [`writes`] and their microseconds since the last call.
+pub(crate) fn take_asks() -> [u64; 2] {
+    [0, 1].map(|i| ASKS[i].swap(0, Ordering::Relaxed))
+}
+
+fn writes_now(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -251,7 +269,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at + len);
+    // The length is the title's (`fread`'s size times count, saturated).
+    open(&mut guards(), at, at.saturating_add(len));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -260,7 +279,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
+        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
         .copied()
         .collect();
     for block in blocks {
@@ -442,5 +461,15 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A write or mapping that runs past the end of the address space (a
+    /// title's `fread` with a huge count) covers up to the end; the sum used
+    /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn ranges_past_the_address_space_end_do_not_overflow() {
+        let top = usize::MAX - 16;
+        writing(top, PAGE);
+        title_memory_remapped(top, usize::MAX);
     }
 }

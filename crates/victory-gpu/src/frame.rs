@@ -49,11 +49,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = forced_interval().unwrap_or(asked);
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +67,22 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// `VICTORY_FPS` (opt-in): frames per second to pace at instead of the
+/// title's own interval, e.g. 60 where the title asks for 30. A title that
+/// steps its simulation per frame rather than per elapsed time runs faster
+/// with it. Unset, 0 or unreadable: the title's interval.
+fn forced_interval() -> Option<Duration> {
+    static FORCED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| parse_fps(std::env::var("VICTORY_FPS").ok().as_deref()))
+}
+
+/// `VICTORY_FPS`'s interval. Pure, for testing.
+fn parse_fps(value: Option<&str>) -> Option<Duration> {
+    let fps: f64 = value?.trim().parse().ok()?;
+    (fps.is_finite() && (1.0..=1000.0).contains(&fps))
+        .then(|| Duration::from_nanos((1e9 / fps) as u64))
 }
 
 /// Device method: events are scheduled at every tick.
@@ -92,14 +109,16 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-/// The next tick after now and after the last one a wait for `kind` ended
-/// on (an event happens once per tick: a wait woken a little early must not
-/// let the next one end on the same tick), and how long until it.
-fn next_tick(kind: u32) -> (u64, Duration) {
+/// The next tick after now and after the last one a wait for `kind` took
+/// (an event happens once per tick: a wait woken a little early must not
+/// let the next one end on the same tick), and how long until it. A wait
+/// that comes within `limit` takes the tick here, under the clock's lock,
+/// so two threads waiting for one kind never take the same tick.
+fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: forced_interval().unwrap_or(SIXTIETH),
         first: 0,
     });
     let elapsed = c.start.elapsed().as_nanos();
@@ -107,10 +126,11 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
-    (
-        tick,
-        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-    )
+    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    if wait <= limit {
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+    }
+    (tick, wait)
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -126,14 +146,15 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (tick, wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
+    let (tick, wait) = next_tick(kind, limit);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = tick;
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {
         std::thread::sleep(wait);
-        last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
     // A frame begun on a time-out takes no tick: its flip still does.
@@ -220,7 +241,35 @@ mod tests {
             .collect();
         assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
-        let (tick, _) = next_tick(FLIP);
+        let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
+    }
+
+    /// Two waits for one kind that begin together (two threads) take two
+    /// ticks: the first takes its tick before it sleeps. A time-out takes
+    /// none. The old code marked the tick after the sleep, so both got it.
+    #[test]
+    fn waits_begun_together_take_different_ticks() {
+        const VBLANK: u32 = 1;
+        let long = Duration::from_secs(1);
+        let (first, _) = next_tick(VBLANK, long);
+        let (second, _) = next_tick(VBLANK, long);
+        assert!(second > first, "{second} after {first}");
+        next_tick(VBLANK, Duration::ZERO);
+        assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+}
+
+#[cfg(test)]
+mod fps_tests {
+    use super::*;
+
+    #[test]
+    fn fps_override_parses() {
+        assert_eq!(parse_fps(Some("60")), Some(Duration::from_nanos(16_666_666)));
+        assert_eq!(parse_fps(Some(" 120 ")), Some(Duration::from_nanos(8_333_333)));
+        for bad in [None, Some(""), Some("0"), Some("-5"), Some("abc"), Some("inf"), Some("5000")] {
+            assert_eq!(parse_fps(bad), None, "{bad:?}");
+        }
     }
 }

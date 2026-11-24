@@ -87,6 +87,7 @@ mod lds_tests;
 mod lower;
 mod sampler;
 mod shader;
+mod spin;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -107,8 +108,9 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) sets it
+/// instead, in every build: a release build can then show which loops
+/// make a frame slow without a diagnostics build. A loop that hits the limit in
 /// every lane of a full-screen pass still runs for seconds (2^20 times a
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
@@ -116,17 +118,39 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+    })
+}
+
+/// The spin-wait limit without an override: 4096.
+pub const DEFAULT_SPIN_LIMIT: u32 = 1 << 12;
+
+/// The iteration count after which a loop that only waits for memory to
+/// change (a spin wait, see `spin.rs`) is left: [`DEFAULT_SPIN_LIMIT`], or
+/// `VICTORY_SHADER_SPIN_LIMIT` (decimal or `0x` hex, at least 1), never
+/// more than [`loop_limit`]. On the console the write such a loop waits
+/// for comes within microseconds; on the host, when it never comes (the
+/// writer's view is another host resource, null, or the load was hoisted),
+/// 2^20 uncached reads per lane cost about a second per wave, which is
+/// what world frames spent per host submission. 4096 reads are a few
+/// milliseconds. Part of the translation: the shader cache keys on it.
+pub fn spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_SPIN_LIMIT").ok();
+        parse_limit(v.as_deref(), DEFAULT_SPIN_LIMIT).min(loop_limit())
     })
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit(value, lower::LOOP_LIMIT)
+}
+
+/// A limit's value from its variable; `default` when it is unset,
+/// unreadable or 0.
+fn parse_limit(value: Option<&str>, default: u32) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
@@ -135,7 +159,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         });
     match parsed {
         Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        _ => default,
     }
 }
 
@@ -451,6 +475,14 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    #[test]
+    fn the_spin_limit_parses_with_its_own_default() {
+        use super::{DEFAULT_SPIN_LIMIT, parse_limit};
+        assert_eq!(parse_limit(None, DEFAULT_SPIN_LIMIT), 4096);
+        assert_eq!(parse_limit(Some("0x40"), DEFAULT_SPIN_LIMIT), 64);
+        assert_eq!(parse_limit(Some("0"), DEFAULT_SPIN_LIMIT), 4096);
+    }
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
@@ -638,6 +670,151 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn valu_mad64_executes_on_gpu() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0x7E14_0200, // v_mov_b32 v10, s0
+            0x7E16_0283, // v_mov_b32 v11, 3
+            0x7E18_0201, // v_mov_b32 v12, s1
+            0x7E1A_0202, // v_mov_b32 v13, s2
+            0xD576_0C00,
+            0x0432_170A, // v_mad_u64_u32 v[0:1], s12, v10, v11, v[12:13]
+            0xD501_0002,
+            0x0031_0280, // v_cndmask_b32_e64 v2, 0, 1, s12
+            0x7E1C_02C3, // v_mov_b32 v14, -3
+            0x7E1E_0285, // v_mov_b32 v15, 5
+            0x7E20_0299, // v_mov_b32 v16, 25
+            0x7E22_0280, // v_mov_b32 v17, 0
+            0xD577_0E04,
+            0x0442_1F0E, // v_mad_i64_i32 v[4:5], s14, v14, v15, v[16:17]
+            0xD501_0006,
+            0x0039_0280, // v_cndmask_b32_e64 v6, 0, 1, s14
+            0x7E24_0280, // v_mov_b32 v18, 0
+            0x7E26_0203, // v_mov_b32 v19, s3
+            0xD577_1008,
+            0x044A_1F0E, // v_mad_i64_i32 v[8:9], s16, v14, v15, v[18:19]
+            0xD501_0007,
+            0x0041_0280, // v_cndmask_b32_e64 v7, 0, 1, s16
+            0x7E06_0306, // v_mov_b32 v3, v6
+            0x7E28_0280, // v_mov_b32 v20, 0
+            0xE078_1000,
+            0x8002_0014, // buffer_store_dwordx4 v[0:3], v20, s[8:11], 0 offen
+            0x7E28_0290, // v_mov_b32 v20, 16
+            0x7E0C_0307, // v_mov_b32 v6, v7
+            0xE078_1000,
+            0x8002_0414, // buffer_store_dwordx4 v[4:7], v20, s[8:11], 0 offen
+            0x7E26_0280, // v_mov_b32 v19, 0
+            0xD577_1008,
+            0x044A_1F0E, // v_mad_i64_i32 v[8:9], s16, v14, v15, v[18:19]
+            0xD501_000A,
+            0x0041_0280, // v_cndmask_b32_e64 v10, 0, 1, s16
+            0x7E28_02A0, // v_mov_b32 v20, 32
+            0xE078_1000,
+            0x8002_0814, // buffer_store_dwordx4 v[8:11], v20, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 21,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(
+                            0,
+                            super::host::Root::Constants(vec![
+                                0x8000_0002,
+                                0xFFFF_FFFC,
+                                0xFFFF_FFFE,
+                                0x8000_0000,
+                                0,
+                            ]),
+                        )],
+                        views: &[super::host::View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(&out[0][..7], &[0x8000_0002, 0, 1, 0, 10, 0, 1]);
+            assert_eq!(&out[0][8..11], &[(-15i32) as u32, u32::MAX, 1]);
+        }
     }
 }
 

@@ -50,6 +50,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue;
+        }
         let mut old = 0;
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
@@ -67,10 +70,33 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
             FlushInstructionCache(GetCurrentProcess(), start as _, len);
         }
     }
-    // SAFETY: see `index_at`; `.data` is writable.
-    unsafe { index_at.write(0) };
+    // SAFETY: `index_at` is the image's `_tls_index` DWORD; no title code runs yet.
+    unsafe { zero_tls_index(index_at) }?;
     tracing::info!(index, patched, "static TLS redirected");
     Ok(patched)
+}
+
+/// Zeroes `_tls_index`, temporarily granting write access in case the linker
+/// placed it on a read-only page.
+///
+/// # Safety
+/// `index_at` points to a live, mapped `u32` inside the image and no other
+/// thread accesses it concurrently.
+unsafe fn zero_tls_index(index_at: *mut u32) -> Result<()> {
+    let mut old = 0;
+    // SAFETY: caller guarantees `index_at` points to a mapped `u32`.
+    if unsafe { VirtualProtect(index_at.cast(), size_of::<u32>(), PAGE_READWRITE, &mut old) } == 0 {
+        bail!(
+            "VirtualProtect(_tls_index) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: writable now, and caller guarantees exclusive access.
+    unsafe { index_at.write(0) };
+    let mut ignored = 0;
+    // SAFETY: restoring the protection we just changed.
+    unsafe { VirtualProtect(index_at.cast(), size_of::<u32>(), old, &mut ignored) };
+    Ok(())
 }
 
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
@@ -78,7 +104,10 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
 fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
     let mut count = 0;
     let mut i = 0;
-    while i + LOAD_LEN <= code.len() {
+    // The scan jumps between offsets that start like a load instead of
+    // testing the whole pattern at every byte.
+    while let Some(next) = next_candidate(code, i) {
+        i = next;
         let c = &code[i..i + LOAD_LEN];
         let rex = c[1];
         let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
@@ -103,6 +132,49 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
         }
     }
     count
+}
+
+/// The `gs` segment prefix that starts every TLS-array load.
+const GS: u8 = 0x65;
+
+/// The first offset from `from` where a load could start: a whole load's
+/// room, `gs` at the offset, `mov` (8B) two bytes on and the `[disp32]`
+/// SIB byte (25) four on, so `patch` tests the rest of the pattern only
+/// there. Sixteen offsets at a time with SSE2, which every x86-64 has.
+fn next_candidate(code: &[u8], from: usize) -> Option<usize> {
+    // One past the last offset a whole load fits at.
+    let end = (code.len() + 1).checked_sub(LOAD_LEN)?;
+    let mut i = from;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_set1_epi8,
+        };
+        // SAFETY: SSE2 is part of x86-64. Each load reads 16 bytes from
+        // `i`, `i + 2` or `i + 4`, which end by `i + 20 <= end + 4`, inside
+        // the code (`end + LOAD_LEN - 1` is its length).
+        unsafe {
+            let at = |k: usize| _mm_loadu_si128(code.as_ptr().add(k).cast::<__m128i>());
+            let (gs, mov, sib) = (
+                _mm_set1_epi8(GS as i8),
+                _mm_set1_epi8(0x8B_u8 as i8),
+                _mm_set1_epi8(0x25),
+            );
+            while i + 16 <= end {
+                let hits = _mm_and_si128(
+                    _mm_and_si128(_mm_cmpeq_epi8(at(i), gs), _mm_cmpeq_epi8(at(i + 2), mov)),
+                    _mm_cmpeq_epi8(at(i + 4), sib),
+                );
+                let mask = _mm_movemask_epi8(hits);
+                if mask != 0 {
+                    return Some(i + mask.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+    }
+    (i..end).find(|&j| code[j] == GS)
 }
 
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
@@ -135,6 +207,8 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: flushing our own freshly written thunks before any thread executes them.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), block as _, 4096) };
     Ok(block as usize)
 }
 
@@ -182,6 +256,150 @@ mod tests {
         array
     }
 
+    /// The byte-at-a-time scan `patch` had before it searched for
+    /// candidates: the reference its results must match exactly.
+    fn patch_bytewise(code: &mut [u8], at: usize, thunks: usize) -> usize {
+        let mut count = 0;
+        let mut i = 0;
+        while i + LOAD_LEN <= code.len() {
+            let c = &code[i..i + LOAD_LEN];
+            let rex = c[1];
+            let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
+            if c[0] == 0x65
+                && (rex == 0x48 || rex == 0x4C)
+                && c[2] == 0x8B
+                && c[3] & 0xC7 == 0x04
+                && c[4..] == [0x25, 0x58, 0, 0, 0]
+                && reg != 4
+            {
+                let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
+                code[i] = 0xE8;
+                code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+                code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
+                count += 1;
+                i += LOAD_LEN;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// xorshift64*: reproducible bytes without a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// `len` bytes of noise, rich in `gs` prefixes, with `loads` TLS-array
+    /// loads (and near misses of them) written at random offsets: any REX
+    /// or ModRM, so some are refused, and some overlapping one another.
+    fn code_with_loads(rng: &mut Rng, len: usize, loads: usize) -> Vec<u8> {
+        let mut code: Vec<u8> = (0..len)
+            .map(|_| match rng.next() % 16 {
+                0 => GS,
+                _ => rng.next() as u8,
+            })
+            .collect();
+        for _ in 0..loads {
+            let Some(room) = len.checked_sub(LOAD_LEN - 1) else {
+                break;
+            };
+            let at = (rng.next() as usize) % room.max(1);
+            let r = rng.next();
+            let rex = [0x48, 0x4C, 0x49, 0x65][(r & 3) as usize];
+            let modrm = (r >> 8) as u8 & 0x3F | [0x04, 0x44][(r >> 16 & 1) as usize] & 0xC7;
+            let mut load = [GS, rex, 0x8B, modrm, 0x25, 0x58, 0, 0, 0];
+            if r >> 20 & 7 == 0 {
+                // A near miss in one byte of the tail.
+                load[4 + (r >> 24) as usize % 5] ^= 1;
+            }
+            let n = load.len().min(len - at);
+            code[at..at + n].copy_from_slice(&load[..n]);
+        }
+        code
+    }
+
+    #[test]
+    fn candidate_search_patches_exactly_what_the_bytewise_scan_does() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (at, thunks) = (0x1_4000_0000, 0x1_3FFF_0000);
+        let mut patched = 0;
+        for len in (0..64).chain([255, 256, 257, 4093, 4096, 65_537]) {
+            for round in 0..40 {
+                let loads = (len / LOAD_LEN).min(round * 3);
+                let code = code_with_loads(&mut rng, len, loads);
+                // Every offset too, so each word alignment of the search
+                // is covered.
+                let shift = round % 8;
+                let (mut fast, mut slow) = (code.clone(), code.clone());
+                let n = patch(&mut fast[shift.min(len)..], at, thunks);
+                let m = patch_bytewise(&mut slow[shift.min(len)..], at, thunks);
+                assert_eq!((n, &fast), (m, &slow), "len {len} round {round}");
+                patched += n;
+            }
+        }
+        assert!(patched > 200, "{patched} loads patched");
+        // Back to back, a prefix inside a load, and a load ending the code.
+        let load = [GS, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0];
+        let mut code = Vec::new();
+        for _ in 0..3 {
+            code.extend(load);
+        }
+        code.extend([GS, GS]);
+        code.extend(load);
+        let (mut fast, mut slow) = (code.clone(), code);
+        assert_eq!(patch(&mut fast, at, thunks), 4);
+        assert_eq!(patch_bytewise(&mut slow, at, thunks), 4);
+        assert_eq!(fast, slow);
+    }
+
+    /// `cargo test -p victory-loader --release -- --ignored --nocapture
+    /// tls_scan_speed`: both scans over synthetic code sections.
+    #[test]
+    #[ignore = "benchmark"]
+    fn tls_scan_speed() {
+        use std::time::Instant;
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for (name, mib, per_mib) in [("small", 1, 512), ("medium", 16, 512), ("large", 128, 512)] {
+            let len = mib << 20;
+            // Code-like noise: each byte a gs prefix with chance 1/256.
+            let mut code: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            for _ in 0..mib * per_mib {
+                let i = rng.next() as usize % (len - LOAD_LEN);
+                code[i..i + LOAD_LEN].copy_from_slice(&[GS, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
+            }
+            let best = |f: fn(&mut [u8], usize, usize) -> usize| {
+                let mut times = Vec::new();
+                let mut out = (0, Vec::new());
+                for _ in 0..5 {
+                    let mut c = code.clone();
+                    let t = Instant::now();
+                    let n = f(&mut c, 0x1_4000_0000, 0x1_3FFF_0000);
+                    times.push(t.elapsed().as_secs_f64());
+                    out = (n, c);
+                }
+                (times.into_iter().fold(f64::MAX, f64::min), out)
+            };
+            let (old, a) = best(patch_bytewise);
+            let (new, b) = best(patch);
+            assert_eq!(a, b);
+            println!(
+                "{name:6} {mib:4} MiB, {:6} loads: bytewise {:8.3} ms, candidate search {:8.3} ms, {:5.1}x",
+                a.0,
+                old * 1e3,
+                new * 1e3,
+                old / new
+            );
+        }
+    }
+
     #[test]
     fn loads_become_calls_that_yield_the_title_slot() {
         let page = near(tls_array as *const () as usize, 0).unwrap();
@@ -208,12 +426,53 @@ mod tests {
             assert_eq!(patch(bytes, page as usize, thunks), 1);
             let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
-            unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
+            unsafe {
+                VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old);
+                FlushInstructionCache(GetCurrentProcess(), page as _, 4096);
+            }
             // SAFETY: the page holds the patched load and a return.
             let f: extern "system" fn() -> usize = unsafe { std::mem::transmute(page) };
             assert_eq!(f(), tls_array() + 3 * 8, "REX {rex:#x} ModRM {modrm:#x}");
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn zero_tls_index_writes_read_only_page_and_restores_protection() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualFree, VirtualQuery,
+        };
+        // SAFETY: allocating a private single page for this test.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as *mut u32;
+        assert!(!page.is_null());
+        // SAFETY: freshly allocated writable page.
+        unsafe { page.write(7) };
+        let mut old = 0;
+        // SAFETY: protecting our test page as read-only before calling `zero_tls_index`.
+        let protected = unsafe { VirtualProtect(page.cast(), 4096, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+
+        // SAFETY: `page` is our private mapped DWORD with exclusive access.
+        unsafe { zero_tls_index(page) }.unwrap();
+        // SAFETY: still mapped and readable.
+        assert_eq!(unsafe { page.read() }, 0);
+
+        // SAFETY: POD Win32 struct, zero-initialized before `VirtualQuery` writes it.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying our own page's protection.
+        let queried = unsafe { VirtualQuery(page.cast(), &mut info, size_of_val(&info)) };
+        assert!(queried >= size_of_val(&info));
+        assert_eq!(info.Protect, PAGE_READONLY);
+
+        // SAFETY: releasing the test allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 }

@@ -35,6 +35,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Host pipelines another worker was already loading or creating under the
+/// same name, handed its result instead of a second compile.
+pub(crate) static SHARED: AtomicU64 = AtomicU64::new(0);
+/// Time spent in the host's compiles (`create`), in microseconds.
+pub(crate) static COMPILE_US: AtomicU64 = AtomicU64::new(0);
 
 struct Library {
     library: ID3D12PipelineLibrary1,
@@ -106,9 +111,64 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// A host pipeline being loaded or created, shared by every worker that
+/// asks for the same name meanwhile.
+type Slot = std::sync::Arc<OnceLock<Made>>;
+struct Made(windows::core::Result<ID3D12PipelineState>);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Made {}
+// SAFETY: as above.
+unsafe impl Sync for Made {}
+
+/// Names being loaded or created right now (removed once done, so a name
+/// asked for later is loaded from the library instead of kept alive here).
+static IN_FLIGHT: Mutex<Option<std::collections::HashMap<String, Slot>>> = Mutex::new(None);
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description, else made by `create` and stored. Two
+/// title pipelines with the same host description (the title creates
+/// duplicates) asked for at once are made once: the later caller waits for
+/// the first one's result.
 pub(crate) fn pipeline(
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let slot: Slot = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .entry(name.to_owned())
+        .or_default()
+        .clone();
+    let mut ran = false;
+    let made = slot.get_or_init(|| {
+        ran = true;
+        Made(load_or_create(name, load, create))
+    });
+    let result = made.0.clone();
+    if ran {
+        let mut flying = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = flying.as_mut() {
+            map.remove(name);
+        }
+    } else {
+        SHARED.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// `create`, timed.
+fn compile(
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let started = std::time::Instant::now();
+    let pso = create();
+    COMPILE_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    pso
+}
+
+fn load_or_create(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
@@ -116,14 +176,14 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return compile(create);
     };
     if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
-    let pso = create()?;
+    let pso = compile(create)?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -137,19 +197,19 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // Held over serialisation and both writes, so overlapping saves cannot
+    // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
-    let blob = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+    *last = Some(std::time::Instant::now());
+    let (blob, saved_additions) = {
+        let l = library.lock().unwrap_or_else(|e| e.into_inner());
+        if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -158,39 +218,59 @@ pub(crate) fn save(now: bool) {
             l.library.Serialize(&mut bytes).map(|()| bytes)
         };
         match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                bytes
-            }
+            Ok(bytes) => (bytes, l.added),
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
         }
     };
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Ok(()) => {
+            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep pipelines stored while the files were being written.
+            l.added = l.added.saturating_sub(saved_additions);
+            tracing::info!(
+                bytes = blob.len(),
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            );
+        }
+        Err(e) => {
+            // At least one cache file was not published. Keep the counters
+            // dirty for the next save.
+            if used_changed {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// Writes `bytes` to a unique temporary file beside `path`, then renames it
+/// over `path`: a reader never sees a part, and overlapping saves do not
+/// share a temporary file.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let extension = format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = path.with_extension(extension);
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Title pipeline keys drawn or dispatched with (this run and the last).
@@ -250,5 +330,49 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_publish_one_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for thread in 0..8 {
+            let path = path.clone();
+            let start = start.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let byte = thread as u8 + 1;
+                for _ in 0..32 {
+                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let published = std::fs::read(&path).unwrap();
+        assert_eq!(published.len(), 64 * 1024);
+        assert!(published.iter().all(|&byte| byte == published[0]));
+        assert!((1..=8).contains(&published[0]));
+        assert!(!std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
+    }
+
+    #[test]
+    fn failed_atomic_writes_remove_their_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_atomically(&path, b"not published").is_err());
+        assert!(!std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
     }
 }

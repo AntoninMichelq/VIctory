@@ -156,6 +156,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// As [`with_state`], for a draw or dispatch: its CPU time counts as
+/// recording time in the frame-rate log.
+#[cfg(windows)]
+fn with_state_timed(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let started = std::time::Instant::now();
+    with_state(this, f);
+    crate::draw::recorded(started);
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
@@ -532,6 +541,42 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// Size of the source box, or of the selected mip/array/plane subresource
+/// when the caller asks D3D12 to copy the whole subresource.
+#[cfg(windows)]
+fn readback_extent(
+    host: &crate::host::Host,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    subresource: u32,
+    source_box: Option<&[u32; 6]>,
+) -> Option<[u32; 3]> {
+    if let Some(&[left, top, front, right, bottom, back]) = source_box {
+        return Some([
+            right.checked_sub(left)?,
+            bottom.checked_sub(top)?,
+            back.checked_sub(front)?,
+        ]);
+    }
+    use windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT;
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: the texture is live and both outputs hold one subresource's result.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &texture.GetDesc(),
+            subresource,
+            1,
+            0,
+            Some(&mut layout),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    let fp = layout.Footprint;
+    (total != u64::MAX).then_some([fp.Width, fp.Height, fp.Depth])
+}
+
 /// Texture to texture on the GPU, buffer to texture through an upload
 /// buffer filled at submission, and texture to buffer through a readback
 /// buffer copied into title memory once the submission completes.
@@ -593,6 +638,37 @@ extern "system" fn copy_texture_region(
             if total == 0 || lines == 0 || row_bytes == 0 {
                 return;
             }
+            // For a subresource location the first DWORD of the footprint union is its index.
+            let Some([width, height, depth]) = readback_extent(
+                host,
+                from_tex,
+                src.footprint.offset as u32,
+                // SAFETY: the optional source box is read during this call.
+                unsafe { source_box.as_ref() },
+            ) else {
+                return;
+            };
+            let footprint = dst.footprint;
+            let Some((element, block)) = crate::resource::element(footprint.format) else {
+                return;
+            };
+            // A BC mip's reported extent can include its final partial block.
+            // Measure the footprint and the copied area in the same storage units.
+            let rows_per_slice = u64::from(footprint.height).div_ceil(block);
+            let row_in_slice = u64::from(y) / block;
+            let first_row = u64::from(z) * rows_per_slice + row_in_slice;
+            let column_bytes = (u64::from(x) / block) * element;
+            let copy_rows = u64::from(height).div_ceil(block);
+            let copy_bytes = u64::from(width).div_ceil(block) * element;
+            if copy_bytes == 0
+                || copy_rows == 0
+                || depth == 0
+                || column_bytes + copy_bytes > row_bytes
+                || row_in_slice + copy_rows > rows_per_slice
+                || u64::from(z) + u64::from(depth) > u64::from(footprint.depth)
+            {
+                return;
+            }
             let dst_pitch = u64::from(dst.footprint.row_pitch);
             if lines > 1 && dst_pitch < row_bytes {
                 return;
@@ -604,11 +680,14 @@ extern "system" fn copy_texture_region(
                 return;
             };
             // D3D12 requires placed footprints' row pitch to be 256-byte aligned.
-            let host_pitch = dst
+            let Some(host_pitch) = dst
                 .footprint
                 .row_pitch
                 .max(row_bytes_u32)
-                .next_multiple_of(256);
+                .checked_next_multiple_of(256)
+            else {
+                return;
+            };
             let Some(staging_bytes) = u64::from(host_pitch)
                 .checked_mul(lines - 1)
                 .and_then(|n| n.checked_add(row_bytes))
@@ -654,15 +733,21 @@ extern "system" fn copy_texture_region(
                     host_box,
                 )
             };
-            list.defer_readback(
-                target,
-                staging,
-                dst_pitch as usize,
-                host_pitch as usize,
-                lines as usize,
-                row_bytes as usize,
-                total as usize,
-            );
+            // The GPU only populated the copied rectangle in staging. Preserve
+            // the rest of each destination row and the gaps between slices.
+            for slice in 0..u64::from(depth) {
+                let row = first_row + slice * rows_per_slice;
+                let dst_offset = (row * dst_pitch + column_bytes) as usize;
+                let src_offset = (row * u64::from(host_pitch) + column_bytes) as usize;
+                list.defer_readback(
+                    target.wrapping_add(dst_offset),
+                    staging.wrapping_add(src_offset),
+                    dst_pitch as usize,
+                    host_pitch as usize,
+                    copy_rows as usize,
+                    copy_bytes as usize,
+                );
+            }
             return;
         }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -950,36 +1035,61 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: recorded into the host list, in order
+/// with the draws, for the types the host has (not timestamps, which only
+/// end, nor a query running already).
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::query::host(heap, kind, index, 1)
+        && list.begin_query(&host.heap, kind, index)
+    {
+        host.began(index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: takes a timestamp, or ends a query begun
+/// in the same list; an end without its begin is dropped, so the query
+/// has no host result.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::query::host(heap, kind, index, 1)
+        && let Some(ended) = list.end_query(&host.heap, kind, index)
+    {
+        host.ended(index, ended);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// each query's result into the buffer once the list has run. Queries that
+/// ran on the host GPU give its results ([`host_resolve`]); the others,
+/// and every query of types the host lacks, stand-in values: timestamps
+/// (type 2) the GPU clock then, occlusion counts (0) a million samples
+/// passed and binary occlusion (1) visible, so nothing is culled by a
+/// query that did not run.
+/// shortcut: the console's other query types and result layouts are not
+/// known; they get zeros, 16 bytes per query.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
-    const PIPELINE_STATISTICS: u32 = 3;
+    use crate::query::{BINARY_OCCLUSION, OCCLUSION, PIPELINE_STATISTICS, TIMESTAMP};
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
+        BINARY_OCCLUSION => (Written::Value(1), 8),
         TIMESTAMP => (Written::GpuTimestamp, 8),
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
@@ -990,15 +1100,98 @@ extern "system" fn resolve_queries(
     if end > size {
         return;
     }
+    // SAFETY: inside the buffer, checked above.
+    let at = unsafe { data.add(offset as usize) };
+    #[cfg(windows)]
+    let measured = host_resolve(this, heap, kind, first, count, at, bytes);
+    #[cfg(not(windows))]
+    let (measured, _) = (Vec::<bool>::new(), (heap, first));
     for i in 0..u64::from(count) {
+        if measured.get(i as usize) == Some(&true) {
+            continue;
+        }
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
             // SAFETY: inside the buffer, checked above.
-            let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
+            let at = unsafe { at.add((i * bytes + piece * 8) as usize) };
             let what = if piece == 0 { what } else { Written::Value(0) };
             defer_write(this, at as u64, what, 8);
         }
     }
+}
+
+/// Resolves on the host GPU the queries of `[first, first + count)` whose
+/// last run there was of type `kind`, into title memory at `at` (`bytes`
+/// per query, inside a buffer): which ones it resolves.
+///
+/// Occlusion and statistics results go into the buffer's host copy, where
+/// later commands read them, and back into title memory after the
+/// submission, as shader writes do ([`crate::shadow::Shadow::gpu_writes`]).
+/// Timestamps go through read-back memory and are put on the title's GPU
+/// clock after the submission (`Written::HostTimestamp`).
+#[cfg(windows)]
+fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *mut u8, bytes: u64) -> Vec<bool> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (Some(list), Some(host)) = (host_list(this), crate::query::host(heap, kind, first, count)) else {
+        return Vec::new();
+    };
+    let measured: Vec<bool> = (first..first + count).map(|i| host.measured(i, kind)).collect();
+    // Runs of measured queries: (first index from `first`, count).
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
+        match runs.last_mut() {
+            Some((from, n)) if *from + *n == i as u32 => *n += 1,
+            _ => runs.push((i as u32, 1)),
+        }
+    }
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let len = u64::from(count) * bytes;
+    let host_kind = D3D12_QUERY_TYPE(kind as i32);
+    if kind == crate::query::TIMESTAMP {
+        let Some((back, data)) = crate::host::host().and_then(|h| list.readback(h, len)) else {
+            return Vec::new();
+        };
+        for &(from, n) in &runs {
+            // SAFETY: an open list, a live heap, a read-back buffer of `len`
+            // bytes.
+            unsafe { list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &back, u64::from(from) * 8) };
+        }
+        for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
+            // SAFETY: both inside their buffers (`i < count`).
+            let (to, raw) = unsafe { (at.add(i * 8), data.add(i * 8)) };
+            list.defer_write(to, Written::HostTimestamp(raw as usize), 8);
+        }
+        return measured;
+    }
+    let address = at as u64;
+    // The host resolves to 8-byte aligned offsets only.
+    let Some(shadow) = crate::shadow::find(address, len).filter(|s| s.offset(address).is_multiple_of(8)) else {
+        return Vec::new();
+    };
+    // Title memory first (the stand-in values and the bytes between
+    // results), then the results over it.
+    shadow.refresh(&list, address, len);
+    shadow.gpu_writes(&list, address, len);
+    let to = shadow.offset(address);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("resolve {count} queries of type {kind} to {address:#x}"));
+    // SAFETY: an open list, a live heap and buffer copy, kept until the list
+    // is reset; the copy is promoted to a copy destination and left for
+    // what reads it next.
+    unsafe {
+        for &(from, n) in &runs {
+            let offset = to + u64::from(from) * bytes;
+            list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &shadow.buffer, offset);
+        }
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &shadow.buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    measured
 }
 
 /// IUnknown 3, object 4, device child 1, allocator 2.
@@ -1061,11 +1254,18 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, host_list, with_state, with_state_timed};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1198,27 +1398,41 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state_timed(this, |list, s| s.dispatch(list, x, y, z));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
-    /// programs take `x` groups only.
-    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-        super::count_draw();
-        if y * z != 1 {
+    /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
+    /// title's mesh programs read only the x group id, so `x` (y and z
+    /// other than 1 are logged once); none if any dimension is empty.
+    pub(super) fn mesh_groups(x: u32, y: u32, z: u32) -> Option<u32> {
+        if x == 0 || y == 0 || z == 0 {
+            return None;
+        }
+        if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        Some(x)
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMesh(x, y, z)` (the PC method of List6).
+    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        super::count_draw();
+        if let Some(x) = mesh_groups(x, y, z) {
+            with_state_timed(this, |list, s| s.dispatch_mesh(list, x));
+        }
+    }
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
+    /// indirect address the group counts are in GPU memory there, run as
+    /// indirect execution of one mesh dispatch (behind the same switch).
+    /// Inferred, not documented: the arguments are those of a PC indirect
+    /// mesh dispatch (D3D12_DISPATCH_MESH_ARGUMENTS, three 32-bit group
+    /// counts, as the title's mesh dispatch signatures have) and `x` is then
+    /// unused; `flags` and `payload` are unknown.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1226,13 +1440,27 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        const MESH: u32 = 10;
+        const STRIDE: u32 = 12;
         super::count_draw();
-        if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+        if indirect == 0 {
+            if x != 0 {
+                with_state_timed(this, |list, s| s.dispatch_mesh(list, x));
+            }
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        let mut ran = false;
+        if super::indirect_on() {
+            with_state_timed(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+            });
+        }
+        if !ran {
+            if let Some(list) = super::host_list(this) {
+                list.missed_draw();
+            }
+            super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1243,7 +1471,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1288,6 +1516,14 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Whether the title's indirect draws and dispatches run on the host:
+/// always now that their arguments are clamped and budgeted
+/// (`crate::indirect`) and pipelines are made off the render thread.
+#[cfg(windows)]
+fn indirect_on() -> bool {
+    true
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1314,13 +1550,14 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if indirect_on()
+        && let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_timed(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -1333,6 +1570,10 @@ extern "system" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.missed_draw();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1475,7 +1716,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1488,8 +1729,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0
+    (29, end_query as *const ()),              // 0xe8
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -1548,10 +1789,56 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
+#[cfg(all(test, windows))]
+pub(crate) fn has_newer_table(list: This) -> bool {
+    // SAFETY: one of our lists; its first field is the table. The device
+    // tests can switch layouts, so use this list's table.
+    let table = unsafe { *list.cast::<*const *const ()>() };
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Mesh programs read only the x group id, so a mesh dispatch runs its
+    /// x groups; one with no groups in any dimension runs nothing.
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatches_run_x_groups_unless_empty() {
+        use state::mesh_groups;
+        assert_eq!(mesh_groups(5, 1, 1), Some(5));
+        assert_eq!(mesh_groups(0, 1, 1), None);
+        assert_eq!(mesh_groups(5, 0, 1), None);
+        assert_eq!(mesh_groups(5, 1, 0), None);
+        assert_eq!(mesh_groups(5, 2, 3), Some(5));
+        assert_eq!(mesh_groups(5, u32::MAX, u32::MAX), Some(5));
+    }
+
+    /// An indirect mesh dispatch the host does not run (indirect execution
+    /// off, as in tests) is counted with the other indirect work dropped.
+    #[cfg(windows)]
+    #[test]
+    fn indirect_mesh_dispatches_not_run_are_counted() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let arguments = [7u32, 1, 1];
+        let before = INDIRECT.load(std::sync::atomic::Ordering::Relaxed);
+        state::dispatch_mesh_x(list, 0, 0, arguments.as_ptr() as u64, 0);
+        assert!(INDIRECT.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
