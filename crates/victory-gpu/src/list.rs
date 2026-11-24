@@ -1247,10 +1247,34 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The console runs
+/// draws and dispatches of a list back to back and the title orders the
+/// ones that depend on each other with these syncs (a pass reading what
+/// the previous dispatch wrote to a buffer or to the same UAV texture), not
+/// with barriers. The host may overlap such work too, so a sync becomes an
+/// unordered access barrier on every resource: earlier shader writes land
+/// before later work reads them. Texture state changes are made where a
+/// use needs them, as before. `VICTORY_NO_SYNC_BARRIER=1` restores the
+/// old no-op.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SYNC_BARRIER").is_some()) {
+            return;
+        }
+        if let Some(list) = host_list(this) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
