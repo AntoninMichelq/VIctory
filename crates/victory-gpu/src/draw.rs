@@ -1482,7 +1482,13 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
+            Some(t) => format!("uav {t}"),
+            None => match crate::descriptor::host::buffer_range(v) {
+                Some(range) => format!("uav buffer {range:?}"),
+                None => "uav without host resource".into(),
+            },
+        },
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
