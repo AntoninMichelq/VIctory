@@ -344,8 +344,12 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// A section handle and its size.
-struct Section(HANDLE, usize);
+/// A section handle, its size and a number no other section gets.
+struct Section(HANDLE, usize, u64);
+
+/// Numbers sections for `victory_gpu`'s direct title memory, which keys
+/// its heaps by section (handle values are reused).
+static NEXT_SECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Bytes of the physical-page sections alive (reserved; committed as
 /// mapped or written).
@@ -437,7 +441,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         "XMemAllocatePhysicalPages"
     );
     SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
-    let section = Arc::new(Section(handle, size));
+    let section = Arc::new(Section(
+        handle,
+        size,
+        NEXT_SECTION.fetch_add(1, Ordering::Relaxed),
+    ));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -975,7 +983,55 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// For `victory_gpu`'s direct title memory (`VICTORY_DIRECT_MEMORY=1`):
+/// the section whose consecutive bytes show `[at, at + len)`, through one
+/// view or views of adjacent slices, with a duplicate of its handle the
+/// caller closes. `None` where the range is not all mapped that way (a
+/// scatter mapping, two sections, a hole).
+fn direct_section(at: usize, len: usize) -> Option<victory_gpu::DirectSection> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    let end = at.checked_add(len.max(1))?;
+    let physical = physical();
+    let (&first, (first_len, slice)) = physical.views.range(..=at).next_back()?;
+    if first + first_len <= at {
+        return None;
+    }
+    let section = slice.section.clone();
+    let offset = slice.index * PAGE + (at - first);
+    // Adjacent views must go on with the next slices of the same section.
+    let (mut view, mut view_len, mut index) = (first, *first_len, slice.index);
+    while view + view_len < end {
+        let next = view + view_len;
+        let (len, part) = physical.views.get(&next)?;
+        let pages = view_len.div_ceil(PAGE);
+        if !Arc::ptr_eq(&part.section, &section) || part.index != index + pages {
+            return None;
+        }
+        (view, view_len, index) = (next, *len, part.index);
+    }
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: our live section handle, duplicated into our own process.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            section.0,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    (ok != 0).then(|| victory_gpu::DirectSection {
+        handle: copy as isize,
+        id: section.2,
+        size: section.1 as u64,
+        offset: offset as u64,
+    })
+}
+
 pub(crate) fn module() -> HleModule {
+    victory_gpu::set_direct_section_lookup(direct_section);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],

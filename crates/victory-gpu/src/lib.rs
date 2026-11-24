@@ -22,6 +22,7 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+mod direct;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -57,6 +58,7 @@ mod timeline;
 mod watch;
 
 #[cfg(windows)]
+pub use direct::{DirectSection, SectionLookup, set_direct_section_lookup};
 pub use host::on_failure;
 pub use memstat::report as memory_report;
 #[cfg(windows)]
