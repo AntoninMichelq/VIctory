@@ -1865,7 +1865,19 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
         };
-        if self.mask_data == MaskData::None {
+        // shortcut: a mesh program's minimum, maximum, AND or OR over the
+        // active lanes is taken over the host's wave (no wave size can be
+        // declared): a value some active lane holds, which the console
+        // compiler's loops over distinct values (each round takes the lanes
+        // equal to the minimum) need, per host wave as per console wave.
+        // Sums, XORs and prefixes would count lanes of the console's wave.
+        if self.mask_data == MaskData::None
+            && (prefix.is_some()
+                || !matches!(
+                    op,
+                    Op::MinU | Op::MaxU | Op::MinI | Op::MaxI | Op::MinF | Op::MaxF | Op::Or | Op::And
+                ))
+        {
             return Err("a wave reduction in a mesh shader");
         }
         if self.split {
