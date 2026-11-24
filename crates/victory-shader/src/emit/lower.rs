@@ -12603,6 +12603,10 @@ impl<'a> Lower<'a> {
                     .enumerate()
                     .filter(|&(_, &q)| self.tail[q].is_some())
                     .any(|(n, _)| matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_))));
+            // A join structurisation keeps as data (no mask): a mask on
+            // one of its edges is a register reused for data elsewhere.
+            let phi_is_mask = self.x.st.masks.contains_key(&phi.value)
+                || self.x.st.highs.contains_key(&phi.value);
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -12633,7 +12637,7 @@ impl<'a> Lower<'a> {
                     // dead descriptor dword, junk on that edge, assuming
                     // the joined value is read only after the data edge.
                     (Some(Val::Missing(LANE_MASK)) | None, false)
-                        if has_data
+                        if !phi_is_mask
                             && (self.x.st.masks.contains_key(&arg)
                                 || self.x.st.highs.contains_key(&arg)) =>
                     {
@@ -13154,6 +13158,41 @@ mod tests {
             }
             lower_wave(&w, vec![], vec![], wave64).unwrap();
         }
+    }
+
+    /// A compare's mask high half joined with a descriptor's dword (no
+    /// edge of data), then that join joined with data and read: the inner
+    /// join is data too, its mask edge junk.
+    #[test]
+    fn a_mask_half_joined_twice_with_data_is_a_number() {
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xD4C4_000A,
+            0x0002_0085, // v_cmp_gt_u32_e64 s[10:11], 5, v0
+            0xD501_0002,
+            0x002A_0300, // v_cndmask_b32_e64 v2, v0, v1, s[10:11]
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0005, // s_cbranch_scc1 J1
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8002_0300, // buffer_load_dword v3, v0, s[8:11], 0 offen
+            0xBF04_8101, // J1: s_cmp_lt_i32 s1, 1
+            0xBF85_0001, // s_cbranch_scc1 J2
+            0x7E16_0501, // v_readfirstlane_b32 s11, v1
+            0x8706_FF0B,
+            0x0000_0100, // J2: s_and_b32 s6, s11, 0x100
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0
+            0xBF85_0003, // s_cbranch_scc1 end
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_wave(&words, layout, dword_buffers(), true).unwrap();
     }
 
     /// Lowers a compute program of constants: whether it translates.
