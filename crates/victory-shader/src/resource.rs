@@ -129,6 +129,11 @@ pub struct Resources {
     /// For a read-first-lane result used as an address offset, the lane-local
     /// offset to broadcast at that instruction instead of its full pointer.
     pub first_lane_offsets: BTreeMap<Value, Value>,
+    /// Global loads from inside the buffer a descriptor describes (an
+    /// address made of the descriptor's own base words): the load, the
+    /// byte offset in that buffer and the computed term. The descriptor is
+    /// in [`Resources::descriptors`] at the same site.
+    pub described: Vec<(Site, u32, Option<Value>)>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -224,10 +229,23 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) => {
+                            let Some((source, sum)) = (inst.name().starts_with("global_load_"))
+                                .then(|| t.described(inst, addr.as_ref(), saddr.as_ref(), *offset))
+                                .flatten()
+                            else {
+                                return Err(fail(why));
+                            };
+                            out.descriptors.push(Descriptor {
+                                site,
+                                role: Role::Resource,
+                                source,
+                            });
+                            out.described.push((site, sum.offset, sum.dynamic));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -749,6 +767,117 @@ impl<'a> Tracer<'a> {
                 )
             }
         }
+    }
+
+    /// A global load's address made of a buffer descriptor's own base
+    /// words, loaded from a table: low dword `(word0 & !0xff) | k` (or
+    /// `+ k`, or `word0` itself), high dword `word1` masked to its address
+    /// bits. Read as byte `k` (plus the offsets the load adds) of the buffer
+    /// the descriptor describes, taking its base as 256-byte aligned.
+    fn described(
+        &self,
+        inst: &Inst,
+        addr: Option<&Operand>,
+        saddr: Option<&Operand>,
+        offset: i16,
+    ) -> Option<(Source, Sum)> {
+        let Some(&Operand::Vector { reg, .. }) = addr else {
+            return None;
+        };
+        let mut extra = Sum {
+            base: None,
+            offset: offset as i32 as u32,
+            dynamic: None,
+        };
+        let (lo, hi) = match saddr {
+            Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                let v = inst.read(Reg::V(reg))?;
+                let s = self.sum(self.vorigin(v));
+                if s.base.is_some() {
+                    return None;
+                }
+                extra.offset = extra.offset.wrapping_add(s.offset);
+                extra.dynamic = s.dynamic;
+                (
+                    self.origin(inst.read(Reg::S(code))?),
+                    self.origin(inst.read(Reg::S(code + 1))?),
+                )
+            }
+            _ => (
+                self.vorigin(inst.read(Reg::V(reg))?),
+                self.vorigin(inst.read(Reg::V(reg + 1))?),
+            ),
+        };
+        let lo = self.through_firstlane(lo);
+        let hi = self.through_firstlane(hi);
+        // The low dword: the base word, with its low byte replaced by or
+        // added to a constant.
+        let (word0, k) = self.base_word(lo)?;
+        // The high dword: the next base word, masked.
+        let word1 = match hi {
+            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [Term::Value(w), Term::Const(m)] | [Term::Const(m), Term::Value(w)]))
+                    if m & 0xff == 0xff =>
+                {
+                    w
+                }
+                _ => v,
+            },
+            Term::Const(_) => return None,
+        };
+        let (site, first) = self.loaded_dword(word0)?;
+        if self.loaded_dword(word1)? != (site, first + 1) {
+            return None;
+        }
+        let load = self.inst(site);
+        if !matches!(load.fields, Fields::Smem { .. }) || !load.name().starts_with("s_load_dword") {
+            return None;
+        }
+        extra.offset = extra.offset.wrapping_add(k);
+        Some((
+            Source::Loaded {
+                load: site,
+                first: first as u8,
+            },
+            extra,
+        ))
+    }
+
+    /// `t` as a loaded word plus a constant below 256: `(w & !0xff) | k`,
+    /// `(w & !0xff) + k`, `w + k` or `w`.
+    fn base_word(&self, t: Term) -> Option<(Value, u32)> {
+        let Term::Value(v) = t else { return None };
+        let masked = |t: Term| -> Option<Value> {
+            let Term::Value(v) = t else { return None };
+            match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [Term::Value(w), Term::Const(m)] | [Term::Const(m), Term::Value(w)]))
+                    if m | 0xff == 0xffff_ffff =>
+                {
+                    Some(w)
+                }
+                _ => Some(v),
+            }
+        };
+        if let Some((_, [a, b])) = self.sop2(v, &["s_or_b32", "s_add_u32", "s_add_i32"]) {
+            let (w, k) = match (a, b) {
+                (x, Term::Const(k)) | (Term::Const(k), x) if k < 0x100 => (x, k),
+                _ => return None,
+            };
+            return Some((masked(w)?, k));
+        }
+        Some((masked(t)?, 0))
+    }
+
+    /// The scalar load and dword position that wrote `v`.
+    fn loaded_dword(&self, v: Value) -> Option<(Site, usize)> {
+        let site = self.defs[v.0 as usize]?;
+        let inst = self.inst(site);
+        let k = inst
+            .writes
+            .iter()
+            .filter(|w| matches!(w.0, Reg::S(_)))
+            .position(|w| w.1 == v)?;
+        Some((site, k))
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
@@ -2717,6 +2846,40 @@ pub(crate) mod tests {
             0x7E04_0206, // v_mov_b32 v2, s6
             0xBF81_0000, // s_endpgm
     ];
+
+    /// A global load at byte 48 of the buffer the descriptor at table
+    /// byte 0x80 describes, its address made of the descriptor's words.
+    pub(crate) const GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0080, // s_load_dwordx4 s[8:11], s[4:5], 0x80
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x870C_FF08,
+            0xFFFF_FF00, // s_and_b32 s12, s8, 0xffffff00
+            0x880C_B00C, // s_or_b32 s12, s12, 48
+            0x870D_FF09,
+            0x0000_00FF, // s_and_b32 s13, s9, 0xff
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xDC30_8000,
+            0x020C_0001, // global_load_dword v2, v1, s[12:13]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn global_loads_at_a_descriptors_own_base_read_its_buffer() {
+        let code: Vec<u8> = GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 0, 1), param(Table, 1, 1)], HwStage::Cs).unwrap();
+        let (site, offset, dynamic) = r.described[0];
+        assert_eq!((offset, dynamic), (48, None));
+        let d = r.descriptors.iter().find(|d| d.site == site).unwrap();
+        let Source::Loaded { load, first: 0 } = d.source else { panic!("{:?}", d.source) };
+        assert!(r.scalar.iter().any(|s| s.0 == load && s.1 == at(0, 0x80)));
+    }
 
     #[test]
     fn addresses_made_in_vgprs_and_read_from_the_first_lane_are_traced() {

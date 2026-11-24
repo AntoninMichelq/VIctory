@@ -493,6 +493,9 @@ struct Lower<'a> {
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     selected_offsets: HashMap<Value, Result<V, Why>>,
+    /// Global loads inside the buffer a descriptor describes: byte offset
+    /// and computed term (see `Resources::described`).
+    described: HashMap<Site, (u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
@@ -1261,6 +1264,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             selected_offsets: HashMap::new(),
+            described: x.res.described.iter().map(|&(s, o, d)| (s, (o, d))).collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1597,10 +1601,19 @@ impl<'a> Lower<'a> {
             _ if sub.is_some() => 1,
             _ => return Err(name),
         };
-        let a = *self
-            .scalar
-            .get(&(b, i))
-            .ok_or("an untracked global address")?;
+        let described = self.described.get(&(b, i)).copied();
+        let a = match described {
+            Some((offset, dynamic)) => Address {
+                param: 0,
+                offset,
+                dynamic,
+                includes_base: false,
+            },
+            None => *self
+                .scalar
+                .get(&(b, i))
+                .ok_or("an untracked global address")?,
+        };
         let guard = self.guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
@@ -1610,7 +1623,24 @@ impl<'a> Lower<'a> {
         if let Some(d) = self.dynamic_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
-        let h = if a.param == CODE {
+        let h = if described.is_some() {
+            // The buffer the descriptor describes, read raw.
+            let src = self
+                .descriptors
+                .get(&((b, i), false))
+                .copied()
+                .ok_or("an untracked buffer")?;
+            let used = self.used_kind(src);
+            if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                return Err("a global load from a constant buffer's memory");
+            }
+            let u = if used.is_some_and(|u| u.kind == ResourceType::Uav) {
+                0x1000
+            } else {
+                0
+            };
+            Some(self.handle((b, i), src, false, (11 | u, 0))?)
+        } else if a.param == CODE {
             None
         } else {
             let src = Source::Built {

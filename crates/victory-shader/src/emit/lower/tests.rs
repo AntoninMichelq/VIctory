@@ -803,6 +803,22 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
     lower_with(&words, layout(), used()).unwrap();
 }
 
+#[test]
+fn global_loads_at_a_descriptors_own_base_lower_to_its_buffer() {
+    let layout = vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    lower_with(crate::resource::tests::GLOBAL_LOAD_IN_A_DESCRIBED_BUFFER, layout, used).unwrap();
+}
+
 /// Tables of 2D textures at s0 and samplers at s1.
 fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
     let range = |kind, user_data, slot| UsedResource {
