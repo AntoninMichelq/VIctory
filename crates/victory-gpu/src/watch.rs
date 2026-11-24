@@ -16,11 +16,12 @@
 //! shortcut: so memory committed otherwise into such a block (a range
 //! reaching from a view into a plain reservation) is not seen.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! Writes into physical pages through another view (DirectStorage's page
+//! destinations) are not seen at the guarded addresses on their own: the
+//! runtime reports them afterwards for every title address showing those
+//! pages (xmem's `physical_written`, through [`writing`]). Streamed world
+//! models land there too, not only textures. A system call writing into a
+//! guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
