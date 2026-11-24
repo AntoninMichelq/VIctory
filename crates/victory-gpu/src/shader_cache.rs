@@ -19,11 +19,14 @@ use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+/// The runtime cache's folder (for the warm-up index, see [`index_path`]).
+static DIR: OnceLock<PathBuf> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    let _ = DIR.set(dir.clone());
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -96,9 +99,97 @@ fn translate_for(target: Target) -> impl Fn(&[u8]) -> Result<HostShader, String>
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
     let translate = translate_for(target);
     match CACHE.get() {
-        Some(cache) => cached(cache, &cache_key(target), container, translate),
+        Some(cache) => {
+            let before = MISSES.load(Ordering::Relaxed);
+            let done = cached(cache, &cache_key(target), container, translate);
+            if MISSES.load(Ordering::Relaxed) != before {
+                log_miss(container, target);
+            }
+            done
+        }
         None => translate(container),
     }
+}
+
+/// One line naming everything the key is made of, logged by the runtime
+/// and printed by `victory translate --write-cache`: the two must match
+/// for the warm-up's entries to be found.
+pub fn describe(target: Target) -> String {
+    let key = cache_key(target);
+    format!(
+        "shader cache key {} (translator {}, debug {}, diagnostics {}, loop limit {}, spin limit {}, root UAVs {}, waves {}-{})",
+        &blake3::Hash::from(key).to_hex()[..16],
+        &victory_shader::SOURCE_HASH[..12],
+        cfg!(debug_assertions),
+        cfg!(feature = "diagnostics"),
+        victory_shader::emit::loop_limit(),
+        victory_shader::emit::spin_limit(),
+        victory_shader::emit::root_uavs(),
+        target.lanes_min,
+        target.lanes_max,
+    )
+}
+
+/// The warm-up's index beside the cache folder `dir`: one line per
+/// container it stored, `<DXBC digest> <length> <blake3> <file>`, so a
+/// runtime miss can say whether the warm-up saw the same shader with other
+/// bytes.
+pub fn index_path(dir: &std::path::Path) -> PathBuf {
+    dir.with_file_name("shader-warmup-index.txt")
+}
+
+/// A container's own digest (DXBC header bytes 4..20), as hex.
+pub fn digest(container: &[u8]) -> String {
+    container
+        .get(4..20)
+        .map(|d| d.iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default()
+}
+
+/// The first misses of a run, logged with what the warm-up index knows of
+/// the same shader.
+fn log_miss(container: &[u8], target: Target) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static INDEX: OnceLock<std::collections::HashMap<String, Vec<(usize, String)>>> = OnceLock::new();
+    let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        tracing::info!("{}", describe(target));
+    }
+    if n >= 20 {
+        return;
+    }
+    let index = INDEX.get_or_init(|| {
+        let mut map = std::collections::HashMap::<String, Vec<(usize, String)>>::new();
+        let Some(dir) = DIR.get() else { return map };
+        let text = std::fs::read_to_string(index_path(dir)).unwrap_or_default();
+        for line in text.lines() {
+            let mut f = line.splitn(4, ' ');
+            if let (Some(d), Some(len), Some(hash)) = (f.next(), f.next(), f.next())
+                && let Ok(len) = len.parse()
+            {
+                map.entry(d.to_owned()).or_default().push((len, hash.to_owned()));
+            }
+        }
+        tracing::info!(entries = map.len(), "shader warm-up index read");
+        map
+    });
+    let header = container
+        .get(0x18..0x1c)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize);
+    let hash = blake3::hash(container).to_hex();
+    let cut = (header > 0 && header < container.len())
+        .then(|| blake3::hash(&container[..header]).to_hex().to_string());
+    let digest = digest(container);
+    let known = index.get(&digest);
+    tracing::info!(
+        len = container.len(),
+        header_len = header,
+        blake3 = &hash[..16],
+        cut_blake3 = cut.as_deref().map(|c| &c[..16]),
+        digest = %digest,
+        warmup_same_digest = ?known.map(|v| v.iter().map(|(l, h)| format!("{l}:{}", &h[..16.min(h.len())])).collect::<Vec<_>>()),
+        "shader cache miss"
+    );
 }
 
 /// What [`store`] did with a container.

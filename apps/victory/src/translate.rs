@@ -167,6 +167,8 @@ struct Warm {
     cache: victory_gpu::shader_cache::Cache,
     key: [u8; 32],
     target: emit::Target,
+    /// The warm-up index (see `shader_cache::index_path`).
+    index: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
 }
 #[cfg(not(windows))]
 struct Warm;
@@ -375,6 +377,10 @@ fn warm_cache() -> Result<Warm> {
     let cache = shader_cache::open(dir.clone())?;
     let target = shader_cache::runtime_target();
     println!("shader cache {}", dir.display());
+    println!("{}", shader_cache::describe(target));
+    let index = std::fs::File::create(shader_cache::index_path(&dir))
+        .map(|f| Mutex::new(std::io::BufWriter::new(f)))
+        .ok();
     println!(
         "host waves   {}-{} lanes",
         target.lanes_min, target.lanes_max
@@ -383,6 +389,7 @@ fn warm_cache() -> Result<Warm> {
         cache,
         key: shader_cache::cache_key(target),
         target,
+        index,
     })
 }
 
@@ -427,7 +434,21 @@ fn store(
         #[cfg(windows)]
         {
             use victory_gpu::shader_cache::{self, Stored};
-            match shader_cache::store(&warm.cache, &warm.key, container, warm.target) {
+            let done = shader_cache::store(&warm.cache, &warm.key, container, warm.target);
+            if done.is_ok()
+                && let Some(index) = &warm.index
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    lock(index),
+                    "{} {} {} {}",
+                    shader_cache::digest(container),
+                    container.len(),
+                    blake3::hash(container).to_hex(),
+                    example()
+                );
+            }
+            match done {
                 Ok(Stored::Written) => t.cache_written += 1,
                 Ok(Stored::AlreadyCached) => t.cache_present += 1,
                 Err(e) => t.fail(e, example),
