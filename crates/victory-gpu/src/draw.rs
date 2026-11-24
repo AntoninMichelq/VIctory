@@ -550,6 +550,18 @@ impl State {
         if !gpu.is_multiple_of(4) {
             return None;
         }
+        // SAFETY: a live buffer.
+        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+        // A raw UAV must start 16 bytes into its buffer (the debug layer:
+        // "the offset of the first element ... must be a multiple of 16
+        // bytes"); the host removes the device for one that does not.
+        if uav && !(gpu - base).is_multiple_of(16) {
+            once!(
+                address = format_args!("{address:#x}"),
+                "a root UAV not 16-byte aligned in its copy: no bounded table"
+            );
+            return None;
+        }
         let heap = self
             .heaps
             .iter()
@@ -558,8 +570,6 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let len = shadow.left(address);
-        // SAFETY: a live buffer.
-        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
         let elements = u32::try_from(len / 4).ok()?;
         // The top bit of the length tells a UAV from an SRV of the same range.
         let key = (
