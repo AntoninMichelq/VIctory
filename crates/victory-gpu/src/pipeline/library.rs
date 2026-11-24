@@ -184,6 +184,41 @@ pub(crate) fn pipeline(
     result
 }
 
+/// Where a slow pipeline's driver binary is kept (`GetCachedBlob`): the
+/// AMD library keeps ~150 bytes per pipeline and rebuilds from DXIL when
+/// its own cache misses, which took the world's ScreenProbes compute
+/// 163 s on every run.
+fn blob_path(name: &str) -> Option<PathBuf> {
+    Some(DIR.get()?.join("cached-pso").join(format!("{name}.bin")))
+}
+
+/// The driver binary kept for `name` by [`keep_blob`], if any.
+pub(crate) fn cached_blob(name: &str) -> Option<Vec<u8>> {
+    std::fs::read(blob_path(name)?).ok().filter(|b| !b.is_empty())
+}
+
+/// Keeps `pso`'s driver binary for the next run (see [`cached_blob`]).
+pub(crate) fn keep_blob(name: &str, pso: &ID3D12PipelineState) {
+    let Some(path) = blob_path(name) else { return };
+    // SAFETY: a live pipeline.
+    let Ok(blob) = (unsafe { pso.GetCachedBlob() }) else { return };
+    // SAFETY: the blob's own pointer and size.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let done = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| write_atomically(&path, bytes));
+    match done {
+        Ok(()) => tracing::info!(name, bytes = bytes.len(), "slow pipeline's driver binary kept"),
+        Err(e) => tracing::warn!(name, error = %e, "slow pipeline's driver binary not kept"),
+    }
+}
+
 /// `create`, timed.
 fn compile(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
@@ -212,7 +247,16 @@ fn load_or_create(
     let shared = library.lock().unwrap_or_else(|e| e.into_inner()).library.clone();
     let loading = std::time::Instant::now();
     let loaded = load(&shared, PCWSTR(wide.as_ptr()));
-    LOAD_US.fetch_add(loading.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let load_us = loading.elapsed().as_micros() as u64;
+    LOAD_US.fetch_add(load_us, Ordering::Relaxed);
+    if load_us >= 5_000_000 {
+        tracing::info!(
+            name,
+            ms = load_us / 1000,
+            found = loaded.is_ok(),
+            "slow pipeline library load (the driver rebuilt it)"
+        );
+    }
     if let Ok(pso) = loaded {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
