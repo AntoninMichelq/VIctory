@@ -740,6 +740,122 @@ impl<'a> Tracer<'a> {
     }
 
     /// A VGPR value's origin through `v_mov_b32` copies.
+    /// `t` is a constant, through a few VGPR copies.
+    fn constant_copy(&self, mut t: Term) -> bool {
+        for _ in 0..4 {
+            match t {
+                Term::Const(_) => return true,
+                Term::Value(v) => {
+                    let next = self.vorigin(v);
+                    if next == t {
+                        return false;
+                    }
+                    t = next;
+                }
+            }
+        }
+        false
+    }
+
+    /// The value a VGPR held before `t`'s VALU write, when that write puts
+    /// a constant: lanes outside EXEC keep the old value, and a pointer the
+    /// code overwrites with a default under a narrowed EXEC (lanes that
+    /// then leave) is still the pointer in the lanes that stay.
+    fn kept_under_constant(&self, t: Term) -> Option<Term> {
+        let Term::Value(v) = t else { return None };
+        let inst = self.def(v)?;
+        if !matches!(inst.fields, Fields::Valu(_)) || !self.constant_copy(self.vorigin(v)) {
+            return None;
+        }
+        let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
+        inst.read(reg).map(Term::Value)
+    }
+
+    /// `t`, a phi, when every argument is one value once constants
+    /// written under a narrowed EXEC are seen through
+    /// ([`Resources::kept_under_constant`]) and at least one was: that
+    /// value. A plain phi (a pointer picked by a branch or advanced in a
+    /// loop) gives `None`.
+    fn one_kept(&self, t: Term) -> Option<Term> {
+        let Term::Value(v) = t else { return None };
+        let (block, i) = self.phis[v.0 as usize]?;
+        let mut one = None;
+        let mut kept = false;
+        for &a in &self.p.blocks[block].phis[i].args {
+            if a == v {
+                continue;
+            }
+            let x = match self.kept_under_constant(Term::Value(a)) {
+                Some(x) => {
+                    kept = true;
+                    x
+                }
+                None => Term::Value(a),
+            };
+            if one.is_some_and(|o| o != x) {
+                return None;
+            }
+            one = Some(x);
+        }
+        one.filter(|_| kept)
+    }
+
+    /// `d` (low dword) and `hi` (high dword), phis in one block, when each
+    /// path brings an address of the same root parameter or root-constant
+    /// pointer, once constants written under a narrowed EXEC are seen
+    /// through ([`Resources::kept_under_constant`]): that parameter's
+    /// address plus a computed term holding it
+    /// ([`Address::includes_base`]).
+    fn joined_pointers(&self, d: Value, hi: Term, extra: Sum) -> Option<Address> {
+        let Term::Value(h) = hi else { return None };
+        let (block, i) = self.phis[d.0 as usize]?;
+        let (hblock, j) = self.phis[h.0 as usize]?;
+        if hblock != block {
+            return None;
+        }
+        let los = &self.p.blocks[block].phis[i].args;
+        let his = &self.p.blocks[block].phis[j].args;
+        if los.len() != his.len() {
+            return None;
+        }
+        let see = |a: Value| self.kept_under_constant(Term::Value(a)).unwrap_or(Term::Value(a));
+        let zero = Sum {
+            base: None,
+            offset: 0,
+            dynamic: None,
+        };
+        if !los
+            .iter()
+            .any(|&l| self.kept_under_constant(Term::Value(l)).is_some())
+        {
+            return None;
+        }
+        let mut param = None;
+        let mut kept = false;
+        for (&l, &hh) in los.iter().zip(his) {
+            if l == d || hh == h {
+                // The back edge of a loop that keeps the pointer.
+                if l == d && hh == h {
+                    continue;
+                }
+                return None;
+            }
+            kept |= self.kept_under_constant(Term::Value(l)).is_some();
+            let a = self.address(see(l), see(hh), zero).ok()?;
+            if a.includes_base || param.is_some_and(|p| p != a.param) {
+                return None;
+            }
+            param = Some(a.param);
+        }
+        let param = param.filter(|_| kept)?;
+        Some(Address {
+            param,
+            offset: extra.offset,
+            dynamic: Some(d),
+            includes_base: true,
+        })
+    }
+
     fn vorigin(&self, v: Value) -> Term {
         if let Some(inst) = self.def(v)
             && inst.name() == "v_mov_b32"
@@ -982,6 +1098,19 @@ impl<'a> Tracer<'a> {
             && let Some(d) = s.dynamic
             && self.phis[d.0 as usize].is_some()
         {
+            // A pointer that only a constant overwrote under a narrowed
+            // EXEC on some path: the pointer itself.
+            if lo == Term::Value(d)
+                && let (Some(l), Some(h)) = (self.one_kept(lo), self.one_kept(hi))
+            {
+                return self.address(l, h, extra);
+            }
+            if lo == Term::Value(d)
+                && extra.dynamic.is_none()
+                && let Some(a) = self.joined_pointers(d, hi, extra)
+            {
+                return Ok(a);
+            }
             return self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi);
         }
         if s.base.is_none()
@@ -1239,7 +1368,16 @@ impl<'a> Tracer<'a> {
             let mut found = None;
             let mut result = Ok(());
             for &a in &self.p.blocks[block].phis[i].args {
-                let a = self.vorigin(a);
+                // shortcut: a constant written under a narrowed EXEC
+                // ([`Resources::kept_under_constant`]) is taken as the
+                // pointer it overwrote, for the lanes that read it; a lane
+                // that did keep the constant reads through the pointer's
+                // bounded view, so zeros rather than a fault.
+                let a = self.kept_under_constant(Term::Value(a)).unwrap_or(Term::Value(a));
+                let a = match a {
+                    Term::Value(x) => self.vorigin(x),
+                    c => c,
+                };
                 // A VGPR no instruction wrote yet on that path: the
                 // pointer only on the paths that wrote it, undefined (so
                 // anything) on the others, unless the hardware sets it
@@ -1250,7 +1388,9 @@ impl<'a> Tracer<'a> {
                     }
                     continue;
                 }
-                match self.pointer_base(a, seen, budget) {
+
+                let r = self.pointer_base(a, seen, budget);
+                match r {
                     Ok(None) => {}
                     Ok(Some(b)) if found.is_none_or(|f| f == b) => found = Some(b),
                     _ => {
@@ -1304,7 +1444,12 @@ impl<'a> Tracer<'a> {
             seen.push(v);
             // A VGPR not written yet on a path: as for the low half.
             let ok = self.p.blocks[block].phis[i].args.iter().all(|&a| {
-                let a = self.vorigin(a);
+                // A constant under a narrowed EXEC: as for the low half.
+                let a = match self.kept_under_constant(Term::Value(a)) {
+                    Some(Term::Value(x)) => self.vorigin(x),
+                    Some(c) => c,
+                    None => self.vorigin(a),
+                };
                 if self.unset_input(a) {
                     if let Term::Value(u) = a {
                         self.pointer_unset.borrow_mut().push(u);

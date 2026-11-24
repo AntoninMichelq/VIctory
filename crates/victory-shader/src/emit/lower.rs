@@ -2780,9 +2780,32 @@ impl<'a> Lower<'a> {
         {
             return Err("a pointer joined with a VGPR the hardware sets");
         }
-        let base = match self.user(a.param, 0) {
-            Val::I32(x) => x,
-            _ => return Err("an advanced pointer into a root descriptor"),
+        let base = if let Some(index) = crate::resource::pointer_user_data(a.param) {
+            // A pointer in root constants (its low dword, or its only dword
+            // when kept shifted right by 8).
+            let layout = &self.x.native.layout;
+            let index = index & 0xFF;
+            let param = (0..layout.len())
+                .find(|&i| {
+                    let r = layout[i];
+                    r.root == RootType::Constants
+                        && (u32::from(r.user_data)..u32::from(r.user_data) + r.sgprs)
+                            .contains(&index)
+                })
+                .ok_or("an advanced pointer in root constants")?;
+            if crate::resource::pointer_user_data(a.param).is_some_and(|i| i & 0x100 != 0) {
+                return Err("an advanced pointer kept shifted");
+            }
+            let dword = index - u32::from(layout[param].user_data);
+            match self.user(param, dword) {
+                Val::I32(x) => x,
+                _ => return Err("an advanced pointer in root constants"),
+            }
+        } else {
+            match self.user(a.param, 0) {
+                Val::I32(x) => x,
+                _ => return Err("an advanced pointer into a root descriptor"),
+            }
         };
         Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
     }
