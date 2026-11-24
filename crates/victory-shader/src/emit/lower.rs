@@ -596,6 +596,10 @@ struct Lower<'a> {
     finals: HashMap<Value, (Val, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The lane's iterations of every loop so far (an `i32` it keeps):
+    /// loops inside loops stop at [`LOOP_LIMIT`] in all, not at its power
+    /// of their depth.
+    total: Option<V>,
     /// Headers of loops that only wait for memory to change: they stop
     /// at [`super::spin_limit`] instead.
     spin: HashSet<usize>,
@@ -1374,6 +1378,7 @@ impl<'a> Lower<'a> {
             loop_bodies: HashMap::new(),
             finals: HashMap::new(),
             abort: None,
+            total: None,
             spin: HashSet::new(),
             #[cfg(test)]
             spun: 0,
@@ -2069,6 +2074,13 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if !self.counters.is_empty() {
+            let e = self.s.entry;
+            let at = self.s.m.alloca(e, self.s.t.i32);
+            let z = self.s.m.i32(0);
+            self.s.m.store(e, at, z);
+            self.total = Some(at);
         }
         self.find_loop_exits();
         self.cur = self.s.entry;
@@ -11982,7 +11994,21 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        let this_loop = self.s.m.cmp(c, p, next, limit);
+        // Every loop's iterations together: a loop in a loop multiplied the
+        // limits (2^40 for two), a GPU that never came back
+        // (DXGI_ERROR_DEVICE_HUNG with a 10 s timeout, 2026-11-24).
+        let Some(at) = self.total else {
+            return this_loop;
+        };
+        let total = self.s.m.load(c, at);
+        let total = self.s.m.bin(c, Bin::Add, total, one);
+        self.s.m.store(c, at, total);
+        let all = self.s.m.i32(super::loop_limit());
+        let all = self.s.m.cmp(c, p, total, all);
+        // Below both limits goes on (IULT); at or above either stops (IUGE).
+        let op = if p == pred::IULT { Bin::And } else { Bin::Or };
+        self.s.m.bin(c, op, this_loop, all)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
