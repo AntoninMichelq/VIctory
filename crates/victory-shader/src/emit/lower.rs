@@ -601,6 +601,15 @@ struct Lower<'a> {
     /// [`Self::first_lane_indices`]).
     /// Each lane's own index, then the first lane's.
     first_lane_index: HashMap<(Site, bool), Result<(V, V), Why>>,
+    /// The first lane's offsets of addresses read from the first lane
+    /// ([`resource::Resources::first_lane_offsets`]), by the
+    /// `v_readfirstlane_b32` result: read at that instruction (see
+    /// [`Self::first_lane_offset`]).
+    first_lane_offsets: HashMap<Value, Result<V, Why>>,
+    /// Those of [`Self::first_lane_offsets`] as the wave's last iteration
+    /// of a divergent loop left them, with the loop's header (as
+    /// [`Self::finals`]).
+    first_lane_offset_finals: HashMap<Value, (V, usize)>,
     /// See [`Lowered::heap_paths`].
     #[cfg(test)]
     heap_paths: Vec<Vec<String>>,
@@ -1359,6 +1368,8 @@ impl<'a> Lower<'a> {
             abort: None,
             lane_paths: Vec::new(),
             first_lane_index: HashMap::new(),
+            first_lane_offsets: HashMap::new(),
+            first_lane_offset_finals: HashMap::new(),
             #[cfg(test)]
             heap_paths: Vec::new(),
             #[cfg(test)]
@@ -2429,7 +2440,7 @@ impl<'a> Lower<'a> {
     /// pointer that holds it (see [`Address::includes_base`]).
     fn dynamic_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
         let Some(d) = a.dynamic else { return Ok(None) };
-        let d = self.i32_of(d)?;
+        let d = self.offset_of(d)?;
         if !a.includes_base {
             return Ok(Some(d));
         }
@@ -2453,6 +2464,45 @@ impl<'a> Lower<'a> {
             _ => return Err("an advanced pointer into a root descriptor"),
         };
         Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
+    }
+
+    /// The value of the computed term `d` of an address: for a
+    /// `v_readfirstlane_b32` result that stands for the first lane's
+    /// offset ([`resource::Resources::first_lane_offsets`]), that offset as
+    /// read there.
+    fn offset_of(&mut self, d: Value) -> Result<V, Why> {
+        if !self.x.res.first_lane_offsets.iter().any(|f| f.0 == d) {
+            return self.i32_of(d);
+        }
+        if let Some(&(x, h)) = self.first_lane_offset_finals.get(&d)
+            && !self.loop_bodies[&h].contains(&self.cur_ir)
+        {
+            return Ok(x);
+        }
+        self.first_lane_offsets.get(&d).cloned().unwrap_or(Err(
+            "an address offset read from the first lane before the read",
+        ))
+    }
+
+    /// At `v_readfirstlane_b32` `inst`, whose result stands for the first
+    /// lane's offset of an address ([`resource::Resources::first_lane_offsets`]):
+    /// that offset, read from the first active lane under the EXEC here
+    /// (the access may run under another), or each lane's own in a
+    /// waterfall loop (`own`), as the read of the address is there.
+    fn first_lane_offset(&mut self, inst: &Inst, own: bool) {
+        let Some(&(_, read)) = inst.writes.first() else {
+            return;
+        };
+        let offsets = &self.x.res.first_lane_offsets;
+        let Some(&(_, offset)) = offsets.iter().find(|f| f.0 == read) else {
+            return;
+        };
+        let x = match self.offset_of(offset) {
+            Ok(x) if own => Ok(x),
+            Ok(x) => self.read_first_lane(inst, x),
+            Err(why) => Err(why),
+        };
+        self.first_lane_offsets.insert(read, x);
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -7534,6 +7584,7 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                self.first_lane_offset(inst, true);
                 let a = s(self, 0)?;
                 int(self, a)
             }
@@ -7541,6 +7592,7 @@ impl<'a> Lower<'a> {
                 // Before the dword: a descriptor's may be no data (heap
                 // memory), unused once its index is read.
                 self.first_lane_indices(inst)?;
+                self.first_lane_offset(inst, false);
                 let a = s(self, 0)?;
                 let r = self.read_first_lane(inst, a)?;
                 int(self, r)
@@ -11366,6 +11418,11 @@ impl<'a> Lower<'a> {
                 if let Some(f) = final_of(self, val) {
                     self.finals.insert(v, (f, h));
                 }
+                if let Some(&Ok(x)) = self.first_lane_offsets.get(&v)
+                    && let Some(Val::I32(f)) = final_of(self, Val::I32(x))
+                {
+                    self.first_lane_offset_finals.insert(v, (f, h));
+                }
             }
             // This block's joins of the loop's scalars.
             for phi in &self.x.p.blocks[b].phis {
@@ -12316,6 +12373,61 @@ mod tests {
         lowers(crate::resource::tests::CODE_TABLE_THROUGH_FIRST_LANE).unwrap();
     }
 
+    /// The code table loads of `words` (lowered per lane): each load's
+    /// block and the blocks of the first-lane reads its index is computed
+    /// from.
+    fn code_table_reads(words: &[u32]) -> Vec<(usize, Vec<usize>)> {
+        with_parts(words, vec![], vec![], false, |parts| {
+            let bad = std::collections::HashMap::new();
+            let mut l = super::Lower::new(parts, &bad, false);
+            assert!(l.lower_ir().is_ok());
+            let (table, _, _) = l.code_table.expect("a code table");
+            Ok(l.s.m.first_lane_reads_indexing(table))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_code_table_offset_is_the_first_lanes_at_its_read_before_exec_changes() {
+        let loads = code_table_reads(CODE_TABLE_OFFSET_THEN_EXEC);
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        let (load, reads) = &loads[0];
+        // Read in the block of the `v_readfirstlane_b32` (under the EXEC
+        // there), not under the branch's EXEC at the load.
+        assert!(!reads.is_empty(), "the offset is each lane's own");
+        assert!(reads.iter().all(|r| r != load), "{loads:?}");
+    }
+
+    /// An address into the code table (`s_getpc_b64` plus each lane's
+    /// `(v0 & 1) * 4`), read from the first lane by `v_readfirstlane_b32`;
+    /// then only lanes with `v0 != 0` (not lane 0) run the scalar load,
+    /// which the hardware makes at the address of the first lane of the
+    /// read (lane 0's: table dword 0), and store what it reads to LDS.
+    const CODE_TABLE_OFFSET_THEN_EXEC: &[u32] = &[
+        0xBE84_1F00, // 0x0: s_getpc_b64 s[4:5]
+        0x3602_0081, // 0x4: v_and_b32 v1, 1, v0
+        0x3406_0282, // 0x8: v_lshlrev_b32 v3, 2, v1
+        0xD70F_6A04,
+        0x0002_0604, // 0xc: v_add_co_u32 v4, vcc_lo, s4, v3
+        0x7E0C_0205, // 0x14: v_mov_b32 v6, s5
+        0x500A_0C80, // 0x18: v_add_co_ci_u32 v5, vcc_lo, 0, v6, vcc_lo
+        0x7E10_0504, // 0x1c: v_readfirstlane_b32 s8, v4
+        0x7E12_0505, // 0x20: v_readfirstlane_b32 s9, v5
+        0x7D8A_0080, // 0x24: v_cmp_ne_u32 vcc_lo, 0, v0
+        0xBE8A_3C6A, // 0x28: s_and_saveexec_b32 s10, vcc_lo
+        0xBF88_0007, // 0x2c: s_cbranch_execz -> 0x4c
+        0xF400_0184,
+        0xFA00_004C, // 0x30: s_load_dword s6, s[8:9], 0x4c (0x4 + 0x4c: 0x50)
+        0xBF8C_C07F, // 0x38: s_waitcnt lgkmcnt(0)
+        0x7E04_0206, // 0x3c: v_mov_b32 v2, s6
+        0x340E_0082, // 0x40: v_lshlrev_b32 v7, 2, v0
+        0xD834_0000,
+        0x0000_0207, // 0x44: ds_write_b32 v7, v2
+        S_ENDPGM,    // 0x4c
+        0x0000_0011, // 0x50: the table
+        0x0000_0022,
+    ];
+
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_with(words, vec![], vec![]).map(|_| ())
@@ -12338,6 +12450,18 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        with_parts(words, layout, used, wave64, lower)
+    }
+
+    /// Runs `run` on the parts of a compute program as [`lower_wave`]
+    /// lowers them.
+    fn with_parts<T>(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        run: impl FnOnce(&Parts) -> Result<T, crate::ShaderError>,
+    ) -> Result<T, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -12357,7 +12481,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage)?;
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        lower(&Parts {
+        run(&Parts {
             psv: None,
             native: &native,
             p: &p,
