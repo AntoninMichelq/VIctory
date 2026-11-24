@@ -685,7 +685,8 @@ enum MaskData {
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Scalar set operations, which keep a lane mask a lane mask: their result
-/// as a number is the same operation on their sources' numbers.
+/// as a number is the same operation on their sources' numbers (for
+/// `s_cselect`, the number of the source SCC picks).
 fn mask_set_op(name: &str) -> bool {
     let Some(op) = name
         .strip_prefix("s_")
@@ -695,7 +696,17 @@ fn mask_set_op(name: &str) -> bool {
     };
     matches!(
         op,
-        "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not" | "mov"
+        "and"
+            | "or"
+            | "xor"
+            | "andn2"
+            | "orn2"
+            | "nand"
+            | "nor"
+            | "xnor"
+            | "not"
+            | "mov"
+            | "cselect"
     )
 }
 
@@ -12987,6 +12998,97 @@ mod tests {
         }];
         let l = lower_with(&APPEND_WAVE32, layout, used).unwrap();
         assert!(l.wave_ops);
+    }
+
+    /// Layout of the joins below: a table at s0 (a buffer descriptor at
+    /// byte 0x960), root constants at s1 and s2.
+    fn join_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+        (
+            vec![
+                root(RootType::Table, 0, 0),
+                root(RootType::Constants, 1, 1),
+                root(RootType::Constants, 2, 2),
+            ],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_register_joining_loaded_data_and_a_uniform_mask_is_data() {
+        // Assembled with llvm-mc (gfx1030, wave32): s11 holds dword 3 of a
+        // descriptor, unless a root constant (s1) is not negative: then a
+        // record is loaded through it and s11 becomes EXEC or 0 (a uniform
+        // bool), selected into v1. At the join s11 is read as data.
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_020A,
+            0xFA00_0960, // s_load_dwordx4 s[8:11], s[20:21], 0x960
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0280, // v_mov_b32_e32 v1, 0
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0008, // s_cbranch_scc1 -> 0x44
+            0xF428_0304,
+            0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[8:11], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8810_0E0C, // s_or_b32 s16, s12, s14
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0x850B_807E, // s_cselect_b32 s11, exec_lo, 0
+            0xD501_0001,
+            0x002D_8280, // v_cndmask_b32_e64 v1, 0, -1, s11
+            0xBF82_0000, // s_branch -> 0x44
+            0x7D84_02C1, // 0x44: v_cmp_eq_u32_e32 vcc_lo, -1, v1
+            0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0005, // s_cbranch_vccnz -> s_endpgm
+            0xBF06_800B, // s_cmp_eq_u32 s11, 0
+            0x8511_8281, // s_cselect_b32 s17, 1, 2
+            0x7E04_0211, // v_mov_b32_e32 v2, s17
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let (layout, used) = join_layout();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_select_by_a_register_joining_loaded_data_and_a_mask() {
+        // As above, the select made after the join, from the joined s11.
+        let words = [
+            0xBE94_0300, // s_mov_b32 s20, s0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_020A,
+            0xFA00_0960, // s_load_dwordx4 s[8:11], s[20:21], 0x960
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF04_8001, // s_cmp_lt_i32 s1, 0
+            0xBF85_0006, // s_cbranch_scc1 -> 0x34
+            0xF428_0304,
+            0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[8:11], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8810_0E0C, // s_or_b32 s16, s12, s14
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0x850B_807E, // s_cselect_b32 s11, exec_lo, 0
+            0xBF82_0000, // s_branch -> 0x34
+            0xD501_0001,
+            0x002D_8280, // 0x34: v_cndmask_b32_e64 v1, 0, -1, s11
+            0x7D84_02C1, // v_cmp_eq_u32_e32 vcc_lo, -1, v1
+            0x8A6A_6A7E, // s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0002, // s_cbranch_vccnz -> s_endpgm
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let (layout, used) = join_layout();
+        lower_with(&words, layout, used).unwrap();
     }
 
     #[test]
