@@ -1307,6 +1307,11 @@ impl<R> BufferStates<R> {
         }
     }
 
+    /// The state the list leaves `copy` in so far (`None`: not used yet).
+    pub(crate) fn now(&self, copy: usize) -> Option<u32> {
+        self.by_copy.get(&copy).map(|&(_, now, _)| now)
+    }
+
     /// The prelude's transitions: each buffer from common to its first state.
     pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
         self.by_copy.values().map(|(first, _, r)| (r, *first))
@@ -2372,6 +2377,12 @@ impl HostList {
 
     /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
     /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
+    /// The state the list has left `buffer` in so far (`None`: unused yet).
+    pub(crate) fn buffer_state_now(&self, buffer: &ID3D12Resource) -> Option<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.now(buffer.as_raw() as usize)
+    }
+
     pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {

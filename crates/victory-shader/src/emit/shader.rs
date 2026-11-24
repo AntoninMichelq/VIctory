@@ -15,6 +15,17 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one `u32` element stride per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
+/// The register space of the memory table (`t0`): a raw buffer of u32s,
+/// dword 0 the entry count `n`, then `n` entries of 8 dwords sorted by
+/// (start_hi, start_lo), the disjoint windows of title memory the host has
+/// copies of: `[start_lo, start_hi, len_bytes, srv, uav, view_base_lo,
+/// view_base_hi, 0]`. `srv` / `uav` index the directly indexed view heap: a
+/// raw SRV or raw UAV of the window's copy, `0xFFFF_FFFF` when absent (one
+/// is always there: the UAV when the copy is in the unordered-access state
+/// at that point of the list, else the SRV). Byte `address` of a window is
+/// at `address - view_base` in its view (`view_base` <= `start`). Addresses
+/// outside every window read zero.
+pub const MEMORY_SPACE: u32 = 3;
 /// View-heap slots the runtime stride table has strides for. It is a root
 /// view, which the host does not bounds-check, so a translated program
 /// reads entry `STRIDE_TABLE_SLOTS` (always zero) for a slot at or past it:

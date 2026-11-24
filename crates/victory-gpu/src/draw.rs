@@ -290,6 +290,13 @@ fn emit_uav_barrier(list: &HostList) {
     unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
+/// `VICTORY_NO_MEMORY_TABLE=1`: shaders reading the memory table get an
+/// empty one (reads through loaded addresses give zero).
+fn no_memory_table() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("VICTORY_NO_MEMORY_TABLE").is_ok_and(|v| v.trim() == "1"))
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -754,6 +761,8 @@ impl State {
             list.keep(&p.root);
         }
         let mut bound_params = 0u64;
+        // The memory table, made once per command (stages share it).
+        let mut memory_table: Option<u64> = None;
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {
@@ -907,8 +916,139 @@ impl State {
                     once!("a shader reads the runtime stride table without a host view heap");
                 }
             }
+            if let Some(param) = stage.memory_table {
+                if memory_table.is_none() {
+                    memory_table = self.memory_table(list);
+                }
+                let Some(gpu) = memory_table else {
+                    once!("a shader reads the memory table, which could not be made; dropped");
+                    return false;
+                };
+                // SAFETY: an open list; the table lives in the list's scratch.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
         }
         true
+    }
+
+    /// The memory table (`t0` in `victory_shader::emit::MEMORY_SPACE`) in
+    /// the list's scratch: every copy of title memory made so far as a
+    /// window, sorted and disjoint, with a raw view of its copy in the view
+    /// heap the list has bound (the UAV when the list has left the copy in
+    /// the unordered-access state, else the SRV, the copy then moved to a
+    /// read state). Each window is refreshed whole for this command (dirty
+    /// pages only, from the write watch). Programs that load an address
+    /// from memory and read through it find the window there.
+    /// `VICTORY_NO_MEMORY_TABLE=1` binds an empty table (such reads give 0).
+    ///
+    /// shortcut: rebuilt for every command that reads it, and reads only:
+    /// a program writing through a loaded address is not copied back.
+    fn memory_table(&mut self, list: &HostList) -> Option<u64> {
+        const NONE: u32 = u32::MAX;
+        // A raw view holds at most 2^27 elements (D3D12).
+        const MAX_VIEW: u64 = 4 << 27;
+        let mut entries: Vec<[u32; 8]> = Vec::new();
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers());
+        if let Some(heap) = heap.filter(|_| !no_memory_table()) {
+            let host = heap.host()?;
+            let mut windows: Vec<_> = crate::shadow::live()
+                .into_iter()
+                .map(|s| (s.range(), s))
+                .collect();
+            // Larger first at one start, so an inner copy loses to it.
+            windows.sort_by_key(|&((start, len), _)| (start, std::cmp::Reverse(len)));
+            let mut reach = 0u64;
+            for ((view_base, view_len), shadow) in windows {
+                let view_len = view_len.min(MAX_VIEW);
+                let end = view_base + view_len;
+                // Disjoint: what an earlier window covers stays its.
+                let start = view_base.max(reach);
+                if start >= end {
+                    continue;
+                }
+                // SAFETY: a live buffer.
+                let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+                let first = shadow.gpu(view_base) - base;
+                if !first.is_multiple_of(16) {
+                    continue;
+                }
+                // SAFETY: a live buffer.
+                let width = unsafe { shadow.buffer.GetDesc() }.Width;
+                let elements = (view_len.div_ceil(4)).min((width - first) / 4);
+                let Ok(elements) = u32::try_from(elements) else {
+                    continue;
+                };
+                shadow.refresh(list, start, end - start);
+                let uav = list.buffer_state_now(&shadow.buffer) == Some(crate::host::BUFFER_WRITE);
+                if !uav {
+                    list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+                }
+                let key = (
+                    std::ptr::from_ref(heap) as usize,
+                    shadow.buffer.as_raw() as usize,
+                    view_base,
+                    view_len | u64::from(uav) << 63 | 1 << 62,
+                );
+                let slot = match self.root_srv_slots.get(&key) {
+                    Some(&slot) => slot,
+                    None => {
+                        let Some(slot) = host.dynamic(1) else {
+                            once!("no dynamic descriptor slot for a memory table window");
+                            break;
+                        };
+                        self.dynamic.push((key.0, slot, 1));
+                        if uav {
+                            host.raw_uav_at(slot, &shadow.buffer, first / 4, elements);
+                        } else {
+                            host.raw_srv_at(slot, &shadow.buffer, first / 4, elements);
+                        }
+                        self.root_srv_slots.insert(key, slot);
+                        slot
+                    }
+                };
+                let (srv, uav) = if uav { (NONE, slot) } else { (slot, NONE) };
+                entries.push([
+                    start as u32,
+                    (start >> 32) as u32,
+                    (end - start) as u32,
+                    srv,
+                    uav,
+                    view_base as u32,
+                    (view_base >> 32) as u32,
+                    0,
+                ]);
+                reach = end;
+            }
+        }
+        let bytes = 4 + 32 * entries.len();
+        let (gpu, data) = list.scratch(bytes as u64)?;
+        // SAFETY: the scratch slice holds `bytes` bytes.
+        unsafe {
+            data.cast::<u32>().write_unaligned(entries.len() as u32);
+            std::ptr::copy_nonoverlapping(
+                entries.as_ptr().cast::<u8>(),
+                data.add(4),
+                32 * entries.len(),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1)
+        {
+            tracing::debug!(windows = entries.len(), "memory table bound");
+        }
+        Some(gpu)
     }
 
     /// Runs a dispatch on the host.
