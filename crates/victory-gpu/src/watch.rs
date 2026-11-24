@@ -625,8 +625,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for b in gone {
             j.allocations.remove(&b);
         }
-        // What was refused may be watched now.
-        j.refused.clear();
+        // What was refused there may be watched now; the rest stands
+        // (remaps come often while the world streams, and clearing all
+        // made most refusals asked again).
+        let (a, e) = (at / PAGE, end.div_ceil(PAGE));
+        j.refused.retain(|&(first, last)| last <= a || first >= e);
     }
     let mut g = guards();
     let range = at / BLOCK..(at + len).div_ceil(BLOCK);
