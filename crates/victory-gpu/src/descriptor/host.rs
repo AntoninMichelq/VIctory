@@ -1227,9 +1227,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // Unordered access to a texture the title placed itself:
+                // the same host texture its shader views get (keyed by
+                // address and description), so writes reach the readers.
+                if *unordered && std::env::var_os("VICTORY_NO_PLACED_UAV").is_none() {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    if let Some(texture) = crate::resource::texture_at(address, resource) {
+                        once!(
+                            dimension = resource[0],
+                            "placed unordered texture view mirrored"
+                        );
+                        let view = View::Unordered(
+                            texture as usize,
+                            0,
+                            desc[..10].try_into().ok(),
+                        );
+                        return make(&view, at);
+                    }
+                }
                 once!(
                     dimension = resource[0],
                     "placed unordered texture view not mirrored"
