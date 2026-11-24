@@ -131,15 +131,42 @@ const KEPT: usize = 4096;
 /// `VICTORY_COPY_BACK_RUNS=1`: copy-back writes only the exact bytes the
 /// GPU changed and marks a page current only if title memory still matches
 /// (upstream #1024's idea). Off by default: slower in world play runs.
-/// Per root-UAV address: the furthest byte past it the GPU was seen to
-/// write ([`Shadow::copy_back`]), and how often it was bound since that was
-/// last measured over the whole range.
-static REACH: Mutex<Option<std::collections::HashMap<usize, (usize, u32)>>> = Mutex::new(None);
+/// Per root-UAV binding (shader and slot, [`set_root_uav_key`]): the
+/// furthest byte past its address the GPU was seen to write
+/// ([`Shadow::copy_back`]), and how often it was bound. Keyed by binding,
+/// not address: the title's per-frame buffers move a binding's address
+/// from frame to frame, and an address seen once was never learned.
+struct Reach {
+    by_key: std::collections::HashMap<u64, (usize, u32)>,
+    /// The binding each address was last declared for.
+    keys: std::collections::HashMap<usize, u64>,
+}
+
+static REACH: Mutex<Option<Reach>> = Mutex::new(None);
+
+thread_local! {
+    static KEY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The binding the next [`root_uav_extent`] calls on this thread are for.
+/// None: not a root UAV binding (its extent is not bounded).
+pub(crate) fn set_root_uav_key(binding: Option<(&str, u8)>) {
+    use std::hash::{Hash, Hasher};
+    let key = binding.map_or(0, |b| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish() | 1
+    });
+    KEY.with(|k| k.set(key));
+}
 
 fn learned_reach(address: usize, reach: usize) {
-    // Only addresses bound as root UAVs (other views have their size).
+    // Only addresses declared as root UAVs (other views have their size).
     let mut map = REACH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(e) = map.as_mut().and_then(|m| m.get_mut(&address)) {
+    if let Some(r) = map.as_mut()
+        && let Some(key) = r.keys.get(&address).copied()
+        && let Some(e) = r.by_key.get_mut(&key)
+    {
         e.0 = e.0.max(reach);
     }
 }
@@ -148,8 +175,9 @@ fn learned_reach(address: usize, reach: usize) {
 /// (refreshed before, compared and copied back after). A root view has no
 /// size: every bind declared all that is left of the title's buffer (25 GB
 /// of refreshes a frame, 0.23 fps, "10 calculs" 2026-11-24). Bound by
-/// twice the furthest write seen (at least 1 MiB, on 64 KiB), the whole
-/// range again every 64th bind and until something was measured.
+/// twice the furthest write seen for the binding (at least 1 MiB, on
+/// 64 KiB), the whole range again every 64th bind and until something was
+/// measured.
 /// shortcut: a write past the bound between two whole-range binds is not
 /// put back into title memory. VICTORY_ROOT_UAV_LEARN=0: whole range.
 pub(crate) fn root_uav_extent(address: u64, len: u64) -> u64 {
@@ -157,8 +185,20 @@ pub(crate) fn root_uav_extent(address: u64, len: u64) -> u64 {
     if !*ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_LEARN").map_or(true, |v| v != "0")) {
         return len;
     }
+    let key = KEY.with(std::cell::Cell::get);
+    if key == 0 {
+        return len;
+    }
     let mut map = REACH.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(Default::default).entry(address as usize).or_insert((0, 0));
+    let r = map.get_or_insert_with(|| Reach {
+        by_key: Default::default(),
+        keys: Default::default(),
+    });
+    if r.keys.len() > 1 << 16 {
+        r.keys.clear();
+    }
+    r.keys.insert(address as usize, key);
+    let e = r.by_key.entry(key).or_insert((0, 0));
     e.1 = e.1.wrapping_add(1);
     if e.1 % 64 == 1 {
         return len;
