@@ -355,8 +355,8 @@ fn show(resource: Option<object::Held>) {
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if let Some(target) = crate::capture::present_override(frame)
+    #[cfg(windows)]
+    if let Some(target) = crate::present_target::present_override(frame)
         && let Some(host) = crate::host::host()
     {
         let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
