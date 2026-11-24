@@ -785,13 +785,6 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
-        // A register a scalar load or scalar arithmetic wrote on some edge
-        // holds data there: the join is no mask, whatever the other edges
-        // bring (a register that held a mask reused for data).
-        if args.iter().any(|a| self.data(a.0) || self.data(a.1)) {
-            let born = self.index[block];
-            return Some((self.b.atom(Atom::Phi(id), born), false));
-        }
         let mut derived = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
@@ -831,50 +824,6 @@ impl<'a> Lanes<'a> {
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
-    }
-
-    /// Whether a scalar load (`s_load`, `s_buffer_load`) or a scalar
-    /// operation that makes no mask (an addition, a shift) wrote `v`.
-    fn data(&self, v: Value) -> bool {
-        let Some(&(b, i)) = self.defs.get(&v) else {
-            return false;
-        };
-        let inst = &self.p.blocks[b].insts[i];
-        match &inst.fields {
-            Fields::Smem { .. } => inst.name().contains("_load_"),
-            Fields::Sop { .. } => {
-                let width = if self.p.wave64 { "_b64" } else { "_b32" };
-                let Some(op) = inst
-                    .name()
-                    .strip_prefix("s_")
-                    .and_then(|n| n.strip_suffix(width))
-                else {
-                    return true;
-                };
-                let base = op
-                    .strip_suffix("_saveexec")
-                    .or_else(|| op.strip_suffix("_wrexec"))
-                    .unwrap_or(op);
-                !matches!(
-                    base,
-                    "and"
-                        | "or"
-                        | "xor"
-                        | "andn1"
-                        | "andn2"
-                        | "orn1"
-                        | "orn2"
-                        | "nand"
-                        | "nor"
-                        | "xnor"
-                        | "not"
-                        | "mov"
-                        | "cmov"
-                        | "cselect"
-                )
-            }
-            _ => false,
-        }
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
