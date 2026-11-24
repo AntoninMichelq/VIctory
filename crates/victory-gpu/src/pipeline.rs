@@ -79,7 +79,11 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// (16 hex digits each): writes the container of each listed shader the
 /// title creates to `<folder>/<hash>.bin`, for `victory shader-info` to
 /// describe shaders no game file holds as such (diagnostics; stays local).
-fn dump(hash: &str, bytes: &[u8]) {
+/// `VICTORY_SHADER_HASHES=all` dumps every shader the title creates, and
+/// each dumped shader also gets a line `<hash> <stage>` in
+/// `<folder>/index.txt`, so `victory translate <folder>` can work on a
+/// scene's whole shader set offline.
+fn dump(hash: &str, stage: &str, bytes: &[u8]) {
     static SPEC: OnceLock<Option<(std::path::PathBuf, Vec<String>)>> = OnceLock::new();
     let Some((dir, hashes)) = SPEC.get_or_init(|| {
         let dir = std::env::var_os("VICTORY_SHADER_DUMP")?;
@@ -94,13 +98,26 @@ fn dump(hash: &str, bytes: &[u8]) {
     }) else {
         return;
     };
-    if !hashes.iter().any(|h| h == hash) {
+    if !hashes.iter().any(|h| h == hash || h == "all") {
         return;
     }
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("{hash}.bin"));
+    if path.exists() {
+        return;
+    }
     match std::fs::write(&path, bytes) {
-        Ok(()) => tracing::info!(hash, path = %path.display(), "shader dumped"),
+        Ok(()) => {
+            use std::io::Write;
+            if let Ok(mut index) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("index.txt"))
+            {
+                let _ = writeln!(index, "{hash} {stage}");
+            }
+            tracing::info!(hash, stage, path = %path.display(), "shader dumped")
+        }
         Err(e) => tracing::warn!(hash, %e, "shader not dumped"),
     }
 }
@@ -112,7 +129,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
-            dump(&full.to_hex()[..16], bytes);
+            dump(&full.to_hex()[..16], stage, bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
