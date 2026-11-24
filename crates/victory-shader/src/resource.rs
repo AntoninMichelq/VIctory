@@ -12,6 +12,8 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+use std::cell::RefCell;
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
@@ -72,15 +74,28 @@ pub enum Source {
     /// dword is `mask`: the source where the lane's bit is set, then where it
     /// is clear.
     Lanes { mask: Value, args: Vec<Source> },
+    /// Picked per lane by the path the lane took into `block`, where VGPR
+    /// phis join the dwords: one source per predecessor, in
+    /// [`crate::ir::Block::preds`] order. A descriptor that differs between
+    /// lanes.
+    Paths { block: usize, args: Vec<Source> },
+    /// In a [`Source::Paths`] arg: the dwords the enclosing `Paths` at
+    /// `block` joins, as they were on the previous pass through the loop.
+    Carried { block: usize },
+    /// In a [`Source::Paths`] arg: VGPRs no instruction wrote on that path,
+    /// undefined unless the hardware loads them (listed in
+    /// [`Waterfall::unset`], checked when lowering).
+    Unset,
 }
 
 impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
-                args.iter().flat_map(Source::leaves).collect()
-            }
+            Source::Phi { args, .. }
+            | Source::Select { args, .. }
+            | Source::Lanes { args, .. }
+            | Source::Paths { args, .. } => args.iter().flat_map(Source::leaves).collect(),
             s => vec![s],
         }
     }
@@ -126,6 +141,11 @@ pub struct Waterfall {
     /// The `v_readfirstlane_b32` results they compare, each the lane's own
     /// source dword.
     pub reads: Vec<Value>,
+    /// VGPRs read before any write that a per-lane descriptor's phis join
+    /// ([`Source::Unset`], or dropped where the other paths agree): taken
+    /// as undefined, so as anything, which holds unless the hardware loads
+    /// them.
+    pub unset: Vec<Value>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -195,6 +215,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
         }
     }
     out.waterfall = t.waterfall(&first_lane);
+    out.waterfall.unset = t.unset.take();
     Ok(out)
 }
 
@@ -224,6 +245,10 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Per-lane joins being traced: block and the dwords joined there.
+    lane_joins: RefCell<Vec<(usize, Vec<Term>)>>,
+    /// See [`Waterfall::unset`].
+    unset: RefCell<Vec<Value>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -269,6 +294,8 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            lane_joins: RefCell::new(Vec::new()),
+            unset: RefCell::new(Vec::new()),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -1164,6 +1191,9 @@ impl<'a> Tracer<'a> {
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
             return self.classify(words, joins);
         };
+        if let Some(source) = self.lane_phi(words, joins)? {
+            return Ok(source);
+        }
         if let Some(source) = self.fetched(words)? {
             return Ok(source);
         }
@@ -1188,6 +1218,116 @@ impl<'a> Tracer<'a> {
             }
             Some(_) => "a descriptor read from the first lane of computed VGPRs",
         })
+    }
+
+    /// Per-lane words that phis join: a phi that carries one dword is that
+    /// dword, other joins are traced per path into their block
+    /// ([`Source::Paths`]).
+    fn lane_phi(
+        &self,
+        words: &[Term],
+        joins: &mut Vec<usize>,
+    ) -> Result<Option<Source>, &'static str> {
+        let phi_of = |w: &Term| match *w {
+            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Const(_) => None,
+        };
+        if words.iter().all(|w| phi_of(w).is_none()) {
+            return Ok(None);
+        }
+        let carried: Vec<Term> = words
+            .iter()
+            .map(|&w| match phi_of(&w) {
+                Some(_) => self.joined_one(w).unwrap_or(w),
+                None => w,
+            })
+            .collect();
+        if carried != words {
+            return self.per_lane(&carried, joins).map(Some);
+        }
+        let Some((block, _)) = words.iter().find_map(phi_of) else {
+            unreachable!()
+        };
+        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
+            return Err("a per-lane descriptor joined in several blocks");
+        }
+        if joins.contains(&block) {
+            // Back at a join being traced: through a loop's back edge, the
+            // dwords it joined on the previous pass.
+            return match self.lane_joins.borrow().iter().find(|j| j.0 == block) {
+                Some((_, w)) if w == words => Ok(Some(Source::Carried { block })),
+                _ => Err("a per-lane descriptor that changes in a loop"),
+            };
+        }
+        if joins.len() >= MAX_JOINS {
+            return Err("a descriptor joined too often");
+        }
+        joins.push(block);
+        self.lane_joins.borrow_mut().push((block, words.to_vec()));
+        let phis = &self.p.blocks[block].phis;
+        let args = (0..self.p.blocks[block].preds.len())
+            .map(|j| {
+                let edge: Vec<Term> = words
+                    .iter()
+                    .map(|w| match phi_of(w) {
+                        Some((_, i)) => self.lane_term(Term::Value(phis[i].args[j])),
+                        None => *w,
+                    })
+                    .collect();
+                if edge.iter().all(|&t| self.unset_input(t)) {
+                    let mut unset = self.unset.borrow_mut();
+                    unset.extend(edge.iter().filter_map(|t| match *t {
+                        Term::Value(v) => Some(v),
+                        Term::Const(_) => None,
+                    }));
+                    return Ok(Source::Unset);
+                }
+                self.per_lane(&edge, joins)
+            })
+            .collect::<Result<_, _>>();
+        self.lane_joins.borrow_mut().pop();
+        joins.pop();
+        Ok(Some(Source::Paths { block, args: args? }))
+    }
+
+    /// The one dword the phi `t` carries: what the arguments of the phis it
+    /// joins through come to (through copies), past VGPRs no one wrote.
+    fn joined_one(&self, t: Term) -> Option<Term> {
+        let (mut seen, mut todo, mut leaves) = (Vec::new(), vec![t], Vec::new());
+        while let Some(t) = todo.pop() {
+            let t = self.lane_term(t);
+            match t {
+                Term::Value(v) if let Some((b, i)) = self.phis[v.0 as usize] => {
+                    if seen.contains(&v) {
+                        continue;
+                    }
+                    if seen.len() >= MAX_POINTER_STEPS {
+                        return None;
+                    }
+                    seen.push(v);
+                    let phi = &self.p.blocks[b].phis[i];
+                    todo.extend(phi.args.iter().map(|&a| Term::Value(a)));
+                }
+                t if !leaves.contains(&t) => leaves.push(t),
+                _ => {}
+            }
+        }
+        let (unset, set): (Vec<Term>, Vec<Term>) =
+            leaves.into_iter().partition(|&l| self.unset_input(l));
+        let [one] = set[..] else { return None };
+        self.unset
+            .borrow_mut()
+            .extend(unset.into_iter().filter_map(|t| match t {
+                Term::Value(v) => Some(v),
+                Term::Const(_) => None,
+            }));
+        Some(one)
+    }
+
+    /// Whether `t` is a VGPR read before any write (undefined unless the
+    /// hardware loads it).
+    fn unset_input(&self, t: Term) -> bool {
+        matches!(t, Term::Value(v) if matches!(self.inputs[v.0 as usize], Some(Reg::V(_))))
     }
 
     /// Dwords of `global_load_dword*` that line up: `first..` of one load,
@@ -2147,6 +2287,201 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
+    /// [`WATERFALL_FETCHED_WAVE32`] inside an outer loop that moves the
+    /// descriptor to v[20:27] and back after each pass: the loop header's
+    /// phis carry the loaded dwords unchanged.
+    pub(crate) const WATERFALL_CARRIED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0xDC38_8000,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
+        0xDC38_8010,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE94_037E, // 0x3c: s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x40: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
+        0xD4E2_0015,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+        0xD4E2_0016,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE7, // s_cbranch_execnz -> 0x40
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xD834_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0x7E28_0304, // v_mov_b32 v20, v4
+        0x7E2A_0305, // v_mov_b32 v21, v5
+        0x7E2C_0306, // v_mov_b32 v22, v6
+        0x7E2E_0307, // v_mov_b32 v23, v7
+        0x7E30_0308, // v_mov_b32 v24, v8
+        0x7E32_0309, // v_mov_b32 v25, v9
+        0x7E34_030A, // v_mov_b32 v26, v10
+        0x7E36_030B, // v_mov_b32 v27, v11
+        0x7E08_0314, // v_mov_b32 v4, v20
+        0x7E0A_0315, // v_mov_b32 v5, v21
+        0x7E0C_0316, // v_mov_b32 v6, v22
+        0x7E0E_0317, // v_mov_b32 v7, v23
+        0x7E10_0318, // v_mov_b32 v8, v24
+        0x7E12_0319, // v_mov_b32 v9, v25
+        0x7E14_031A, // v_mov_b32 v10, v26
+        0x7E16_031B, // v_mov_b32 v11, v27
+        0x8017_8117, // s_add_u32 s23, s23, 1
+        0xBF07_8417, // s_cmp_lg_u32 s23, 4
+        0xBF85_FFD0, // s_cbranch_scc1 -> 0x3c
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// The waterfall over a descriptor loaded in an if/else on EXEC: lanes
+    /// below 16 load entry i of the table at s0, the others entry i at byte
+    /// 1024; phis join the two (and the undefined VGPRs of lanes that skip
+    /// the first branch).
+    pub(crate) const WATERFALL_BRANCHES_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE98_3C6A, // s_and_saveexec_b32 s24, vcc_lo
+        0x8918_187E, // s_xor_b32 s24, exec_lo, s24
+        0xBF88_0004, // s_cbranch_execz -> 0x44
+        0xDC38_8000,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
+        0xDC38_8010,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
+        0xBE98_3D18, // 0x44: s_or_saveexec_b32 s24, s24
+        0x897E_187E, // s_xor_b32 exec_lo, exec_lo, s24
+        0xBF88_0004, // s_cbranch_execz -> 0x60
+        0xDC38_8400,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5] offset:1024
+        0xDC38_8410,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:1040
+        0x887E_187E, // 0x60: s_or_b32 exec_lo, exec_lo, s24
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE94_037E, // s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x6c: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
+        0xD4E2_0015,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+        0xD4E2_0016,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE7, // s_cbranch_execnz -> 0x6c
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xD834_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// The waterfall inside an outer loop whose pass n reloads the
+    /// descriptor of lanes below n from byte 1024 on: the loop header joins
+    /// the first load with what the previous pass left.
+    pub(crate) const WATERFALL_REPLACED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0xDC38_8000,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
+        0xDC38_8010,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0xBF8C_0070, // 0x38: s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE94_037E, // s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x40: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
+        0xD4E2_0015,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+        0xD4E2_0016,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xD4E2_0016,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE7, // s_cbranch_execnz -> 0x40
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xD834_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0x7D88_0017, // v_cmp_gt_u32 vcc_lo, s23, v0
+        0xBE98_3C6A, // s_and_saveexec_b32 s24, vcc_lo
+        0xBF88_0004, // s_cbranch_execz -> 0xcc
+        0xDC38_8400,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5] offset:1024
+        0xDC38_8410,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:1040
+        0x887E_187E, // 0xcc: s_or_b32 exec_lo, exec_lo, s24
+        0x8017_8117, // s_add_u32 s23, s23, 1
+        0xBF07_8417, // s_cmp_lg_u32 s23, 4
+        0xBF85_FFD7, // s_cbranch_scc1 -> 0x38
+        0xBF81_0000, // s_endpgm
+    ];
+
     fn waterfall(words: &[u32], wave64: bool) -> Result<Resources, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, wave64, 256).unwrap();
@@ -2214,6 +2549,76 @@ pub(crate) mod tests {
         // in place of the global loads.
         let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
         words[5..9].copy_from_slice(&[0xDBFC_0000, 0x0400_0001, 0xDBFC_0010, 0x0800_0001]);
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane of an LDS read",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The byte offset in the table of each per-lane load `s` picks from,
+    /// per path (`C` for the join itself on the previous pass, `U` for
+    /// unset VGPRs).
+    fn paths(r: &Resources, s: &Source) -> String {
+        match s {
+            Source::Fetched { load, first: 0 } => {
+                let a = r.scalar.iter().find(|x| x.0 == *load).unwrap().1;
+                assert!(a.dynamic.is_some());
+                format!("{}", a.offset)
+            }
+            Source::Paths { args, .. } => {
+                let args: Vec<String> = args.iter().map(|a| paths(r, a)).collect();
+                format!("[{}]", args.join(" "))
+            }
+            Source::Carried { .. } => "C".into(),
+            Source::Unset => "U".into(),
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_a_loop_carried_phi_are_its_one_source() {
+        let r = waterfall(WATERFALL_CARRIED_WAVE32, false).unwrap();
+        let image = &r.descriptors[0];
+        assert_eq!(paths(&r, &image.source), "0");
+        assert_eq!(r.waterfall.compares.len(), 4);
+        assert!(r.waterfall.unset.is_empty());
+    }
+
+    #[test]
+    fn descriptors_read_from_the_first_lane_of_a_phi_are_traced_per_path() {
+        let r = waterfall(WATERFALL_BRANCHES_WAVE32, false).unwrap();
+        let image = &r.descriptors[0];
+        // Past the else branch or through it. Before it, lanes that skipped
+        // the then branch hold v[4:11] as no one set them: undefined, so
+        // the then branch's load.
+        assert_eq!(paths(&r, &image.source), "[0 1024]");
+        assert_eq!(r.waterfall.unset.len(), 8);
+        assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn descriptors_replaced_in_a_loop_join_the_previous_pass() {
+        let r = waterfall(WATERFALL_REPLACED_WAVE32, false).unwrap();
+        let image = &r.descriptors[0];
+        // From the entry, or from the previous pass: kept or reloaded.
+        assert_eq!(paths(&r, &image.source), "[0 [C 1024]]");
+        assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn descriptors_joined_from_lds_fail_naming_it() {
+        // The else branch reads its descriptor from LDS: ds_read_b128
+        // v[4:7], v1 and ds_read_b128 v[8:11], v1 offset:16.
+        let mut words = WATERFALL_BRANCHES_WAVE32.to_vec();
+        assert_eq!(words[20], 0xDC38_8400);
+        words[20..24].copy_from_slice(&[0xDBFC_0000, 0x0400_0001, 0xDBFC_0010, 0x0800_0001]);
         let err = waterfall(&words, false).unwrap_err();
         assert!(
             matches!(
