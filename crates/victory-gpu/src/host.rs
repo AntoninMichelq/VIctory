@@ -3570,7 +3570,7 @@ impl Meter {
         let [submissions, submit_us, wait_us] =
             [0, 1, 2].map(|i| SUBMITTING[i].swap(0, Ordering::Relaxed));
         let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
-        let [asks, ask_us, kernel_asks] = crate::watch::take_asks();
+        let [asks, ask_us, kernel_asks, failed_asks] = crate::watch::take_asks();
         let recording_us = crate::draw::take_recording_us();
         let [runs_us, texture_check_us, prelude_us, flush_us, srv_us] =
             [0, 1, 2, 3, 4].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed));
@@ -3588,7 +3588,7 @@ impl Meter {
             tracing::info!(
                 "frame CPU split: recording {:.1} ms (blocked: pipeline waits {:.1} ms, \
                  buffer lock {:.1} ms, list lock {:.1} ms); {:.1} submissions: preparing {cpu:.1} ms \
-                 (snapshots {:.1} ms for {:.1} MB declared, {:.0} write-watch asks ({:.0} of the kernel) {:.1} ms; \
+                 (snapshots {:.1} ms for {:.1} MB declared, {:.0} write-watch asks ({:.0} of the kernel, {:.0} refused) {:.1} ms; \
                  copies {copy_ms:.1} ms {copy_mb:.1} MB, run work {:.1} ms, texture checks {:.1} ms \
                  ({texture_mb:.1} MB), texture uploads recorded {:.1} ms, last refresh {:.1} ms, \
                  indexed SRVs {:.1} ms), submitting \
@@ -3602,6 +3602,7 @@ impl Meter {
                 per(snapshot_b, 1e6),
                 per(asks, 1.0),
                 per(kernel_asks, 1.0),
+                per(failed_asks, 1.0),
                 per(ask_us, 1e3),
                 per(runs_us, 1e3),
                 per(texture_check_us, 1e3),
