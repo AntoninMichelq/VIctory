@@ -170,8 +170,8 @@ static STATS: Stats = Stats {
 /// Every 5 s while there is pipeline work: one line on the backlog and
 /// what the workers made since the last one.
 fn progress() {
-    use super::library::{COMPILE_US, LOADED, MADE, SHARED};
-    let (mut made, mut loaded, mut shared, mut compile_us) = (0, 0, 0, 0);
+    use super::library::{COMPILE_US, LOAD_US, LOADED, MADE, SHARED};
+    let (mut made, mut loaded, mut shared, mut compile_us, mut load_us) = (0, 0, 0, 0, 0);
     let (mut hits, mut misses) = crate::shader_cache::counts();
     loop {
         std::thread::sleep(Duration::from_secs(5));
@@ -188,6 +188,7 @@ fn progress() {
         let from_library = delta(&LOADED, &mut loaded);
         let deduped = delta(&SHARED, &mut shared);
         let compile_ms = delta(&COMPILE_US, &mut compile_us) / 1000;
+        let load_ms = delta(&LOAD_US, &mut load_us) / 1000;
         let (h, m) = crate::shader_cache::counts();
         let shader_hits = h.saturating_sub(std::mem::replace(&mut hits, h));
         let shader_translated = m.saturating_sub(std::mem::replace(&mut misses, m));
@@ -207,6 +208,7 @@ fn progress() {
             avg_ms = us.checked_div(done).unwrap_or(0) / 1000,
             max_ms = max_us / 1000,
             host_compile_avg_ms = compile_ms.checked_div(compiled).unwrap_or(0),
+            library_ask_avg_ms = load_ms.checked_div(compiled + from_library).unwrap_or(0),
             queue_entries = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).heap.len(),
             "pipeline workers (last 5 s)"
         );

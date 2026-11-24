@@ -12,8 +12,10 @@
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
 //!
-//! All library calls are serialised: the interface does not promise that
-//! stores, loads and serialising may overlap.
+//! The library synchronises itself, except that two loads of the same
+//! name must not overlap (`IN_FLIGHT` makes one name load once at a time).
+//! Stores and serialising still go through the mutex, which also counts
+//! what was stored since the last save.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,9 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED: AtomicU64 = AtomicU64::new(0);
 /// Time spent in the host's compiles (`create`), in microseconds.
 pub(crate) static COMPILE_US: AtomicU64 = AtomicU64::new(0);
+/// Time spent asking the library for pipelines (hits and misses), in
+/// microseconds.
+pub(crate) static LOAD_US: AtomicU64 = AtomicU64::new(0);
 
 struct Library {
     library: ID3D12PipelineLibrary1,
@@ -199,10 +204,16 @@ fn load_or_create(
         MADE.fetch_add(1, Ordering::Relaxed);
         return compile(create);
     };
-    if let Ok(pso) = load(
-        &library.lock().unwrap_or_else(|e| e.into_inner()).library,
-        PCWSTR(wide.as_ptr()),
-    ) {
+    // Loaded outside the lock: the library synchronises itself except for
+    // two loads of one name, which `IN_FLIGHT` already keeps apart. Under
+    // the lock, loads (seconds each when the driver rebuilds the pipeline)
+    // queued every worker behind one another: the world made one pipeline
+    // per 5 s with a thousand waiting.
+    let shared = library.lock().unwrap_or_else(|e| e.into_inner()).library.clone();
+    let loading = std::time::Instant::now();
+    let loaded = load(&shared, PCWSTR(wide.as_ptr()));
+    LOAD_US.fetch_add(loading.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if let Ok(pso) = loaded {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -262,11 +273,9 @@ fn saver() -> Option<&'static mpsc::Sender<SaveRequest>> {
             let spawned = std::thread::Builder::new()
                 .name("victory-pipeline-save".into())
                 .spawn(move || {
-                    // SAFETY: plain priority call on our own background thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    // Normal priority: it holds the library's mutex while it
+                    // serialises, and below normal it was starved by a busy
+                    // title with every pipeline worker waiting on it.
                     let mut buf = Vec::new();
                     while let Ok(req) = rx.recv() {
                         perform_save(&req.dir, &mut buf);
