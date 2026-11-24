@@ -229,6 +229,32 @@ enum RootView {
 /// maximum; SRVs and UAVs refresh the full remaining extent of the backing
 /// buffer (dirty-page watched) and UAVs also schedule write-back.
 /// `None` for a null address or one outside title buffers.
+/// Whether root-UAV writes of the shader `hash` (16 hex digits, as the
+/// log names them) go back to title memory: [`root_uav_copy_back`], but
+/// never for the shaders listed in `VICTORY_ROOT_UAV_NO_COPY_BACK_FOR`
+/// (comma-separated). By default that list holds caa78b8ca62bc3d6 and
+/// 28918b7150a7aad5: with their writes copied back the title crashed at
+/// world load (reading -1 / f16 infinities, which these BVH-like builders
+/// write), each on its own; the other root-UAV computes copy back safely.
+/// An empty value lists none.
+fn root_uav_copy_back_for(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let v = std::env::var("VICTORY_ROOT_UAV_NO_COPY_BACK_FOR")
+            .unwrap_or_else(|_| "caa78b8ca62bc3d6,28918b7150a7aad5".into());
+        let list: Vec<String> = v
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if root_uav_copy_back() && !list.is_empty() {
+            tracing::info!(?list, "root UAV writes of these shaders stay on the GPU");
+        }
+        list
+    });
+    root_uav_copy_back() && !list.iter().any(|h| h.as_str() == hash)
+}
+
 /// Whether what shaders write through root UAVs is copied back to the
 /// title's memory; `VICTORY_NO_ROOT_UAV_COPY_BACK=1` keeps those writes
 /// in the host's copies only (other GPU readers still see them, the CPU
@@ -261,7 +287,7 @@ fn root_uav_first_bind(gpu: u64, address: u64) -> bool {
         .insert((gpu, address))
 }
 
-fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, kind: RootView, copy_back: bool) -> Option<u64> {
     if address == 0 {
         return None;
     }
@@ -300,7 +326,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
                 return None;
             }
             let len = shadow.left(address);
-            if root_uav_copy_back() {
+            if copy_back {
                 shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
             } else if root_uav_first_bind(gpu, address) {
@@ -542,6 +568,7 @@ impl State {
         list: &HostList,
         address: u64,
         uav: bool,
+        copy_back: bool,
     ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         if address == 0 {
             return None;
@@ -605,13 +632,18 @@ impl State {
                 first
             }
         };
-        shadow.refresh(list, address, len);
         if uav {
-            if root_uav_copy_back() {
+            if copy_back {
+                shadow.refresh(list, address, len);
                 shadow.gpu_writes(list, address, len);
+            } else if root_uav_first_bind(gpu, address) {
+                // See root_view: refreshed from the title once, then the
+                // GPU's (every bind re-copied up to 2 GB a frame).
+                shadow.refresh(list, address, len);
             }
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
         } else {
+            shadow.refresh(list, address, len);
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
         Some(host.gpu_handle(first))
@@ -839,6 +871,7 @@ impl State {
                 (&stage.root_srvs, RootView::Srv),
                 (&stage.root_uavs, RootView::Uav),
             ] {
+                let copy_back = root_uav_copy_back_for(&stage.shader.hash);
                 for &(slot, param) in views {
                     // A root view two stages share has one parameter.
                     if param < 64 {
@@ -888,7 +921,7 @@ impl State {
                             // A null address the program tests before reading.
                             self.null_srv_table(kind == RootView::Uav)
                         } else {
-                            self.root_srv_table(list, address, kind == RootView::Uav)
+                            self.root_srv_table(list, address, kind == RootView::Uav, copy_back)
                         };
                         let Some(table) = table else {
                             once!(
@@ -914,7 +947,7 @@ impl State {
                     let null = (pointer && address == 0)
                         .then(|| list.scratch(256).map(|(gpu, _)| gpu))
                         .flatten();
-                    let Some(gpu) = null.or_else(|| root_view(list, address, kind)) else {
+                    let Some(gpu) = null.or_else(|| root_view(list, address, kind, copy_back)) else {
                         once!(
                             slot,
                             ?kind,
@@ -2233,6 +2266,11 @@ mod group_limit_tests {
 }
 
 #[cfg(test)]
+fn root_view_t(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
+    root_view(list, address, kind, true)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use victory_shader::native::{ComputeIo, StageIo};
@@ -2439,13 +2477,13 @@ mod tests {
             return;
         };
         let list = host.new_list().expect("new_list");
-        assert!(root_view(&list, 0, RootView::Cbv).is_none());
-        assert!(root_view(&list, 0, RootView::Srv).is_none());
-        assert!(root_view(&list, 0, RootView::Uav).is_none());
-        assert!(root_view(&list, mid, RootView::Srv).is_none());
-        assert!(root_view(&list, mid, RootView::Uav).is_none());
-        assert!(root_view(&list, u64::MAX - 16, RootView::Srv).is_none());
-        assert!(root_view(&list, u64::MAX - 16, RootView::Uav).is_none());
+        assert!(root_view_t(&list, 0, RootView::Cbv).is_none());
+        assert!(root_view_t(&list, 0, RootView::Srv).is_none());
+        assert!(root_view_t(&list, 0, RootView::Uav).is_none());
+        assert!(root_view_t(&list, mid, RootView::Srv).is_none());
+        assert!(root_view_t(&list, mid, RootView::Uav).is_none());
+        assert!(root_view_t(&list, u64::MAX - 16, RootView::Srv).is_none());
+        assert!(root_view_t(&list, u64::MAX - 16, RootView::Uav).is_none());
 
         list.close();
     }
@@ -2471,7 +2509,7 @@ mod tests {
         let list = host.new_list().expect("new_list");
         let shadow = crate::shadow::find(base, 4).expect("shadow");
         assert_eq!(
-            root_view(&list, base, RootView::Srv),
+            root_view_t(&list, base, RootView::Srv),
             Some(shadow.gpu(base))
         );
         list.close();
@@ -2486,7 +2524,7 @@ mod tests {
             alloc.ptr.add(off_b).cast::<u32>().write(0xBEEF_5678);
         }
         assert_eq!(
-            root_view(&list, base, RootView::Srv),
+            root_view_t(&list, base, RootView::Srv),
             Some(shadow.gpu(base))
         );
         list.close();
