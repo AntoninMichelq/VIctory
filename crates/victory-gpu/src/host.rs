@@ -594,6 +594,11 @@ impl Host {
     /// immediately.
     pub(crate) fn recycle_list(&self, list: HostList) {
         list.release_kept();
+        // What its submission needed (copies of title memory, texture
+        // staging) is not held while the list waits in the pool: up to 64
+        // idle lists kept gigabytes of loose memory copies from being
+        // released (2026-11-24).
+        *list.deferred() = Deferred::default();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < LIST_POOL_CAP {
             pool.push(list);
