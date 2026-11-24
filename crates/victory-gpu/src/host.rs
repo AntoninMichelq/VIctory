@@ -794,13 +794,15 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
+        // In first-declared order; a set finds repeats (a world submission
+        // declares thousands, comparing each with every one kept was
+        // quadratic).
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                    && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                 {
                     back.push((shadow.clone(), *address, *len));
                 }
