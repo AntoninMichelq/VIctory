@@ -248,6 +248,10 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             Some(gpu)
         }
         RootView::Srv => {
+            // Rounded down to 16 bytes, as root_srv_table.
+            let address = address & !15;
+            let shadow = crate::shadow::find(address, 1)?;
+            let gpu = shadow.gpu(address);
             if !gpu.is_multiple_of(4) {
                 return None;
             }
@@ -257,6 +261,9 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             Some(gpu)
         }
         RootView::Uav => {
+            let address = address & !15;
+            let shadow = crate::shadow::find(address, 1)?;
+            let gpu = shadow.gpu(address);
             if !gpu.is_multiple_of(4) {
                 return None;
             }
@@ -458,6 +465,11 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // A root view's address (the shader reads its low bits to
+            // offset into the view rounded down to 16 bytes).
+            (Some(Root::View(address)), RootType::Descriptor) => {
+                (address >> (32 * dword.min(1))) as u32
+            }
             _ => {
                 once!(
                     slot,
@@ -483,6 +495,10 @@ impl State {
         if address == 0 {
             return None;
         }
+        // The view starts at the address rounded down to 16 bytes; the
+        // shader adds the address's low four bits to its offsets
+        // (`victory_shader::emit` root view bias).
+        let address = address & !15;
         let shadow = crate::shadow::find(address, 1)?;
         let gpu = shadow.gpu(address);
         if !gpu.is_multiple_of(4) {
