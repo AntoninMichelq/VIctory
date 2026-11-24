@@ -2,7 +2,8 @@
 //! present (in every build, so a play build can show the G-buffer colours
 //! while the title's lighting is still black):
 //! - `VICTORY_PRESENT_TARGET=<width>x<height>:<format>[:<n>]` presents the
-//!   `n`-th (first-use order, default 0) texture of that size and DXGI
+//!   `n`-th (first-use order, default 0; `busiest` for the one the frame
+//!   binds most often) texture of that size and DXGI
 //!   format the frame renders to or writes, in place of what the title
 //!   presents, to see a pass the final image does not show.
 //! - `VICTORY_FLAT_LIGHT` (same spec, see [`crate::flat_light`]) adds that
@@ -14,12 +15,19 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 type Spec = (u64, u32, i32, usize);
 
+/// The `n` that picks the matching texture the frame bound most often.
+const BUSIEST: usize = usize::MAX;
+
 fn parse(var: &str, what: &str) -> Option<Spec> {
     let v = std::env::var(var).ok()?;
     let mut parts = v.split(':');
     let (w, h) = parts.next()?.split_once('x')?;
     let format = parts.next()?.trim().parse().ok()?;
-    let n = parts.next().map_or(Some(0), |n| n.trim().parse().ok())?;
+    // `busiest`: the matching texture the frame bound most often.
+    let n = parts.next().map_or(Some(0), |n| match n.trim() {
+        "busiest" => Some(BUSIEST),
+        n => n.parse().ok(),
+    })?;
     let spec = (w.trim().parse().ok()?, h.trim().parse().ok()?, format, n);
     tracing::info!(?spec, "{what}");
     Some(spec)
@@ -48,7 +56,7 @@ fn flat_spec() -> Option<Spec> {
 /// The frame being built and the textures it used that match a spec, in
 /// first-use order.
 #[allow(clippy::type_complexity)]
-struct Used(std::sync::Mutex<(u64, Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>)>);
+struct Used(std::sync::Mutex<(u64, Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, u32)>)>);
 
 static PRESENTED: Used = Used(std::sync::Mutex::new((0, Vec::new())));
 static FLAT: Used = Used(std::sync::Mutex::new((0, Vec::new())));
@@ -79,8 +87,8 @@ fn note_depth(resource: crate::object::This) {
     if p.0 != frame {
         *p = (frame, Vec::new());
     }
-    if !p.1.iter().any(|&(r, _)| r == resource as usize) {
-        p.1.push((resource as usize, copy));
+    if !p.1.iter().any(|&(r, ..)| r == resource as usize) {
+        p.1.push((resource as usize, copy, 1));
     }
 }
 
@@ -107,8 +115,9 @@ impl Used {
         if p.0 != frame {
             *p = (frame, Vec::new());
         }
-        if !p.1.iter().any(|&(r, _)| r == resource as usize) {
-            p.1.push((resource as usize, copy));
+        match p.1.iter_mut().find(|(r, ..)| *r == resource as usize) {
+            Some((.., uses)) => *uses += 1,
+            None => p.1.push((resource as usize, copy, 1)),
         }
     }
 
@@ -118,7 +127,15 @@ impl Used {
             return None;
         }
         let (_, list) = std::mem::take(&mut *p);
-        list.into_iter().nth(spec.3).map(|(_, t)| t)
+        if spec.3 == BUSIEST {
+            // The first of the most bound, on a tie.
+            return list
+                .into_iter()
+                .rev()
+                .max_by_key(|&(.., uses)| uses)
+                .map(|(_, t, _)| t);
+        }
+        list.into_iter().nth(spec.3).map(|(_, t, _)| t)
     }
 }
 
