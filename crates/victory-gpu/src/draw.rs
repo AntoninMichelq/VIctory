@@ -1252,10 +1252,16 @@ impl State {
         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
         #[cfg(feature = "diagnostics")]
         if traced {
+            let outcome = if ran {
+                "RUN".to_owned()
+            } else if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+                format!("DROPPED ({})", crate::pipeline::drop_reason(self.pipeline as This))
+            } else {
+                "DROPPED (see the why line above)".to_owned()
+            };
             tracing::debug!(
                 pipeline = format_args!("{:#x}", self.pipeline),
-                "indirect kind {kind} {}",
-                if ran { "RUN" } else { "DROPPED" }
+                "indirect kind {kind} {outcome}"
             );
         }
         ran

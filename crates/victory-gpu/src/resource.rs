@@ -881,6 +881,31 @@ static ALIASES: std::sync::Mutex<
     std::collections::BTreeMap<u64, Vec<std::sync::Weak<HostTexture>>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The host textures made for memory at or before `address` (the nearest
+/// start below it and its size), for a texture read as all zero
+/// (diagnostics): whether another texture the GPU writes overlaps it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_report(address: u64) -> String {
+    let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let near = map.range(..=address).next_back().or_else(|| map.range(address..).next());
+    let Some((&at, list)) = near else {
+        return "no host texture anywhere".into();
+    };
+    let descs: Vec<String> = list
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .map(|h| {
+            // SAFETY: a live resource.
+            let d = unsafe { h.texture.GetDesc() };
+            format!(
+                "{}x{}x{} f{} mips {} flags {:#x}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0
+            )
+        })
+        .collect();
+    format!("nearest host texture at {at:#x} ({:+}): {descs:?}", at as i64 - address as i64)
+}
+
 #[cfg(windows)]
 fn remember_alias(address: u64, made: &std::sync::Arc<HostTexture>) {
     if address == 0 {
@@ -910,7 +935,8 @@ fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTextu
     let own = pc_format(desc.format);
     let mips = u32::from(desc.mip_levels).max(1).min(mip_count(desc));
     let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let shared = map.get(&address)?.iter().filter_map(|w| w.upgrade()).find(|h| {
+    let live: Vec<_> = map.get(&address)?.iter().filter_map(|w| w.upgrade()).collect();
+    let shared = live.iter().find(|h| {
         // SAFETY: a live resource.
         let d = unsafe { h.texture.GetDesc() };
         d.Dimension.0 as u32 == desc.dimension
@@ -923,7 +949,21 @@ fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTextu
             && d.Flags.0 & USES & desc.flags as i32 == desc.flags as i32 & USES
             // Not denied shader access the new one may need.
             && (d.Flags.0 & DENY_SHADER_RESOURCE == 0 || desc.flags as i32 & DENY_SHADER_RESOURCE != 0)
-    })?;
+    });
+    #[cfg(feature = "diagnostics")]
+    if shared.is_none() {
+        for h in &live {
+            // SAFETY: a live resource.
+            let d = unsafe { h.texture.GetDesc() };
+            tracing::debug!(
+                address = format_args!("{address:#x}"),
+                ?desc,
+                host = ?d,
+                "a texture placed over another's memory does not match its host copy"
+            );
+        }
+    }
+    let shared = shared?.clone();
     #[cfg(feature = "diagnostics")]
     tracing::debug!(
         address = format_args!("{address:#x}"),
