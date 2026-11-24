@@ -210,6 +210,9 @@ struct Lower<'a> {
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
     /// buffer's): no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
+    /// While an image access is emitted once per immediate sampler a
+    /// branch picks between (`image`): the one this pass uses.
+    sampler_pick: Option<usize>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -1548,6 +1551,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
+            sampler_pick: None,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -6254,8 +6258,8 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
-            Source::Phi { block, args } if sampler && constant_leaves(src) => {
-                self.constant_sampler_phi(site, *block, args, props, 8)
+            Source::Phi { .. } if sampler && constant_leaves(src) => {
+                self.constant_sampler(site, src, props)
             }
             Source::Phi { block, args } => {
                 let _ = site;
@@ -6291,45 +6295,44 @@ impl<'a> Lower<'a> {
     }
 
     /// A sampler the code builds from constants on each path to a join (an
-    /// address mode chosen by a uniform branch): each predecessor makes the
-    /// handle of its static sampler at its end, and the join picks one. One
-    /// constant on every path is that sampler alone.
-    fn constant_sampler_phi(
-        &mut self,
-        site: Site,
-        block: usize,
-        args: &[Source],
-        props: (u32, u32),
-        depth: u32,
-    ) -> Result<V, Why> {
+    /// address mode chosen by a uniform branch). One constant on every path
+    /// is that sampler alone; otherwise `image` emits the access once per
+    /// constant (`sampler_pick`) and keeps the result of the one the branch
+    /// chose (`sampler_choice`): the host takes no handle chosen by a phi.
+    fn constant_sampler(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<V, Why> {
+        let choices = sampler_choices(src);
+        let one = match (choices.len(), self.sampler_pick) {
+            (1, _) => &choices[0],
+            (_, Some(k)) => choices.get(k).ok_or("a sampler chosen by control flow")?,
+            _ => return Err("a sampler chosen by control flow outside an image access"),
+        };
+        let one = one.clone();
+        self.handle(site, &one, true, props)
+    }
+
+    /// Which of `sampler_choices(src)` the branch picked: at a join, each
+    /// predecessor gives its position, at most `depth` joins deep.
+    fn sampler_choice(&mut self, src: &Source, choices: &[Source], depth: u32) -> Result<V, Why> {
         const WHY: Why = "a sampler chosen by control flow";
-        let leaves: Vec<Source> = args.iter().flat_map(|a| a.leaves()).cloned().collect();
-        if let Some(one) = leaves.first()
-            && leaves.iter().all(|l| l == one)
-        {
-            return self.handle(site, one, true, props);
-        }
+        let Source::Phi { block, args } = src else {
+            let k = choices.iter().position(|c| c == src).ok_or(WHY)?;
+            return Ok(self.s.m.i32(k as u32));
+        };
         let p = self.x.p;
         let mut incoming = Vec::new();
-        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+        for (&q, arg) in p.blocks[*block].preds.iter().zip(args) {
             if self.block[q].is_none() {
                 continue;
             }
             let tail = self.tail[q].ok_or(WHY)?;
-            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
             let here = std::mem::replace(&mut self.cur, at);
-            let h = match arg {
-                Source::Constant(_) => self.handle(site, arg, true, props),
-                Source::Phi { block: inner, args: inner_args } if depth > 0 => {
-                    self.constant_sampler_phi(site, *inner, inner_args, props, depth - 1)
-                }
-                _ => Err(WHY),
-            };
+            let k = if depth > 0 { self.sampler_choice(arg, choices, depth - 1) } else { Err(WHY) };
             self.cur = here;
-            incoming.push((h?, at));
+            incoming.push((k?, at));
         }
-        let join = self.block[block].ok_or(WHY)?;
-        let phi = self.s.m.phi(join, self.s.t.handle);
+        let join = self.block[*block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
     }
@@ -9154,6 +9157,50 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        // An immediate sampler a uniform branch picks among constants: the
+        // access once per sampler, then the result of the one picked.
+        let picked = match self.descriptors.get(&((b, i), true)).copied() {
+            Some(src @ Source::Phi { .. }) if constant_leaves(src) => {
+                let choices = sampler_choices(src);
+                (choices.len() > 1).then_some((src, choices))
+            }
+            _ => None,
+        };
+        let Some((src, choices)) = picked else {
+            return self.image_access(inst, b, i);
+        };
+        let which = self.sampler_choice(src, &choices, 8)?;
+        let mut results: Vec<Vec<Option<V>>> = Vec::new();
+        for k in 0..choices.len() {
+            self.sampler_pick = Some(k);
+            let r = self.image_access(inst, b, i);
+            self.sampler_pick = None;
+            r?;
+            results.push(
+                inst.writes
+                    .iter()
+                    .map(|w| match self.vals.get(&w.1) {
+                        Some(Val::I32(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        let c = self.cur;
+        for (n, w) in inst.writes.iter().enumerate() {
+            let Some(mut x) = results[0][n] else { continue };
+            for (k, r) in results.iter().enumerate().skip(1) {
+                let Some(y) = r[n] else { continue };
+                let kv = self.s.m.i32(k as u32);
+                let is = self.s.m.cmp(c, pred::EQ, which, kv);
+                x = self.s.m.select(c, is, y, x);
+            }
+            self.vals.insert(w.1, Val::I32(x));
+        }
+        Ok(())
+    }
+
+    fn image_access(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -11760,4 +11807,15 @@ mod tests {
 /// Whether every descriptor a choice of descriptors joins is built from constants.
 fn constant_leaves(src: &Source) -> bool {
     src.leaves().iter().all(|l| matches!(l, Source::Constant(_)))
+}
+
+/// The different constant descriptors a choice joins, in order.
+fn sampler_choices(src: &Source) -> Vec<Source> {
+    let mut out: Vec<Source> = Vec::new();
+    for l in src.leaves() {
+        if !out.contains(l) {
+            out.push(l.clone());
+        }
+    }
+    out
 }
