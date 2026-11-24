@@ -149,7 +149,11 @@ fn store_with(
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if std::fs::read(&path).ok().and_then(|b| decode(&b)).is_some() {
+        let bytes = std::fs::read(&path).ok();
+        if let Some(e) = bytes.as_deref().and_then(failure) {
+            return Err(e);
+        }
+        if bytes.as_deref().and_then(decode).is_some() {
             return Ok(if converter.ran.load(Ordering::Relaxed) {
                 Stored::Written
             } else {
@@ -191,9 +195,15 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let entry = match (self.translate)(&input[32..]) {
+            Ok(shader) => encode(&shader),
+            // A container this build cannot translate is kept as its
+            // error, so later runs do not translate it again (some take
+            // seconds to fail).
+            Err(e) => [FAILED.as_slice(), e.as_bytes()].concat(),
+        };
         self.translated.store(true, Ordering::Relaxed);
-        Ok(encode(&shader))
+        Ok(entry)
     }
 }
 
@@ -220,7 +230,13 @@ fn cached(
             }
             Err(e) => return Err(format!("{e:#}")),
         };
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let bytes = std::fs::read(&path).ok();
+        if let Some(e) = bytes.as_deref().and_then(failure) {
+            let counter = if converter.ran.load(Ordering::Relaxed) { &MISSES } else { &HITS };
+            counter.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+        if let Some(shader) = bytes.as_deref().and_then(decode) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -239,6 +255,14 @@ fn cached(
 
 // "VSH3": root UAVs (PR #294) joined the stride-table flag of "VSH2".
 const MAGIC: &[u8; 4] = b"VSH3";
+/// The start of an entry that keeps a translation's error (the rest).
+const FAILED: &[u8; 4] = b"VSHF";
+
+/// The error a failed translation's entry keeps.
+fn failure(bytes: &[u8]) -> Option<String> {
+    let rest = bytes.strip_prefix(FAILED.as_slice())?;
+    Some(String::from_utf8_lossy(rest).into_owned())
+}
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -445,9 +469,15 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        // Failures are stored with their error and not translated again.
+        let fails = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            fails.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("unsupported".to_owned())
+        };
+        assert_eq!(cached(&cache, &build, b"other", fail), Err("unsupported".to_owned()));
+        assert_eq!(cached(&cache, &build, b"other", fail), Err("unsupported".to_owned()));
+        assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -465,14 +495,15 @@ mod tests {
         // Another host's waves are another entry.
         let other = key(&[7; 32], Target { lanes_min: 32, lanes_max: 32 });
         assert_eq!(store_with(&cache, &other, container, ok), Ok(Stored::Written));
-        // A damaged entry is written again; failures are not stored.
+        // A damaged entry is written again; a failure is kept as its error.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(store_with(&cache, &build, container, ok), Ok(Stored::Written));
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(store_with(&cache, &build, b"other", fail).is_err());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        let never = |_: &[u8]| -> Result<HostShader, String> { panic!("translated again") };
+        assert_eq!(cached(&cache, &build, b"other", never), Err("unsupported".to_owned()));
     }
 
     #[test]
