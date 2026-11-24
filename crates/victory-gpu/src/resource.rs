@@ -852,6 +852,10 @@ impl Resource {
     fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
         self.host
             .get_or_init(|| {
+                let address = self.data() as u64;
+                if let Some(shared) = aliased(address, &self.desc) {
+                    return Some(shared);
+                }
                 let (state, clear) = self.made_with;
                 let clear = clear
                     .as_ref()
@@ -862,14 +866,79 @@ impl Resource {
                 let bytes = allocation_bytes(&texture);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
-                Some(std::sync::Arc::new(HostTexture {
+                let made = std::sync::Arc::new(HostTexture {
                     texture,
                     bytes,
                     state: state.into(),
-                }))
+                });
+                remember_alias(address, &made);
+                Some(made)
             })
             .as_ref()
     }
+}
+
+/// Host textures by the console address of their memory: titles place
+/// several resources over the same memory (a render target or UAV, and a
+/// view-only texture to sample what it holds). On the console they share
+/// the bytes; on the host each would get its own texture, and the
+/// view-only one would read the title's memory (zeros: the GPU wrote the
+/// other). A texture made later at the same address shares the host copy
+/// of an earlier one that can stand in for it (see [`aliased`]).
+#[cfg(windows)]
+static ALIASES: std::sync::Mutex<
+    std::collections::BTreeMap<u64, Vec<std::sync::Weak<HostTexture>>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+fn remember_alias(address: u64, made: &std::sync::Arc<HostTexture>) {
+    if address == 0 {
+        return;
+    }
+    let mut map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let list = map.entry(address).or_default();
+    list.retain(|w| w.strong_count() > 0);
+    list.push(std::sync::Arc::downgrade(made));
+}
+
+/// A live host texture at `address` that a texture described by `desc` can
+/// use as its own: the same dimension, size, array size and samples, at
+/// least its mips, the same format (or that format's typeless family, which
+/// views name the title's format of), and the render target, depth and
+/// unordered access uses it asks for.
+#[cfg(windows)]
+fn aliased(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTexture>> {
+    if address == 0 || desc.dimension == BUFFER {
+        return None;
+    }
+    if std::env::var_os("VICTORY_NO_ALIAS").is_some() {
+        return None;
+    }
+    const USES: i32 = 0x7; // render target, depth, unordered access
+    let own = pc_format(desc.format);
+    let mips = u32::from(desc.mip_levels).max(1).min(mip_count(desc));
+    let map = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = map.get(&address)?.iter().filter_map(|w| w.upgrade()).find(|h| {
+        // SAFETY: a live resource.
+        let d = unsafe { h.texture.GetDesc() };
+        d.Dimension.0 as u32 == desc.dimension
+            && d.Width == desc.width
+            && d.Height == desc.height
+            && d.DepthOrArraySize == desc.depth_or_array_size
+            && d.SampleDesc.Count == desc.sample_count.max(1)
+            && u32::from(d.MipLevels) >= mips
+            && (d.Format.0 as u32 == own || d.Format.0 as u32 == family(own))
+            && d.Flags.0 & USES & desc.flags as i32 == desc.flags as i32 & USES
+    })?;
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        width = desc.width,
+        height = desc.height,
+        format = desc.format,
+        "a texture placed over another's memory shares its host copy"
+    );
+    Some(shared)
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
