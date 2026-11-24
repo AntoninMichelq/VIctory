@@ -1839,6 +1839,9 @@ impl<'a> Tracer<'a> {
             return Ok(source);
         }
         let Term::Value(v) = lane else { unreachable!() };
+        if lane_debug() {
+            eprintln!("LANE fail joins={:?} words={}", joins.iter().map(|&b| if b == usize::MAX { String::from("sel") } else { format!("{:#x}", self.p.blocks[b].offset) }).collect::<Vec<_>>(), self.describe_words(words));
+        }
         let name = self.def(v).map(|i| i.name());
         let (what, junk) = match name {
             _ if self.inputs[v.0 as usize].is_some() => (
@@ -1880,6 +1883,29 @@ impl<'a> Tracer<'a> {
     /// does. When no path brings a descriptor, the join fails as the first
     /// path does; so does it when a path fails any other way (a loop, too
     /// many joins, a load this tracer cannot follow).
+    /// Debug text for per-lane words: each one's defining instruction
+    /// (block offset, index, name) or phi block.
+    fn describe_words(&self, words: &[Term]) -> String {
+        words
+            .iter()
+            .map(|w| match *w {
+                Term::Const(c) => format!("c{c:#x}"),
+                Term::Value(v) => {
+                    if let Some((b, i)) = self.phis[v.0 as usize] {
+                        format!("v{}=phi@{:#x}[{i}]", v.0, self.p.blocks[b].offset)
+                    } else if let Some((b, i)) = self.defs[v.0 as usize] {
+                        format!("v{}={}@{:#x}+{i}", v.0, self.inst((b, i)).name(), self.p.blocks[b].offset)
+                    } else if self.inputs[v.0 as usize].is_some() {
+                        format!("v{}=input", v.0)
+                    } else {
+                        format!("v{}=?", v.0)
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn lane_phi(&self, words: &[Term], joins: &mut Vec<usize>) -> Result<Option<Source>, Fail> {
         let hard = |what| Fail { what, junk: false };
         let phi_of = |w: &Term| match *w {
@@ -1946,6 +1972,9 @@ impl<'a> Tracer<'a> {
                 continue;
             }
             let unset = self.unset.borrow().len();
+            if lane_debug() {
+                eprintln!("LANE phi@{:#x} edge {j} from {:#x}: {}", self.p.blocks[block].offset, self.p.blocks[self.p.blocks[block].preds[j]].offset, self.describe_words(&edge));
+            }
             match self.lane_source(&edge, joins) {
                 Ok(source) => args.push(source),
                 Err(f) if f.junk => {
@@ -4056,4 +4085,11 @@ pub(crate) mod tests {
         let d = first_lane_only(&r);
         assert_eq!(paths(&r, &d.source), "[[L0 L32] N]");
     }
+}
+
+/// `VICTORY_LANE_DEBUG=1`: per-lane descriptor tracing prints the words it
+/// follows to standard error.
+fn lane_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LANE_DEBUG").is_ok_and(|v| v.trim() == "1"))
 }
