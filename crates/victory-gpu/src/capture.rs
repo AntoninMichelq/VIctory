@@ -74,29 +74,37 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
+/// `VICTORY_DUMP_FULL=1`: saved images keep every pixel and the alpha
+/// channel (to study packed targets), instead of half size RGB.
+fn full_dumps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DUMP_FULL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size (or whole,
+/// with alpha, under [`full_dumps`]).
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
-    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
+    let (step, channels) = if full_dumps() { (1, 4) } else { (2, 3) };
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
+    // Filter byte 0 per row, then RGB(A) of every pixel (or every other
+    // pixel of every other row).
+    let mut raw = Vec::with_capacity((w as usize * channels + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step as usize * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
-            if bgra {
-                raw.extend([p[2], p[1], p[0]]);
-            } else {
-                raw.extend_from_slice(p);
-            }
+            let p = &row[(step as usize * x).min(width as usize - 1) * 4..][..4];
+            let p = if bgra { [p[2], p[1], p[0], p[3]] } else { [p[0], p[1], p[2], p[3]] };
+            raw.extend_from_slice(&p[..channels]);
         }
     }
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
     header.extend(h.to_be_bytes());
-    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
+    // 8-bit RGB, or RGBA.
+    header.extend([8, if channels == 4 { 6 } else { 2 }, 0, 0, 0]);
     chunk(&mut png, b"IHDR", &header);
     chunk(
         &mut png,
@@ -389,7 +397,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
-                    out.extend([p[0], p[1], p[2], 255]);
+                    out.extend([p[0], p[1], p[2], if full_dumps() { p[3] } else { 255 }]);
                 }
             }
             return Some(out);
@@ -399,7 +407,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
-                    out.extend([p[2], p[1], p[0], 255]);
+                    out.extend([p[2], p[1], p[0], if full_dumps() { p[3] } else { 255 }]);
                 }
             }
             return Some(out);
