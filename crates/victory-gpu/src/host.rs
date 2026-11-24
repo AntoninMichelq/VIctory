@@ -1035,6 +1035,12 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Per host copy, the longest range refreshed since the last title copy
+    /// (address, end): a range inside it is not refreshed again. Root SRVs
+    /// and UAVs have no size and refresh to their buffer's end, each from
+    /// its own address; without this every such bind queried the write
+    /// watch of the rest of the buffer again (the world's heap is 174 MB).
+    refreshed_spans: std::collections::HashMap<usize, (usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1951,6 +1957,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.refreshed_spans.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1971,8 +1978,23 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
+        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address.saturating_add(len);
+        match deferred.refreshed_spans.entry(copy) {
+            std::collections::hash_map::Entry::Occupied(mut span) => {
+                let (from, to) = *span.get();
+                if from <= address && end <= to {
+                    return;
+                }
+                if len > to - from {
+                    span.insert((address, end));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(span) => {
+                span.insert((address, end));
+            }
+        }
+        if deferred.refreshed.insert((copy, address, len)) {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -2146,8 +2168,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.refreshed_spans.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

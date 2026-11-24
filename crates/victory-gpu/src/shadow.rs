@@ -172,6 +172,13 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_u32(&self, offset: usize) -> u32 {
+        assert!(offset + 4 <= self.len as usize);
+        // SAFETY: `offset..offset + 4` lies within the mapped host buffer.
+        unsafe { self.data.add(offset).cast::<u32>().read_unaligned() }
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -522,6 +529,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// for its bytes twice, and the GPU's writes land in one copy), else of
 /// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address < 0x10000 {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let holding: Vec<((u64, usize), bool)> = map
@@ -579,7 +589,8 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let end = end.max(address.saturating_add(64 << 10));
+    let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
@@ -591,6 +602,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .map(|(_, shadow)| shadow.clone())
     {
         return Some(shadow);
+    }
+    if !crate::texture::committed(address as *const u8, 1) {
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
