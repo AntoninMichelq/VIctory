@@ -704,6 +704,9 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        if super::fold_branches() {
+            self.m.fold_constant_branches();
+        }
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());

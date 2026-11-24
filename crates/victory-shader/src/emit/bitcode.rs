@@ -604,6 +604,115 @@ impl Module {
         live
     }
 
+    /// Branches on a constant condition become jumps, and the blocks no
+    /// longer reachable (with their phis' entries) are left out. The
+    /// console's long scalar programs test many conditions known when
+    /// translated (carries of address sums, say): in one 74k-instruction
+    /// lighting program, 8,745 of 10,016 conditional branches; with them,
+    /// 22k blocks the driver's compiler never finished structuring.
+    /// Nothing changes if a reachable instruction reads a value of a block
+    /// left out.
+    pub fn fold_constant_branches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let terms: Vec<Option<Term>> = self.blocks.iter().map(|b| b.term).collect();
+        let mut folded = false;
+        let consts = &self.consts;
+        for b in &mut self.blocks {
+            if let Some(Term::CondBr(V::Const(c), t, f)) = b.term
+                && let Const::Int(k) = consts[c as usize].1
+            {
+                b.term = Some(Term::Br(if k != 0 { t } else { f }));
+                folded = true;
+            }
+        }
+        if !folded {
+            return;
+        }
+        let mut reach = vec![false; n];
+        let mut stack = vec![0usize];
+        reach[0] = true;
+        while let Some(b) = stack.pop() {
+            for &s in successors(self.blocks[b].term).iter() {
+                if !reach[s] {
+                    reach[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        // The block of each instruction.
+        let mut home = vec![usize::MAX; self.insts.len()];
+        for (k, b) in self.blocks.iter().enumerate() {
+            for &i in b.phis.iter().chain(&b.body) {
+                home[i as usize] = k;
+            }
+        }
+        let dead = |v: V| matches!(v, V::Inst(i) if home[i as usize] != usize::MAX && !reach[home[i as usize]]);
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (k, b) in self.blocks.iter().enumerate() {
+            if reach[k] {
+                for &s in successors(b.term).iter() {
+                    preds[s].push(k);
+                }
+            }
+        }
+        let mut bad = false;
+        for (k, b) in self.blocks.iter().enumerate() {
+            if !reach[k] {
+                continue;
+            }
+            if let Some(Term::CondBr(c, ..)) = b.term
+                && dead(c)
+            {
+                bad = true;
+            }
+            for &i in &b.body {
+                for_each_operand(&self.insts[i as usize].op, |v| bad |= dead(v));
+            }
+            for &i in &b.phis {
+                if let Op::Phi(inc) = &self.insts[i as usize].op {
+                    for &(v, from) in inc {
+                        if preds[k].contains(&from) && dead(v) {
+                            bad = true;
+                        }
+                    }
+                }
+            }
+        }
+        if bad {
+            for (b, t) in self.blocks.iter_mut().zip(terms) {
+                b.term = t;
+            }
+            return;
+        }
+        for k in 0..n {
+            if !reach[k] {
+                continue;
+            }
+            for &i in &self.blocks[k].phis {
+                if let Op::Phi(inc) = &mut self.insts[i as usize].op {
+                    // One entry per edge left.
+                    let mut left = preds[k].clone();
+                    inc.retain(|&(_, from)| match left.iter().position(|&p| p == from) {
+                        Some(at) => {
+                            left.swap_remove(at);
+                            true
+                        }
+                        None => false,
+                    });
+                }
+            }
+        }
+        for k in 0..n {
+            if !reach[k] {
+                self.blocks[k].phis.clear();
+                self.blocks[k].body.clear();
+            }
+        }
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -1256,6 +1365,49 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn constant_branches_fold_and_drop_their_dead_blocks() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (b0, b1, b2, b3) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let x = m.i32(1);
+        let y = m.bin(b2, Bin::Add, x, x);
+        let t = m.bool(true);
+        m.terminate(b0, Term::CondBr(t, b1, b2));
+        m.terminate(b1, Term::Br(b3));
+        m.terminate(b2, Term::Br(b3));
+        let phi = m.phi(b3, i32t);
+        m.set_phi(phi, vec![(x, b1), (y, b2)]);
+        let z = m.bin(b3, Bin::Add, phi, x);
+        let _ = z;
+        m.terminate(b3, Term::Ret);
+        m.fold_constant_branches();
+        assert!(matches!(m.blocks[b0].term, Some(Term::Br(b)) if b == b1));
+        assert!(m.blocks[b2].body.is_empty());
+        let V::Inst(p) = phi else { unreachable!() };
+        assert!(matches!(&m.insts[p as usize].op, Op::Phi(inc) if inc == &vec![(x, b1)]));
+        let _ = m.write();
+    }
+
+    #[test]
+    fn a_fold_that_would_leave_a_dead_value_in_use_is_undone() {
+        // b2's value is read in b3 without a phi (not valid SSA once b2
+        // is dead): nothing is folded.
+        let mut m = Module::default();
+        let (b0, b1, b2, b3) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let x = m.i32(1);
+        let y = m.bin(b2, Bin::Add, x, x);
+        let f = m.bool(false);
+        m.terminate(b0, Term::CondBr(f, b2, b1));
+        m.terminate(b1, Term::Br(b3));
+        m.terminate(b2, Term::Br(b3));
+        m.bin(b3, Bin::Add, y, x);
+        m.terminate(b3, Term::Ret);
+        m.fold_constant_branches();
+        assert!(matches!(m.blocks[b0].term, Some(Term::CondBr(..))));
+        assert_eq!(m.blocks[b2].body.len(), 1);
     }
 
     #[test]
