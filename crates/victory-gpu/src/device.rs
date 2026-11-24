@@ -388,6 +388,40 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // The blobs the description names, as files (`pipeline-x` in the
+        // cache directory, the first calls only), to write the two methods
+        // from: every `(pointer, length)` pair among its words, and the
+        // blob the object in its first word holds.
+        #[cfg(windows)]
+        if calls <= 12
+            && let Some(dir) = std::env::var_os("VICTORY_CACHE_DIR")
+            && let Some(w) = &description
+        {
+            let dir = std::path::Path::new(&dir).join("pipeline-x");
+            let _ = std::fs::create_dir_all(&dir);
+            let save = |name: String, at: u64, len: u64| {
+                let mut bytes = vec![0u8; len as usize];
+                if crate::host::read_into(at as *const u8, &mut bytes) {
+                    let _ = std::fs::write(dir.join(name), &bytes);
+                }
+            };
+            let mut head = [0u8; 256];
+            if crate::host::read_into(desc, &mut head) {
+                let _ = std::fs::write(dir.join(format!("{:x}-{calls:02}-desc.bin", SLOT)), head);
+            }
+            for k in 1..15 {
+                let (at, len) = (w[k], w[k + 1]);
+                if at > 0x1_0000 && (1..=0x10_0000).contains(&len) {
+                    save(format!("{:x}-{calls:02}-word{k:02}.bin", SLOT), at, len);
+                }
+            }
+            if let Some(f) = &first
+                && f[2] == f[4]
+                && (1..=0x10_0000).contains(&f[2])
+            {
+                save(format!("{:x}-{calls:02}-object.bin", SLOT), f[3], f[2]);
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
