@@ -10,8 +10,9 @@
 //! shaded by a light from above and to the right, with normals taken from
 //! the depth (as reversed depth unless `<reversed>` is 0), and outlined
 //! where the depth jumps. An integer texture (R8/R16/R32_UINT, a material
-//! ID target say) is coloured from a palette, one muted colour per ID, ID
-//! 0 black. Frames without such a texture present as usual.
+//! ID target say) is coloured from a palette, one colour per ID (the
+//! most common ID around each pixel), ID 0 black. `<n>` = `busiest` picks
+//! the matching texture the frame binds most often. Frames without such a texture present as usual.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -59,12 +60,33 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint2 at = uint2(id.x * AW / W, id.y * AH / H);
     float3 colour;
     if (Palette != 0) {
-        // A material ID: a muted colour of its own (0, the sky or nothing,
-        // stays black).
-        uint m = Ids.Load(int3(at, 0));
-        uint hash = m * 2654435761u;
-        float3 hue = float3(hash & 255, (hash >> 8) & 255, (hash >> 16) & 255) / 255.0;
-        colour = m == 0 ? float3(0, 0, 0) : 0.3 + 0.5 * hue;
+        // A material ID: a colour of its own (0, the sky or nothing, stays
+        // black). The most common ID of the 3x3 around the pixel, so IDs
+        // that speckle per pixel read as one surface.
+        uint ids[9];
+        int k = 0;
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                int2 q = clamp(int2(at) + int2(x, y), int2(0, 0), int2(AW - 1, AH - 1));
+                ids[k++] = Ids.Load(int3(q, 0));
+            }
+        }
+        uint m = ids[4];
+        int best = 0;
+        for (int i = 0; i < 9; i++) {
+            int n = 0;
+            for (int j = 0; j < 9; j++) {
+                n += ids[i] == ids[j] ? 1 : 0;
+            }
+            if (n > best) {
+                best = n;
+                m = ids[i];
+            }
+        }
+        // A hue from the ID, fairly saturated.
+        float h = frac((float)((m * 2654435761u) >> 8) / 16777216.0);
+        float3 hue = saturate(abs(frac(h + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+        colour = m == 0 ? float3(0, 0, 0) : 0.75 * lerp(float3(1, 1, 1), hue, 0.65);
     } else {
         colour = Albedo.Load(int3(at, 0)).rgb;
     }
