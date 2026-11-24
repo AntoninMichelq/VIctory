@@ -816,6 +816,62 @@ fn mask_sccs(st: &Structured, p: &crate::ir::Program) -> HashMap<Value, Value> {
     out
 }
 
+/// Whether SCC value `scc`, which an operation writing EXEC sets when some
+/// lane of the new EXEC is set (`saveexec`, `wrexec`), is known clear in
+/// IR block `at`: its block ends with `s_cbranch_execz`/`execnz` on that
+/// EXEC, and `at` is reached only through the no-lane edge (the other
+/// edge's paths come back through the block first). A waterfall loop's
+/// exit reads its last iteration's SCC this way; the mask itself then
+/// holds lanes that already left, which no ballot there can see.
+fn exec_scc_clear(p: &Program, scc: Value, at: usize) -> bool {
+    let Some(w) = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.iter().any(|i| i.write(Reg::Scc) == Some(scc)))
+    else {
+        return false;
+    };
+    let insts = &p.blocks[w].insts;
+    let k = insts
+        .iter()
+        .position(|i| i.write(Reg::Scc) == Some(scc))
+        .expect("found");
+    let Some(e) = insts[k].write(Reg::S(EXEC)) else {
+        return false;
+    };
+    let (Some(last), Exit::Branch { taken, not_taken }) = (insts.last(), p.blocks[w].exit) else {
+        return false;
+    };
+    if last.read(Reg::S(EXEC)) != Some(e) || at == w {
+        return false;
+    }
+    let lanes = match last.name() {
+        "s_cbranch_execz" => not_taken,
+        "s_cbranch_execnz" => taken,
+        _ => return false,
+    };
+    // Some lane left: the block's other successor must not reach `at`
+    // without running the block again.
+    let mut seen = vec![false; p.blocks.len()];
+    let mut work = vec![lanes];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); p.blocks.len()];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for &q in &block.preds {
+            succs[q].push(b);
+        }
+    }
+    while let Some(b) = work.pop() {
+        if b == at {
+            return false;
+        }
+        if b == w || std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        work.extend(succs[b].iter().copied());
+    }
+    true
+}
+
 /// Whether `inst` gives each lane what it would under any EXEC: scalar
 /// code and loads that do not touch EXEC, and vector code that reads no
 /// other lane (no DPP, permutes or lane reads and writes).
@@ -2593,6 +2649,11 @@ impl<'a> Lower<'a> {
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
+            }
+            Some(&Val::Missing(_))
+                if self.mask_scc.contains_key(&v) && exec_scc_clear(self.x.p, v, self.cur_ir) =>
+            {
+                return Ok(Val::Bit(self.s.m.bool(false)));
             }
             Some(&Val::Missing(_)) if self.mask_ok && self.mask_scc.contains_key(&v) => {
                 let lo = self.mask_scc[&v];
@@ -15136,6 +15197,25 @@ mod tests {
             "expected high ballot half to be used by s_bcnt1_i32_b32, s_ff1_i32_b32, v_mbcnt_lo_u32_b32, and s_cmp_eq_u32 (>= 4 uses), got {}",
             l.s.m.uses_of(hi)
         );
+    }
+
+    #[test]
+    fn an_empty_waterfalls_exit_reads_its_scc_clear() {
+        // The skinning blend-shape programs' form: a waterfall without a
+        // body, then SCC (its last `s_andn2_wrexec`: no lane left) picks EXEC.
+        let body = [
+            0xBE83_037E, // s_mov_b32 s3, exec_lo
+            0xBE9C_037E, // s_mov_b32 s28, exec_lo
+            0x7E3A_0501, // v_readfirstlane_b32 s29, v1
+            0x7DA4_021D, // v_cmpx_eq_u32 exec_lo, s29, v1
+            0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+            0xBF89_FFFC, // s_cbranch_execnz -4
+            0xBEFE_0303, // s_mov_b32 exec_lo, s3
+            0x8506_807E, // s_cselect_b32 s6, exec_lo, 0
+            0xD501_0000,
+            0x0019_0280, // v_cndmask_b32 v0, 0, 1, s6
+        ];
+        lowers_valu(&body).unwrap();
     }
 
     /// Lowers a one-thread compute program that copies four root constants
