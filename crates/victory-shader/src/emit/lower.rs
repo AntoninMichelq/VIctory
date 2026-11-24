@@ -2159,8 +2159,16 @@ impl<'a> Lower<'a> {
                 Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
                     continue;
                 }
-                Reg::S(_) => match io_inputs.get(&v) {
+                Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // Above the SGPRs the hardware initializes, a register
+                    // holds what the last wave left, so no program depends
+                    // on it: a read the paths only seem to allow (a branch
+                    // past the write, taken only with one past the read)
+                    // reads zero, as VGPRs do.
+                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -2873,6 +2881,25 @@ impl<'a> Lower<'a> {
             op,
             &[a, b],
         )
+    }
+
+    /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
+    /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
+    /// the compare and select DXIL specifies gives either zero.
+    fn max_min(&mut self, max: bool, a: V, b: V) -> V {
+        let c = self.cur;
+        let r = self.binary(if max { 35 } else { 36 }, a, b);
+        let (ia, ib) = (self.as_int(a), self.as_int(b));
+        let either = self.s.m.bin(c, Bin::Or, ia, ib);
+        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+        let either = self.s.m.bin(c, Bin::And, either, magnitude);
+        let zero = self.s.m.i32(0);
+        let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
+        // Of two zeros, +0 unless both are -0 (max), -0 unless neither (min).
+        let op = if max { Bin::And } else { Bin::Or };
+        let sign = self.s.m.bin(c, op, ia, ib);
+        let signed = self.as_float(sign);
+        self.s.m.select(c, zeros, signed, r)
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
@@ -7053,8 +7080,8 @@ impl<'a> Lower<'a> {
                     "v_subrev_f32" => self.s.m.bin(c, Bin::Sub, bb, a),
                     "v_mul_f32" => self.s.m.bin(c, Bin::Mul, a, bb),
                     "v_mul_legacy_f32" => self.legacy_mul(a, bb),
-                    "v_max_f32" => self.binary(35, a, bb),
-                    _ => self.binary(36, a, bb),
+                    "v_max_f32" => self.max_min(true, a, bb),
+                    _ => self.max_min(false, a, bb),
                 };
                 float(self, r)
             }
@@ -7248,12 +7275,12 @@ impl<'a> Lower<'a> {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = match name {
                     "v_max3_f32" => {
-                        let t = self.binary(35, a, bb);
-                        self.binary(35, t, cc)
+                        let t = self.max_min(true, a, bb);
+                        self.max_min(true, t, cc)
                     }
                     "v_min3_f32" => {
-                        let t = self.binary(36, a, bb);
-                        self.binary(36, t, cc)
+                        let t = self.max_min(false, a, bb);
+                        self.max_min(false, t, cc)
                     }
                     _ => self.med3(a, bb, cc),
                 };
@@ -7935,6 +7962,8 @@ impl<'a> Lower<'a> {
             "v_min_i16",
             "v_cvt_u16_f16",
             "v_cvt_i16_f16",
+            "v_cvt_norm_i16_f16",
+            "v_cvt_norm_u16_f16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -7987,8 +8016,8 @@ impl<'a> Lower<'a> {
                 "v_sub_f16" => self.s.m.bin(c, Bin::Sub, a, b),
                 "v_subrev_f16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_f16" => self.s.m.bin(c, Bin::Mul, a, b),
-                "v_max_f16" => self.binary(35, a, b),
-                _ => self.binary(36, a, b),
+                "v_max_f16" => self.max_min(true, a, b),
+                _ => self.max_min(false, a, b),
             };
             return float_result(self, r);
         }
@@ -8018,12 +8047,12 @@ impl<'a> Lower<'a> {
                 // product is exact; the sum rounds twice).
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
-                    let t = self.binary(35, a, b);
-                    self.binary(35, t, acc)
+                    let t = self.max_min(true, a, b);
+                    self.max_min(true, t, acc)
                 }
                 "v_min3_f16" => {
-                    let t = self.binary(36, a, b);
-                    self.binary(36, t, acc)
+                    let t = self.max_min(false, a, b);
+                    self.max_min(false, t, acc)
                 }
                 _ => self.med3(a, b, acc),
             };
@@ -8073,6 +8102,13 @@ impl<'a> Lower<'a> {
             };
             return float_result(self, r);
         }
+        if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
+            return self.write_half(inst, r, guard);
+        }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         let saturates = matches!(name, "v_mad_i16" | "v_mad_u16");
         if v.clamp && !saturates || v.omod != 0 || v.abs != 0 || v.neg != 0 {
@@ -8080,15 +8116,22 @@ impl<'a> Lower<'a> {
         }
         let r = match name {
             "v_cvt_u16_f16" | "v_cvt_i16_f16" => {
-                // shortcut: converted through 32 bits, so out-of-range values
-                // wrap instead of saturating at 16 bits.
+                // Toward zero, saturating at the 16-bit range (infinities
+                // included); NaN gives 0. Clamped in f32 first, where every
+                // f16 is exact, so the conversion never leaves i32's range.
                 let a = self.half_fsrc(inst, 0)?;
-                let op = if name == "v_cvt_u16_f16" {
-                    Cast::FpToUi
+                let (lo, hi) = if name == "v_cvt_u16_f16" {
+                    (0.0f32, 65535.0f32)
                 } else {
-                    Cast::FpToSi
+                    (-32768.0, 32767.0)
                 };
-                self.s.m.cast(c, op, a, i32t)
+                let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
+                let t = self.binary(35, a, lo);
+                let t = self.binary(36, t, hi);
+                let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
+                let nan = self.s.m.cmp(c, pred::UNO, a, a);
+                let z = self.s.m.i32(0);
+                self.s.m.select(c, nan, z, r)
             }
             _ => {
                 let signed = name.ends_with("_i16");
@@ -8146,10 +8189,83 @@ impl<'a> Lower<'a> {
         self.write_half(inst, r, guard)
     }
 
+    /// `v_cvt_norm_i16_f16` / `v_cvt_norm_u16_f16`: the f16 source (with its
+    /// abs/neg modifiers) clamped to [-1, 1] or [0, 1], times 32767 or 65535,
+    /// rounded to nearest even once from the exact product; NaN gives 0.
+    /// Worked on the f16's bits in integers, because in f32 the product
+    /// (up to 26 significant bits) would round before the rounding to an
+    /// integer.
+    fn cvt_norm16(&mut self, inst: &Inst, signed: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let mut h = self.half_src(inst, 0)?;
+        if v.abs & 1 != 0 {
+            let m = k(self, 0x7FFF);
+            h = self.s.m.bin(c, Bin::And, h, m);
+        }
+        if v.neg & 1 != 0 {
+            let m = k(self, 0x8000);
+            h = self.s.m.bin(c, Bin::Xor, h, m);
+        }
+        let scale = if signed { 0x7FFF } else { 0xFFFF };
+        let (k0, k1, k10) = (k(self, 0), k(self, 1), k(self, 10));
+        let mag_mask = k(self, 0x7FFF);
+        let mag = self.s.m.bin(c, Bin::And, h, mag_mask);
+        let k15 = k(self, 15);
+        let neg = self.s.m.bin(c, Bin::LShr, h, k15);
+        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
+        // |x| < 1: x = m * 2^-s with m < 2^11 and 11 <= s <= 24.
+        let exp = self.s.m.bin(c, Bin::LShr, mag, k10);
+        let man_mask = k(self, 0x3FF);
+        let man = self.s.m.bin(c, Bin::And, mag, man_mask);
+        let implicit = k(self, 0x400);
+        let normal = self.s.m.bin(c, Bin::Or, man, implicit);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, k0);
+        let m = self.s.m.select(c, sub, man, normal);
+        let k25 = k(self, 25);
+        let s_norm = self.s.m.bin(c, Bin::Sub, k25, exp);
+        let k24 = k(self, 24);
+        let sh = self.s.m.select(c, sub, k24, s_norm);
+        let ks = k(self, scale);
+        let p = self.s.m.bin(c, Bin::Mul, m, ks);
+        let q = self.s.m.bin(c, Bin::LShr, p, sh);
+        let one_s = self.s.m.bin(c, Bin::Shl, k1, sh);
+        let low_mask = self.s.m.bin(c, Bin::Sub, one_s, k1);
+        let rem = self.s.m.bin(c, Bin::And, p, low_mask);
+        let half = self.s.m.bin(c, Bin::LShr, one_s, k1);
+        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+        let odd = self.s.m.bin(c, Bin::And, q, k1);
+        let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let r = self.s.m.select(c, up, k1, k0);
+        let r = self.s.m.bin(c, Bin::Add, q, r);
+        // |x| >= 1 (and infinity) saturates; NaN gives 0.
+        let one_h = k(self, 0x3C00);
+        let big = self.s.m.cmp(c, pred::IUGE, mag, one_h);
+        let r = self.s.m.select(c, big, ks, r);
+        let inf = k(self, 0x7C00);
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+        let r = self.s.m.select(c, nan, k0, r);
+        let r = if signed {
+            let n = self.s.m.bin(c, Bin::Sub, k0, r);
+            self.s.m.select(c, neg, n, r)
+        } else {
+            self.s.m.select(c, neg, k0, r)
+        };
+        let m16 = k(self, 0xFFFF);
+        Ok(self.s.m.bin(c, Bin::And, r, m16))
+    }
+
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
-    /// half the high result reads. Inline float constants are f16 values.
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+    /// half the high result reads. Packed integer instructions see the f32
+    /// bits of an inline float constant.
+    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8157,7 +8273,8 @@ impl<'a> Lower<'a> {
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
         let x = match (!sel).then(|| self.low_half_of(inst, &op)).flatten() {
             Some(x) => x,
-            None => self.f16_operand(inst, &op)?,
+            None if float => self.f16_operand(inst, &op)?,
+            None => self.operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if sel {
@@ -8193,7 +8310,7 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high)?;
+                let h = self.packed_src(inst, k, high, float)?;
                 if float {
                     let mut f = self
                         .s
@@ -8212,8 +8329,8 @@ impl<'a> Lower<'a> {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
-                    "min_f16" => self.binary(36, xs[0], xs[1]),
-                    "max_f16" => self.binary(35, xs[0], xs[1]),
+                    "min_f16" => self.max_min(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min(true, xs[0], xs[1]),
                     // shortcut: FMad in f32, as v_fma_f16.
                     _ => self.fmad(xs[0], xs[1], xs[2]),
                 };
@@ -8705,24 +8822,22 @@ impl<'a> Lower<'a> {
                     _ => {
                         // A computed selector: each byte picked at run time.
                         let (a, b, sv) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                        let i64t = self.s.m.int(64);
-                        self.s.flags |= flags::INT64;
-                        let wa = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                        let wb = self.s.m.cast(c, Cast::ZExt, b, i64t);
-                        let k32 = self.s.m.int_const(i64t, 32);
-                        let wa = self.s.m.bin(c, Bin::Shl, wa, k32);
-                        let both = self.s.m.bin(c, Bin::Or, wa, wb);
                         let mut r = k(self, 0);
                         for i in 0..4u32 {
                             let (sh, ff) = (k(self, 8 * i), k(self, 0xFF));
                             let sel = self.s.m.bin(c, Bin::LShr, sv, sh);
                             let sel = self.s.m.bin(c, Bin::And, sel, ff);
-                            // Bytes 0-7 of {src0, src1}.
-                            let k3 = k(self, 3);
-                            let bits = self.s.m.bin(c, Bin::Shl, sel, k3);
-                            let bits = self.s.m.cast(c, Cast::ZExt, bits, i64t);
-                            let x = self.s.m.bin(c, Bin::LShr, both, bits);
-                            let x = self.s.m.cast(c, Cast::Trunc, x, self.s.t.i32);
+                            // Select a dword and a byte within it.
+                            // Later selects handle codes 8 and above.
+                            let four = k(self, 4);
+                            let zero = k(self, 0);
+                            let high = self.s.m.bin(c, Bin::And, sel, four);
+                            let high = self.s.m.cmp(c, pred::NE, high, zero);
+                            let word = self.s.m.select(c, high, a, b);
+                            let three = k(self, 3);
+                            let index = self.s.m.bin(c, Bin::And, sel, three);
+                            let bits = self.s.m.bin(c, Bin::Shl, index, three);
+                            let x = self.s.m.bin(c, Bin::LShr, word, bits);
                             let mut byte = self.s.m.bin(c, Bin::And, x, ff);
                             // 8-11: the sign of bytes 1, 3 of src1, then of src0.
                             for (n, src, bit) in [(8, b, 15), (9, b, 31), (10, a, 15), (11, a, 31)]
@@ -9042,6 +9157,13 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, Bin::Xor, n, yes)
                     }
                     "neq" | "nge" | "nle" if same_src => is_nan(self, a),
+                    // Ordered and not equal, false for a NaN, as `olt | ogt`:
+                    // the AMD D3D12 driver runs `fcmp one` as unordered.
+                    "lg" => {
+                        let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                        let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                        self.s.m.bin(c, Bin::Or, lt, gt)
+                    }
                     _ => {
                         let p = match op {
                             "f" => pred::FALSE,
@@ -11960,6 +12082,20 @@ impl<'a> Lower<'a> {
     fn fill_phis(&mut self) -> Result<(), Stop> {
         self.fill_paths().map_err(|w| unsupported(0, w))?;
         let p = self.x.p;
+        // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
+        // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
+        // lowering accepts what it refuses when the same value is read directly.
+        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            for &arg in &p.blocks[b].phis[i].args {
+                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                    work.push(arg);
+                }
+            }
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -12318,8 +12454,25 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        // The layout's user SGPRs (at least two), 512 bytes of LDS.
+        lower_rsrc2(words, layout, used, wave64, 1 << 15 | sgprs.max(2) << 1)
+    }
+
+    /// Lowers a compute program of constants with these input registers
+    /// (`COMPUTE_PGM_RSRC2`): whether it translates.
+    fn lowers_rsrc2(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_rsrc2(words, vec![], vec![], false, rsrc2).map(|_| ())
+    }
+
+    fn lower_rsrc2(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        rsrc2: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64,
@@ -12327,8 +12480,7 @@ mod tests {
             layout,
             used,
             io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                rsrc2,
                 threads: [1, 1, 1],
             }),
             code,
@@ -12874,7 +13026,7 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lowers_rsrc2(&words, 0).unwrap();
         }
     }
 
@@ -12968,7 +13120,7 @@ mod tests {
         ];
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers_rsrc2(&words, 0).unwrap();
         }
     }
 
@@ -13569,6 +13721,35 @@ mod tests {
             ),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future timestamp support works in both cases.
+        let refusal = |code: &[u32]| match lowers_rsrc2(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers_rsrc2(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]
