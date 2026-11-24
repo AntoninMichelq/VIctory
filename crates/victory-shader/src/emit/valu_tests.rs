@@ -1264,3 +1264,49 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f): v1 low, v2 high dword.
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let tie = 1.0 + 2f64.powi(-24);
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        0.1,
+        std::f64::consts::PI,
+        tie,
+        tie + 2f64.powi(-40),
+        1.0 + 3.0 * 2f64.powi(-24),
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * (1.0 + 2f64.powi(-25)),
+        1e40,
+        -1e40,
+        1e-50,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from(f32::MIN_POSITIVE),
+        123_456_789.123,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .map(|x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .chain(std::iter::once([0, 0x7FF8_0000, 0, 0]))
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let Some(&x) = values.get(i) else {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: NaN gave {got:#010x}");
+            return;
+        };
+        let mut want = (x as f32).to_bits();
+        if (x as f32).is_subnormal() || (x != 0.0 && x as f32 == 0.0) {
+            want &= 0x8000_0000;
+        }
+        assert_eq!(got, want, "{backend}: v_cvt_f32_f64({x:e}) = {got:#010x}, want {want:#010x}");
+    });
+}

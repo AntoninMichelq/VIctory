@@ -7208,6 +7208,61 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double narrowed to a float in 32-bit integer steps (no
+                // 64-bit float type in the module): rounded to nearest even,
+                // overflow to infinity, results below the float range (and
+                // double denormals) to a signed zero, NaN stays NaN.
+                let (lo, hi) = self.src_pair(inst, 0)?;
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let sign_bit = k(self, 0x8000_0000);
+                let mut sign = self.s.m.bin(c, Bin::And, hi, sign_bit);
+                if v.abs & 1 != 0 {
+                    sign = k(self, 0);
+                }
+                if v.neg & 1 != 0 {
+                    sign = self.s.m.bin(c, Bin::Xor, sign, sign_bit);
+                }
+                let (k20, k7ff, kfffff) = (k(self, 20), k(self, 0x7ff), k(self, 0xf_ffff));
+                let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let e = self.s.m.bin(c, Bin::And, e, k7ff);
+                let mhi = self.s.m.bin(c, Bin::And, hi, kfffff);
+                let (k3, k29) = (k(self, 3), k(self, 29));
+                let top = self.s.m.bin(c, Bin::Shl, mhi, k3);
+                let low = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let m23 = self.s.m.bin(c, Bin::Or, top, low);
+                let krem = k(self, 0x1fff_ffff);
+                let rem = self.s.m.bin(c, Bin::And, lo, krem);
+                let half = k(self, 0x1000_0000);
+                let (zero, one) = (k(self, 0), k(self, 1));
+                let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+                let odd = self.s.m.bin(c, Bin::And, m23, one);
+                let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+                let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_odd);
+                let up = self.s.m.select(c, up, one, zero);
+                let bias = k(self, 896);
+                let fe = self.s.m.bin(c, Bin::Sub, e, bias);
+                let k23 = k(self, 23);
+                let normal = self.s.m.bin(c, Bin::Shl, fe, k23);
+                let normal = self.s.m.bin(c, Bin::Add, normal, m23);
+                let normal = self.s.m.bin(c, Bin::Add, normal, up);
+                let (inf, nan) = (k(self, 0x7f80_0000), k(self, 0x7fc0_0000));
+                let any = self.s.m.bin(c, Bin::Or, mhi, lo);
+                let any = self.s.m.cmp(c, pred::NE, any, zero);
+                let special = self.s.m.cmp(c, pred::EQ, e, k7ff);
+                let k254 = k(self, 254);
+                let big = self.s.m.cmp(c, pred::SGT, fe, k254);
+                let small = self.s.m.cmp(c, pred::SLT, fe, one);
+                let mag = self.s.m.select(c, small, zero, normal);
+                let mag = self.s.m.select(c, big, inf, mag);
+                let nonfinite = self.s.m.select(c, any, nan, inf);
+                let mag = self.s.m.select(c, special, nonfinite, mag);
+                let r = self.s.m.bin(c, Bin::Or, sign, mag);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -7620,6 +7675,42 @@ impl<'a> Lower<'a> {
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
+        }
+    }
+
+    /// The low and high dwords of 64-bit source `k` (a register pair, an
+    /// inline integer sign-extended, an inline float as its double, or a
+    /// literal as the high dword), without modifiers.
+    fn src_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let consts = |l: &mut Self, x: u64| (l.s.m.i32(x as u32), l.s.m.i32((x >> 32) as u32));
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                Ok(consts(self, i64::from(x as i32) as u64))
+            }
+            Operand::Const(k @ 240..=247) => {
+                let x = [0.5f64, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][usize::from(k - 240)];
+                Ok(consts(self, x.to_bits()))
+            }
+            Operand::Const(248) => Ok(consts(self, (1.0f64 / (2.0 * std::f64::consts::PI)).to_bits())),
+            Operand::Literal(x) => Ok(consts(self, u64::from(x) << 32)),
+            _ => Err("a 64-bit operand"),
         }
     }
 
