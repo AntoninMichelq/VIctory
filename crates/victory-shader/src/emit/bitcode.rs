@@ -247,6 +247,23 @@ impl Module {
         self.types[t.0 as usize] == TypeDef::Void
     }
 
+    /// Test builds: `v` as a short expression (integer constants, binary
+    /// operations, `?` for anything else).
+    #[cfg(test)]
+    pub(crate) fn show(&self, v: V) -> String {
+        match v {
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Int(x) => x.to_string(),
+                _ => "?".into(),
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Bin(op, a, b) => format!("({} {op:?} {})", self.show(*a), self.show(*b)),
+                _ => "?".into(),
+            },
+            _ => "?".into(),
+        }
+    }
+
     fn constant(&mut self, ty: Ty, c: Const) -> V {
         if let Some(&i) = self.const_ids.get(&(ty, c.clone())) {
             return V::Const(i);
