@@ -1630,7 +1630,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                // What the GPU wrote at its address in another format, or
+                // else the title's memory.
+                let alias = crate::resource::written_alias(*resource as This);
+                if !alias.is_some_and(|from| {
+                    crate::texture::copy_alias(list, &from, *resource as This, t)
+                }) {
+                    crate::texture::upload(list, *resource as This, t);
+                }
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
