@@ -1207,7 +1207,9 @@ fn record_twin_copy(
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        // Release builds too: an AMD card hung at world load with no
+        // breadcrumbs, and a diagnostics build changes the timing.
+        std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
 }
 
