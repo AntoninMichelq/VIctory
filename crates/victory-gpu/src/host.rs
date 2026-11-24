@@ -1437,6 +1437,9 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Host timestamps the lists resolved, on the title's GPU clock.
+        // Queues these writes release run their work once no lock is held:
+        // it submits lists itself (this lock, the lists' `deferred`).
+        let mut woken = crate::fence::Woken::default();
         let mut clock = None;
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
@@ -1449,10 +1452,12 @@ impl Host {
                     },
                     what => what,
                 };
-                what.write(at as *mut u8, bytes);
+                woken.add(what.write(at as *mut u8, bytes));
             }
         }
         self.log_messages();
+        drop(submitted);
+        woken.run();
     }
 
     /// How host GPU timestamps map onto the title's GPU clock

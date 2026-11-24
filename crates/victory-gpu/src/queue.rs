@@ -233,8 +233,9 @@ pub(crate) enum Written {
 }
 
 impl Written {
-    /// Stores the low `bytes` (4 or 8) of the value at `at`.
-    pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+    /// Stores the low `bytes` (4 or 8) of the value at `at`; returns the
+    /// queues it woke, to run with no lock held.
+    pub(crate) fn write(self, at: *mut u8, bytes: usize) -> crate::fence::Woken {
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp | Written::HostTimestamp(_) => gpu_clock(),
@@ -259,7 +260,7 @@ impl Written {
             }
         }
         // A write at a fence's GPU address moves its value.
-        crate::fence::written(at as usize, bytes);
+        crate::fence::written(at as usize, bytes)
     }
 }
 
@@ -972,12 +973,18 @@ mod tests {
     #[test]
     fn timestamps_and_values_are_written() {
         let mut at = [0u64; 2];
-        Written::Value(0x1_0000_0002).write(at.as_mut_ptr().cast(), 4);
+        Written::Value(0x1_0000_0002)
+            .write(at.as_mut_ptr().cast(), 4)
+            .run();
         assert_eq!(at[0], 2);
-        Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
+        Written::GpuTimestamp
+            .write(at[1..].as_mut_ptr().cast(), 8)
+            .run();
         let first = at[1];
         std::thread::sleep(std::time::Duration::from_millis(2));
-        Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
+        Written::GpuTimestamp
+            .write(at[1..].as_mut_ptr().cast(), 8)
+            .run();
         assert!(at[1] > first);
     }
 }
