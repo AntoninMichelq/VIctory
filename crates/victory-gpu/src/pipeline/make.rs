@@ -88,8 +88,15 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
+        let started = Instant::now();
+        let made = self
+            .made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let us = started.elapsed().as_micros() as u64;
+        STATS.us.fetch_add(us, Ordering::Relaxed);
+        STATS.max_us.fetch_max(us, Ordering::Relaxed);
+        let counter = if made.is_some() { &STATS.ok } else { &STATS.failed };
+        counter.fetch_add(1, Ordering::Relaxed);
         let _held = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.wait_done.notify_all();
     }
@@ -128,6 +135,69 @@ const WARMUP_BUDGET_MS: u32 = 500;
 const STEADY_BUDGET_MS: u32 = 8;
 /// Upper bound on `VICTORY_PSO_WAIT_MS` (5 seconds).
 const MAX_WAIT_MS: u32 = 5_000;
+
+/// What the workers did since the last progress line.
+struct Stats {
+    ok: AtomicU64,
+    failed: AtomicU64,
+    /// Time making them (translation, root signature, library load or
+    /// host compile), total and longest, in microseconds.
+    us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    ok: AtomicU64::new(0),
+    failed: AtomicU64::new(0),
+    us: AtomicU64::new(0),
+    max_us: AtomicU64::new(0),
+};
+
+/// Every 5 s while there is pipeline work: one line on the backlog and
+/// what the workers made since the last one.
+fn progress() {
+    use super::library::{COMPILE_US, LOADED, MADE, SHARED};
+    let (mut made, mut loaded, mut shared, mut compile_us) = (0, 0, 0, 0);
+    let (mut hits, mut misses) = crate::shader_cache::counts();
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let ok = STATS.ok.swap(0, Ordering::Relaxed);
+        let failed = STATS.failed.swap(0, Ordering::Relaxed);
+        let us = STATS.us.swap(0, Ordering::Relaxed);
+        let max_us = STATS.max_us.swap(0, Ordering::Relaxed);
+        let queued = WAITING.load(Ordering::Relaxed);
+        let delta = |total: &AtomicU64, last: &mut u64| {
+            let now = total.load(Ordering::Relaxed);
+            now.saturating_sub(std::mem::replace(last, now))
+        };
+        let compiled = delta(&MADE, &mut made);
+        let from_library = delta(&LOADED, &mut loaded);
+        let deduped = delta(&SHARED, &mut shared);
+        let compile_ms = delta(&COMPILE_US, &mut compile_us) / 1000;
+        let (h, m) = crate::shader_cache::counts();
+        let shader_hits = h.saturating_sub(std::mem::replace(&mut hits, h));
+        let shader_translated = m.saturating_sub(std::mem::replace(&mut misses, m));
+        if queued == 0 && ok == 0 && failed == 0 {
+            continue;
+        }
+        let done = ok + failed;
+        tracing::info!(
+            queued,
+            made = ok,
+            failed,
+            compiled,
+            from_library,
+            deduped,
+            shader_hits,
+            shader_translated,
+            avg_ms = us.checked_div(done).unwrap_or(0) / 1000,
+            max_ms = max_us / 1000,
+            host_compile_avg_ms = compile_ms.checked_div(compiled).unwrap_or(0),
+            queue_entries = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).heap.len(),
+            "pipeline workers (last 5 s)"
+        );
+    }
+}
 
 /// Bit packing for [`FrameBudget`]: upper 36 bits hold the frame tag and lower
 /// 28 bits hold reserved microseconds (up to ~268 s per frame).
@@ -435,6 +505,9 @@ fn queue(p: Arc<Pending>, wanted: u64) {
     let started = *STARTED.get_or_init(|| {
         let workers = workers();
         tracing::info!(workers, "pipeline workers");
+        let _ = std::thread::Builder::new()
+            .name("victory-pipelines-progress".into())
+            .spawn(progress);
         let mut started = 0;
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
