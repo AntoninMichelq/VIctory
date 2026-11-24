@@ -1658,6 +1658,13 @@ impl State {
         ) {
             Ok(b) => b,
             Err(_reason) => {
+                #[cfg(feature = "diagnostics")]
+                let _reason = format!(
+                    "{_reason}; shaders {:?}, stride {stride}, max {max}, arguments at +{:#x}, count {}",
+                    p.stages.iter().map(|s| format!("{}", s.shader.hash)).collect::<Vec<_>>(),
+                    args.offset(arguments),
+                    counter.as_ref().map_or("none".to_owned(), |(s, at)| format!("+{:#x}", s.offset(*at)))
+                );
                 why(&format!("not bounded: {_reason}"));
                 return false;
             }
