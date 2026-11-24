@@ -225,7 +225,9 @@ impl Shadow {
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Returns the bytes the snapshot was made of (0 if it held the range
+    /// already).
+    pub(crate) fn writing(&self, address: usize, len: usize) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -243,7 +245,7 @@ impl Shadow {
         if let Some((at, bytes)) = &*before
             && (*at, at + bytes.len()) == (start, end)
         {
-            return;
+            return 0;
         }
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
@@ -257,6 +259,7 @@ impl Shadow {
             None => grown.extend_from_slice(host(start, end)),
         }
         *before = Some((start, grown));
+        end - start
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -489,18 +492,19 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let holding: Vec<((u64, usize), bool)> = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .filter(|(_, e)| e.end >= end)
-        .map(|(k, e)| (*k, e.shadow.is_some()))
-        .collect();
-    let key = holding
-        .iter()
-        .find(|(_, made)| *made)
-        .or(holding.first())
-        .map(|(k, _)| *k);
+    // Called for every buffer a draw reads: one pass, no allocation.
+    let (mut innermost, mut made) = (None, None);
+    for (k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+        if e.end < end {
+            continue;
+        }
+        if e.shadow.is_some() {
+            made = Some(*k);
+            break;
+        }
+        innermost.get_or_insert(*k);
+    }
+    let key = made.or(innermost);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);

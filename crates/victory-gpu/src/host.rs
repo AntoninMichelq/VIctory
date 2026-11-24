@@ -137,6 +137,20 @@ fn bury(finished: u64) {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Since the last frame-rate line: submissions, microseconds in
+/// `ExecuteCommandLists` (driver CPU time, part of the GPU time above) and
+/// microseconds blocked on the fence.
+static SUBMITTING: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Of the preparing: snapshots of ranges shaders write (microseconds,
+/// bytes), since the last frame-rate line.
+static SNAPSHOTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -631,6 +645,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges shaders write declared since the last title copy, as
+    /// `refreshed`: a repeat would only flush and find the range taken.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -757,6 +774,7 @@ impl Host {
     /// Waits until the queue has signalled the fence with `value` (the
     /// caller holds `submitted`, under which the event is waited on).
     fn wait_for(&self, value: u64) {
+        let waiting = std::time::Instant::now();
         // SAFETY: the fence and event are ours.
         unsafe {
             match self.fence.SetEventOnCompletion(value, self.event) {
@@ -766,6 +784,7 @@ impl Host {
                 Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
         }
+        SUBMITTING[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Runs closed lists and waits for them.
@@ -815,6 +834,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
+            SUBMITTING[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             *submitted += 1;
             // SAFETY: the fence is ours.
             if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
@@ -856,6 +876,7 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        SUBMITTING[0].fetch_add(1, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -894,13 +915,15 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
+        // In first-declared order; a set finds repeats (a world submission
+        // declares thousands, comparing each with every one kept was
+        // quadratic).
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                    && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                 {
                     back.push((shadow.clone(), *address, *len));
                 }
@@ -1542,6 +1565,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1578,9 +1602,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        // Once per range until a title copy: at submission a repeat flushes
+        // pending refreshes (done at the next step that needs them anyway)
+        // and finds the range already snapshotted and pending.
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1737,8 +1768,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1819,7 +1852,9 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
-                    shadow.writing(*address, *len);
+                    let taken = shadow.writing(*address, *len);
+                    SNAPSHOTS[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    SNAPSHOTS[1].fetch_add(taken as u64, Ordering::Relaxed);
                     continue;
                 }
                 Step::Texture(staging, copy) => {
@@ -2282,6 +2317,16 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // Where a frame's CPU time goes, for slow frames: recording
+        // (title threads, summed), and of the submissions (one at a
+        // time, on the queue's thread) preparing, the driver's submit,
+        // the fence wait and copying back.
+        let per = |n: u64, scale: f64| n as f64 / scale / frames;
+        let [submissions, submit_us, wait_us] =
+            [0, 1, 2].map(|i| SUBMITTING[i].swap(0, Ordering::Relaxed));
+        let [snapshot_us, snapshot_b] = [0, 1].map(|i| SNAPSHOTS[i].swap(0, Ordering::Relaxed));
+        let [asks, ask_us] = crate::watch::take_asks();
+        let recording_us = crate::draw::take_recording_us();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -2291,6 +2336,19 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "frame CPU split: recording {:.1} ms; {:.1} submissions: preparing {cpu:.1} ms \
+                 (snapshots {:.1} ms {:.1} MB, {:.0} write-watch asks {:.1} ms), submitting \
+                 {:.1} ms, waiting {:.1} ms, copying back {back_ms:.1} ms",
+                per(recording_us, 1e3),
+                per(submissions, 1.0),
+                per(snapshot_us, 1e3),
+                per(snapshot_b, 1e6),
+                per(asks, 1.0),
+                per(ask_us, 1e3),
+                per(submit_us, 1e3),
+                per(wait_us, 1e3),
             );
             #[cfg(feature = "diagnostics")]
             {
