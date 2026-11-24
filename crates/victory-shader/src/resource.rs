@@ -1647,6 +1647,68 @@ impl<'a> Tracer<'a> {
         t
     }
 
+    /// Whether per-lane dword `t` is never a descriptor dword: what its
+    /// joins and per-lane selects carry is vector arithmetic, vertex data
+    /// (input VGPRs, buffer or global loads) or constants, with some
+    /// arithmetic among them (a float the program works with, in registers
+    /// it reuses for a descriptor on other paths).
+    fn computed_word(&self, t: Term) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![t];
+        let mut computed = false;
+        while let Some(t) = work.pop() {
+            let Term::Value(v) = self.lane_term(t) else {
+                continue;
+            };
+            if !seen.insert(v) {
+                continue;
+            }
+            if seen.len() > 64 {
+                return false;
+            }
+            if let Some(reg) = self.inputs[v.0 as usize] {
+                if matches!(reg, Reg::V(_)) {
+                    continue;
+                }
+                return false;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                work.extend(
+                    self.p.blocks[b].phis[i]
+                        .args
+                        .iter()
+                        .map(|&a| Term::Value(a)),
+                );
+                continue;
+            }
+            let Some(inst) = self.def(v) else {
+                return false;
+            };
+            let n = inst.name();
+            if n.starts_with("v_cndmask") {
+                // Per lane one of two dwords: both are carried.
+                work.extend(
+                    inst.reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(_)))
+                        .map(|r| Term::Value(r.1)),
+                );
+            } else if n.starts_with("buffer_load") || n.starts_with("global_load") {
+            } else if n.starts_with("v_")
+                && !n.starts_with("v_mov")
+                && !n.starts_with("v_readlane")
+                && !n.starts_with("v_readfirstlane")
+                && !n.starts_with("v_writelane")
+                && !n.starts_with("v_interp")
+            {
+                computed = true;
+            } else {
+                return false;
+            }
+        }
+        computed
+    }
+
     /// Whether `t` is a value each lane holds its own of (one in VGPRs).
     fn varies(&self, t: Term) -> bool {
         let Term::Value(v) = t else { return false };
@@ -1768,7 +1830,13 @@ impl<'a> Tracer<'a> {
             unreachable!()
         };
         if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err(hard("a per-lane descriptor joined in several blocks"));
+            // Dwords last joined in different blocks: junk when one of them
+            // is only ever arithmetic (registers holding other data on a
+            // path that skips the descriptor's writes).
+            return Err(Fail {
+                what: "a per-lane descriptor joined in several blocks",
+                junk: words.iter().any(|&w| self.computed_word(w)),
+            });
         }
         if joins.contains(&block) {
             // Back at a join being traced: through a loop's back edge, the
@@ -3561,6 +3629,81 @@ pub(crate) mod tests {
             assert_eq!(r.waterfall.compares.len(), 4);
             assert_eq!(r.waterfall.reads.len(), 8);
         }
+    }
+
+    /// [`WATERFALL_PICKED_WAVE32`]'s waterfall over a descriptor both sides
+    /// of a branch copy into VGPRs that held floats before, joined in two
+    /// earlier blocks (the skin mesh shaders' form): on the edge that skips
+    /// the copy no lane reaches the access with those floats.
+    pub(crate) fn waterfall_over_reused_floats() -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0602,
+            0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x1008_0702, // v_mul_f32 v4, v2, v3
+            0x100A_0502, // v_mul_f32 v5, v2, v2
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBEA8_3C6A, // s_and_saveexec_b32 s40, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0x0608_0702, // v_add_f32 v4, v2, v3 (v4 joined here)
+            0x887E_287E, // s_or_b32 exec_lo, exec_lo, s40
+            0x7D88_0084, // v_cmp_gt_u32 vcc_lo, 4, v0
+            0xBEA8_3C6A, // s_and_saveexec_b32 s40, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0x080A_0702, // v_sub_f32 v5, v2, v3 (v5 joined here)
+            0x887E_287E, // s_or_b32 exec_lo, exec_lo, s40
+            0x100C_0B04, // v_mul_f32 v6, v4, v5
+            0x100E_0904, // v_mul_f32 v7, v4, v4
+            0x1010_0B05, // v_mul_f32 v8, v5, v5
+            0x0612_0B04, // v_add_f32 v9, v4, v5
+            0x0614_0504, // v_add_f32 v10, v4, v2
+            0x0616_0505, // v_add_f32 v11, v5, v2
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBEA8_3C6A, // s_and_saveexec_b32 s40, vcc_lo
+            0xBF88_0008, // s_cbranch_execz +8
+        ];
+        // v_mov_b32 v4..v11, s24..s31 on both sides.
+        let copy: Vec<u32> = (0..8).map(|k| 0x7E08_0218 + (k << 17) + k).collect();
+        words.extend(&copy);
+        words.extend([
+            0x8A7E_7E28, // s_andn2_b32 exec_lo, s40, exec_lo
+            0xBF88_0008, // s_cbranch_execz +8
+        ]);
+        words.extend(&copy);
+        words.push(0xBEFE_0328); // s_mov_b32 exec_lo, s40
+        let tail = WATERFALL_PICKED_WAVE32
+            .iter()
+            .position(|&w| w == 0xBE94_037E)
+            .unwrap();
+        words.extend_from_slice(&WATERFALL_PICKED_WAVE32[tail..]);
+        words
+    }
+
+    #[test]
+    fn descriptors_over_floats_joined_in_several_blocks_skip_the_floats() {
+        let r = waterfall(&waterfall_over_reused_floats(), false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        assert!(
+            image
+                .source
+                .leaves()
+                .iter()
+                .any(|l| matches!(l, Source::Loaded { .. })),
+            "{:?}",
+            image.source
+        );
     }
 
     #[test]

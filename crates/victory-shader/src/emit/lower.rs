@@ -14232,6 +14232,7 @@ mod tests {
             (WATERFALL_CARRIED_WAVE32, false),
             (WATERFALL_BRANCHES_WAVE32, false),
             (WATERFALL_REPLACED_WAVE32, false),
+            (&crate::resource::tests::waterfall_over_reused_floats(), false),
         ] {
             let (layout, used) = texture_tables();
             let l = lower_wave(words, layout, used, wave64).unwrap();
