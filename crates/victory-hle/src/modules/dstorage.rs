@@ -451,17 +451,6 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
-        let pages = page_count(&job.request);
-        if pages > 0 {
-            // SAFETY: the copy `enqueue_request` made, of this length, which
-            // nothing reads after the request ran.
-            drop(unsafe {
-                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    job.request.destination.cast::<usize>(),
-                    pages,
-                ))
-            });
-        }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -722,20 +711,9 @@ impl Status {
 
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
-    let Some(&(mut request)) = (unsafe { request.as_ref() }) else {
+    let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    // The page numbers of a page destination are read now: a worker runs
-    // the request later, when the title may have reused the array it
-    // passed (requests then failed on page 0, or wrote other pages). The
-    // copy is ours until the request has run (`work`).
-    let pages = page_count(&request);
-    if pages > 0 {
-        // SAFETY: the title passes a page number per 64 KiB of destination.
-        let copy: Box<[usize]> =
-            unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), pages) }.into();
-        request.destination = Box::leak(copy).as_mut_ptr().cast();
-    }
     queue(this, Command::Read(request));
 }
 
@@ -804,14 +782,6 @@ extern "system" fn submit(this: QueueRef) {
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
-}
-
-/// The page numbers a page destination names (0 for an address or none).
-fn page_count(request: &Request) -> usize {
-    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
-        return 0;
-    }
-    ((request.page_offset & 0xffff) as usize + request.destination_size as usize).div_ceil(PAGE)
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -988,9 +958,6 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    if (offset + len).div_ceil(PAGE) > page_count(request) {
-        return Err(E_INVALIDARG);
-    }
     // SAFETY: the title passes a page number per 64 KiB of destination,
     // which holds at least `len` bytes from `offset`.
     let pages = unsafe {
