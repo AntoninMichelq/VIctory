@@ -1479,7 +1479,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        skip: crate::resource::mip_skip(&desc),
+        // As the host copy was made: with the levels a small one leaves off.
+        skip: crate::resource::skipped_mips(resource),
         bytes: total,
         memory,
         last: Mutex::default(),
