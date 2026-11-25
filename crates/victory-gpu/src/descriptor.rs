@@ -713,6 +713,17 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped whenever [`forget`] invalidates at least one buffer view: lets
+/// `VICTORY_PLAN_REUSE=1` skip full bindless buffer-slot rescans while no
+/// buffer resource has been released.
+#[cfg(windows)]
+static BUFFER_FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn buffer_forgotten_epoch() -> u64 {
+    BUFFER_FORGOTTEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -724,6 +735,8 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    #[cfg(windows)]
+    let mut forgot_any = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -731,12 +744,20 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
+        #[cfg(windows)]
+        {
+            forgot_any = true;
+        }
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+    }
+    #[cfg(windows)]
+    if forgot_any {
+        BUFFER_FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

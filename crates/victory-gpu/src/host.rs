@@ -7008,6 +7008,16 @@ impl Meter {
                     crate::texture::STAGING_POOL[2].load(Ordering::Relaxed) as f64 / 1e6,
                 );
             }
+            if crate::draw::plan_reuse() {
+                let [reused_p, compacts, rescans, walked] = [0, 1, 2, 3]
+                    .map(|i| crate::draw::PLAN_REUSE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let unresolved = crate::draw::PLAN_REUSE_STATS[4].load(Ordering::Relaxed);
+                let spans = crate::draw::PLAN_REUSE_STATS[5].load(Ordering::Relaxed);
+                tracing::info!(
+                    "plan reuse (VICTORY_PLAN_REUSE=1): {reused_p:.2} reused, {compacts:.2} compacts, \
+                     {rescans:.2} full rescans/frame; {walked:.0} slots walked/frame, {unresolved} unresolved, {spans} spans",
+                );
+            }
         }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
