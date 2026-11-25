@@ -894,18 +894,37 @@ impl HostHeap {
     /// oldest first, are made null so their host copies can go
     /// ([`TextureQueue::evict`]). Returns how many were.
     /// shortcut: oldest made first, not least sampled (a draw reading a
-    /// texture by index leaves no trace); one given up stays empty until
-    /// the title writes or maps it again. Upgrade by recording what draws
+    /// texture by index leaves no trace). Upgrade by recording what draws
     /// sample.
+    ///
+    /// A slot given up goes back into the queue, due some frames later
+    /// (`VICTORY_EVICT_REQUEUE_FRAMES`, 30; 0: it stays empty until the
+    /// title writes or maps it again, as before): the oldest made are often
+    /// still shown (the player's hair, made at load, was given up and the
+    /// player stayed bald and chrome-shirted for the run), and the queue
+    /// brings them back when the card has room again.
     pub(crate) fn texture_slots_evict(&self, before: u64, n: usize) -> usize {
+        static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let later = *FRAMES.get_or_init(|| {
+            std::env::var("VICTORY_EVICT_REQUEUE_FRAMES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(30)
+        });
         let out = self
             .textures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .evict(before, n);
-        out.into_iter()
-            .filter(|&i| self.texture_slot_gone(i))
-            .count()
+        let gone: Vec<u32> = out.into_iter().filter(|&i| self.texture_slot_gone(i)).collect();
+        if later > 0 && !gone.is_empty() {
+            let frame = crate::frame::current();
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &i in &gone {
+                textures.written(i, frame, frame + later, false);
+            }
+        }
+        gone.len()
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
