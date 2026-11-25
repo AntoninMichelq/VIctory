@@ -6878,20 +6878,28 @@ impl Meter {
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
         {
             // The catch-up's share of the heap passes (counters since the start).
-            static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-            let passes = crate::draw::HEAP_TEXTURES_CATCHUP[0].load(Ordering::Relaxed);
-            let us = crate::draw::HEAP_TEXTURES_CATCHUP[1].load(Ordering::Relaxed);
-            let uploaded = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
-            let [p0, u0, t0] = [0, 1, 2].map(|i| LAST[i].load(Ordering::Relaxed));
-            [passes, us, uploaded].iter().zip(&LAST).for_each(|(v, l)| l.store(*v, Ordering::Relaxed));
-            if passes > p0 {
-                tracing::info!(
-                    "texture catch-up per frame: {:.1} passes, {:.1} ms; textures picked by index uploaded per frame {:.1}",
-                    (passes - p0) as f64 / frames,
-                    (us - u0) as f64 / 1e3 / frames,
-                    uploaded.saturating_sub(t0) as f64 / frames,
-                );
-            }
+            static LAST: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+            let now = [
+                crate::draw::HEAP_TEXTURES_CATCHUP[0].load(Ordering::Relaxed),
+                crate::draw::HEAP_TEXTURES_CATCHUP[1].load(Ordering::Relaxed),
+                crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+                crate::draw::HEAP_SPLIT_MICROS[0].load(Ordering::Relaxed),
+                crate::draw::HEAP_SPLIT_MICROS[1].load(Ordering::Relaxed),
+            ];
+            let d: Vec<f64> = now
+                .iter()
+                .zip(&LAST)
+                .map(|(v, l)| v.saturating_sub(l.swap(*v, Ordering::Relaxed)) as f64 / frames)
+                .collect();
+            tracing::info!(
+                "heap passes per frame: {:.1} ms on buffer views, {:.1} ms on textures picked by index ({:.1} uploaded); \
+                 texture catch-up {:.1} passes, {:.1} ms",
+                d[3] / 1e3,
+                d[4] / 1e3,
+                d[2],
+                d[0],
+                d[1] / 1e3,
+            );
         }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =

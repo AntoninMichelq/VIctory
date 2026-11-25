@@ -1529,7 +1529,10 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let textures_began = std::time::Instant::now();
+        HEAP_SPLIT_MICROS[0].fetch_add((textures_began - started).as_micros() as u64, Ordering::Relaxed);
         self.heap_textures(list, heap, host);
+        HEAP_SPLIT_MICROS[1].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -3609,6 +3612,9 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 /// Passes over textures picked by index that took the loading budget
 /// ([`loading_frame`]).
 pub(crate) static HEAP_TEXTURES_PRELOAD: AtomicU64 = AtomicU64::new(0);
+/// Since the start: of the heap passes' microseconds, before the textures
+/// (the buffer views' refreshes and what leads to them) and in them.
+pub(crate) static HEAP_SPLIT_MICROS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Since the start: passes with the catch-up's budget, and their microseconds.
 pub(crate) static HEAP_TEXTURES_CATCHUP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
