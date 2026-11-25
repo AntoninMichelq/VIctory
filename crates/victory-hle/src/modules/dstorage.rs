@@ -966,6 +966,28 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    // The title fills the page numbers after it enqueued the request, and
+    // now and then a worker gets here first and finds zeros (the request
+    // then failed, and a model or an interior lacked parts). The array is
+    // the title's own, so looking again sees what it wrote: wait for it,
+    // half a second at most (a request it gave up stays unknown).
+    let mut waited = 0u32;
+    while waited < 250 && !super::xmem::pages_known(pages, offset, len) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        waited += 1;
+    }
+    if waited > 0 {
+        static LATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            tracing::info!(
+                n,
+                ms = waited * 2,
+                known = super::xmem::pages_known(pages, offset, len),
+                "dstorage: a destination's page numbers were not there yet; waited for the title to write them"
+            );
+        }
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     // Written through a view of our own: the title addresses showing these
