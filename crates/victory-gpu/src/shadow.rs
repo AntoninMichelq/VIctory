@@ -2192,6 +2192,12 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// The ranges shaders write that are not copied back yet (title
+    /// addresses, end excluded).
+    pub(crate) fn pending_ranges(&self) -> Vec<(usize, usize)> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
