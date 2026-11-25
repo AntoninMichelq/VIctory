@@ -149,7 +149,14 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// behind those a draw asks for, and compiles follow the free memory.
 pub(crate) fn early(p: &Arc<Pending>) {
     static ALL: OnceLock<bool> = OnceLock::new();
-    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PIPELINES_ALL_EARLY").is_some_and(|v| v == "1"));
+    // On a warm cache the early list is enough: starting all again loaded
+    // ~60k pipelines from the library (warm run e19cf03 B, +1.7 GB held
+    // against the list alone). `VICTORY_PIPELINES_ALL_EARLY=2` keeps it on.
+    let all = *ALL.get_or_init(|| match std::env::var("VICTORY_PIPELINES_ALL_EARLY").as_deref() {
+        Ok("2") => true,
+        Ok("1") => super::library::first_run(),
+        _ => false,
+    });
     if p.shaders.is_empty() {
         return;
     }

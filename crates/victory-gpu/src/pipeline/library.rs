@@ -712,9 +712,20 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        let _ = FIRST_RUN.set(set.is_empty());
         *used = Some(set);
     }
     used
+}
+
+/// Whether no earlier run listed pipelines to start early (a cold cache).
+static FIRST_RUN: OnceLock<bool> = OnceLock::new();
+
+/// Whether this is the first run on this cache: no earlier run's draws
+/// listed pipelines to start early.
+pub(crate) fn first_run() -> bool {
+    drop(used());
+    FIRST_RUN.get().copied().unwrap_or(true)
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
