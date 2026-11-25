@@ -1443,6 +1443,10 @@ pub(crate) fn dred_on() -> bool {
 /// records of any kind the list's budget emptied (from the lists' budget
 /// buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Indirect records since the last frame line (the clamp's diagnostics,
+/// budget words 4 to 6): written empty by the title (its culling), active,
+/// emptied by our bounds (not the budget).
+static RECORDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -6025,7 +6029,10 @@ impl HostList {
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
                 // Word 3: records the budget emptied.
                 MESH_GROUPS[2].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
-                for k in 0..4 {
+                for (k, n) in RECORDS.iter().enumerate() {
+                    n.fetch_add(u64::from(words.add(4 + k).read_volatile()), Ordering::Relaxed);
+                }
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6950,8 +6957,9 @@ impl Meter {
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let emptied = MESH_GROUPS[2].swap(0, Ordering::Relaxed) as f64 / frames;
+        let [title_empty, active, bounded] = [0, 1, 2].map(|i| RECORDS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; indirect records emptied by the budget (VICTORY_CLAMP_BUDGET): {emptied:.1} per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; indirect records emptied by the budget (VICTORY_CLAMP_BUDGET): {emptied:.1} per frame; indirect records per frame: {active:.0} active, {title_empty:.0} of them written empty by the title (its culling), {bounded:.1} emptied by our bounds"
         );
         late_line(frames);
         card_clock_line(frames, ms);

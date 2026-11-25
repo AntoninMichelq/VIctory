@@ -2164,6 +2164,7 @@ impl State {
     /// indirect arguments (`HostList::count_write`).
     fn drawn(&self, list: &HostList) {
         DRAWN.fetch_add(1, Ordering::Relaxed);
+        crate::pipeline::census(self.pipeline as This);
         if crate::pipeline::host_pipeline(self.pipeline as This)
             .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
         {

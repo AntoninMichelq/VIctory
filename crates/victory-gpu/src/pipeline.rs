@@ -667,6 +667,57 @@ pub(crate) fn tally_drop(this: This, why: &'static str) {
         .1 += 1;
 }
 
+/// `VICTORY_DRAW_CENSUS=1`: the draws run (direct and indirect, each
+/// execution once) are counted by pipeline, and every 5 s an INFO line
+/// gives the 30 pipelines that drew most, per frame, with their shaders:
+/// which shaders draw a scene (and which are missing from it).
+#[cfg(windows)]
+fn census_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_DRAW_CENSUS").as_deref() == Ok("1");
+        tracing::info!(on, "draws counted by pipeline (VICTORY_DRAW_CENSUS)");
+        on
+    })
+}
+
+/// Draws by title pipeline since the last census line: shaders, count.
+#[cfg(windows)]
+static CENSUS: Mutex<Option<HashMap<usize, (String, u64)>>> = Mutex::new(None);
+
+/// Counts a draw of `this` run on the host (`VICTORY_DRAW_CENSUS`).
+#[cfg(windows)]
+pub(crate) fn census(this: This) {
+    if this.is_null() || !census_on() {
+        return;
+    }
+    let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    census
+        .get_or_insert_with(HashMap::new)
+        .entry(this as usize)
+        .or_insert_with(|| (format!("{:?}", pipeline(this).shaders), 0))
+        .1 += 1;
+}
+
+/// The census line over `frames` frames (`VICTORY_DRAW_CENSUS`).
+#[cfg(windows)]
+fn census_report(frames: f64) {
+    let Some(census) = CENSUS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let pipelines = census.len();
+    let all: u64 = census.values().map(|c| c.1).sum();
+    let mut top: Vec<(String, u64)> = census.into_values().collect();
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let top: Vec<String> =
+        top.iter().take(30).map(|(shaders, n)| format!("{:.1} {shaders}", *n as f64 / frames)).collect();
+    tracing::info!(
+        "draws run per frame by pipeline (VICTORY_DRAW_CENSUS): {:.0} in all, {pipelines} pipelines; the most: {}",
+        all as f64 / frames,
+        top.join("; ")
+    );
+}
+
 /// Counts `frames` more frames for the dropped draws' report; with `log`,
 /// logs the draws and dispatches dropped since the last report, per frame
 /// by reason, then the 20 pipelines that dropped most.
@@ -681,6 +732,9 @@ pub(crate) fn drop_report(frames: f64, log: bool) {
         }
         std::mem::take(&mut *kept)
     };
+    if census_on() && frames > 0.0 {
+        census_report(frames);
+    }
     let Some(tally) = TALLY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
