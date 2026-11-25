@@ -610,6 +610,76 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// `VICTORY_BACK_BLOCKS=1` (off by default): bytes shaders wrote go back
+/// into title memory by 1 KiB block, only the blocks the merge changed
+/// ([`put_back`]), not the whole span from the first changed byte to the
+/// last. After upstream PRs #2242/#2280 (wbkepler, 09595753, 7ef96fa9),
+/// without their shader marks. Fewer bytes written means fewer pages the
+/// write watch reports at the next refresh (the echo).
+fn back_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_BLOCKS").is_some_and(|v| v == "1"))
+}
+
+std::thread_local! {
+    /// Title memory as [`read_title`] read it last on this thread, for
+    /// [`put_back`] to tell what the merge changed.
+    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads title memory at `src` into `dst` (`crate::host::read_into`); with
+/// [`back_blocks`], also keeps what was read for [`put_back`].
+fn read_title(src: *const u8, dst: &mut [u8]) -> bool {
+    let ok = crate::host::read_into(src, dst);
+    if ok && back_blocks() {
+        READ.with_borrow_mut(|r| {
+            r.clear();
+            r.extend_from_slice(dst);
+        });
+    }
+    ok
+}
+
+/// Puts `merged` back into title memory at `at` (read just before by
+/// [`read_title`] on this thread, then merged with what shaders wrote):
+/// the whole span, or with [`back_blocks`] only the 1 KiB blocks that
+/// differ from what was read, joined into runs. Returns the bytes written.
+fn put_back(at: usize, merged: &[u8]) -> usize {
+    let n = merged.len();
+    let whole = || {
+        crate::watch::writing(at, n);
+        crate::host::write_title(at as *mut u8, merged.as_ptr(), n);
+        n
+    };
+    if !back_blocks() {
+        return whole();
+    }
+    READ.with_borrow(|was| {
+        if was.len() != n {
+            return whole();
+        }
+        const BLOCK: usize = 1024;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, (m, w)) in merged.chunks(BLOCK).zip(was.chunks(BLOCK)).enumerate() {
+            if m == w {
+                continue;
+            }
+            let (a, b) = (i * BLOCK, (i * BLOCK + m.len()).min(n));
+            match runs.last_mut() {
+                Some(last) if last.1 == a => last.1 = b,
+                _ => runs.push((a, b)),
+            }
+        }
+        let mut written = 0;
+        for (a, b) in runs {
+            crate::watch::writing(at + a, b - a);
+            crate::host::write_title((at + a) as *mut u8, merged[a..].as_ptr(), b - a);
+            written += b - a;
+        }
+        written
+    })
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -2002,7 +2072,7 @@ impl Shadow {
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
+                if !read_title((start + at) as *const u8, title) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
@@ -2020,9 +2090,7 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    written += put_back(start + at, title);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -2110,15 +2178,13 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !read_title((start + at) as *const u8, title) {
             return 0;
         }
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_back(start + at, &title[..n])
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2695,7 +2761,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if read_title((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -2707,9 +2773,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                written = put_back(start + at, title);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -2799,7 +2863,7 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = read_title((start + at) as *const u8, title);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -2810,9 +2874,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_back(start + at, &title[..n])
     }
 }
 

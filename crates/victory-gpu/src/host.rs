@@ -764,6 +764,10 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // Whether the card offers GPU upload heaps (its memory written by
+        // the CPU through a resizable BAR): what host copies there would
+        // need (upstream PRs #2120/#2130, fxceless VICTORY_WINDOW_UPLOAD).
+        tracing::info!(supported = gpu_upload_heaps(&device), "GPU upload heaps (resizable BAR)");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -6429,7 +6433,9 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per copy, the ranges to bring up to date: one, their envelope, or
+    /// with [`refresh_ranges`] the disjoint ranges asked for.
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6447,13 +6453,24 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let ranges = &mut self.refreshes[at].1;
+                if refresh_ranges() {
+                    add_range(ranges, address, end);
+                } else if let Some(r) = ranges.first_mut() {
+                    (r.0, r.1) = (r.0.min(address), r.1.max(end));
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
+        }
+    }
+
+    /// Brings every range of a copy's entry up to date.
+    fn update_all(shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]) {
+        for &(from, to) in ranges {
+            Self::update(shadow, from, to);
         }
     }
 
@@ -6463,12 +6480,12 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        Self::update_all(&shadow, &ranges);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6522,7 +6539,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6536,19 +6553,88 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| Box::new(move || Self::update_all(&shadow, &ranges)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                Self::update_all(&shadow, &ranges);
             }
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
+    }
+}
+
+/// `VICTORY_REFRESH_RANGES=1` (off by default): a submission's refreshes of
+/// a host copy are the ranges its lists asked for, joined only where they
+/// touch or lie within 64 KiB of each other, not the one range from the
+/// lowest to the highest. After upstream PRs #2349 (dcb4ac34, 7cfd3912) and
+/// #2428 (3a2279fd). The envelope of the title's big heap (174 MB) was
+/// asked of the write watch at every flush, some 45 a frame: 8.5 GB of
+/// ranges a frame, 33 ms (run cpuframe, 2026-11-26 00:19), for some 130 MB
+/// actually copied. A page between two ranges is left as it is: no list of
+/// the submission reads it, and it is still stale for the next that does.
+fn refresh_ranges() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_RANGES").is_some_and(|v| v == "1"))
+}
+
+/// Adds `[from, to)` to `ranges` (disjoint, in order): joined with those it
+/// overlaps, touches or comes within 64 KiB of. Past 256 ranges they become
+/// their envelope (one range).
+fn add_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    const NEAR: usize = 64 << 10;
+    let (mut from, mut to) = (from, to);
+    // The first range that may join: ends within NEAR of `from` or after.
+    let first = ranges.partition_point(|r| r.1.saturating_add(NEAR) < from);
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= to.saturating_add(NEAR) {
+        from = from.min(ranges[last].0);
+        to = to.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(from, to)]);
+    if ranges.len() > 256 {
+        let envelope = (ranges[0].0, ranges[ranges.len() - 1].1);
+        ranges.clear();
+        ranges.push(envelope);
+    }
+}
+
+#[cfg(test)]
+mod refresh_range_tests {
+    use super::add_range;
+
+    #[test]
+    fn ranges_stay_apart_and_join_when_near() {
+        let mut r = vec![(1 << 20, (1 << 20) + 100)];
+        add_range(&mut r, 100 << 20, (100 << 20) + 4096);
+        assert_eq!(r, vec![(1 << 20, (1 << 20) + 100), (100 << 20, (100 << 20) + 4096)]);
+        // Within 64 KiB of the first: joined with it.
+        add_range(&mut r, (1 << 20) + 60_000, (1 << 20) + 70_000);
+        assert_eq!(r[0], (1 << 20, (1 << 20) + 70_000));
+        // Before all, far: its own, first.
+        add_range(&mut r, 0, 10);
+        assert_eq!(r[0], (0, 10));
+        assert_eq!(r.len(), 3);
+        // Bridging the last two.
+        add_range(&mut r, (1 << 20) + 70_000, 100 << 20);
+        assert_eq!(r, vec![(0, 10), (1 << 20, (100 << 20) + 4096)]);
+    }
+
+    #[test]
+    fn many_ranges_become_their_envelope() {
+        let mut r = Vec::new();
+        for i in 0..300usize {
+            add_range(&mut r, i << 20, (i << 20) + 16);
+        }
+        assert!(r.len() <= 256);
+        assert_eq!(r.first().map(|x| x.0), Some(0));
+        assert_eq!(r.last().map(|x| x.1), Some((299 << 20) + 16));
     }
 }
 
@@ -6878,6 +6964,67 @@ unsafe extern "system" {
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Whether `device` offers GPU upload heaps (`D3D12_HEAP_TYPE_GPU_UPLOAD`:
+/// the card's memory, written by the CPU through a resizable BAR).
+pub(crate) fn gpu_upload_heaps(device: &ID3D12Device) -> bool {
+    let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    // SAFETY: a plain query into a structure of the size given.
+    unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool()
+    }
+}
+
+#[cfg(test)]
+mod gpu_upload_check {
+    /// Says whether this PC's card offers GPU upload heaps (run by hand:
+    /// `cargo test -p victory-gpu gpu_upload -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "asks the PC's own card"]
+    fn this_card_offers_gpu_upload_heaps() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: the default adapter, an out pointer of ours.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("a device");
+        let device = device.expect("a device");
+        println!("GPU upload heaps: {}", super::gpu_upload_heaps(&device));
+    }
+}
+
+/// [`write_mapped`] of what shaders wrote, back into title memory: with
+/// `VICTORY_FAST_TITLE_WRITE=1` (off by default) first by the same
+/// `rep movsb` as [`read_ours`] (the caller opened our guards there:
+/// `crate::watch::writing`), and through the kernel only if a fault failed
+/// it (a page not there or not writable; the bytes before it are written,
+/// and written again). Hundreds of pieces a frame each cost a kernel call
+/// (copy 162 of run cumul2: 206 pieces a frame).
+pub(crate) fn write_title(dst: *mut u8, src: *const u8, len: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let fast = *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_WRITE").is_some_and(|v| v == "1");
+        if on {
+            install_copy_recovery();
+            tracing::info!("VICTORY_FAST_TITLE_WRITE=1: what shaders wrote goes back into title memory without the kernel");
+        }
+        on
+    });
+    #[cfg(target_arch = "x86_64")]
+    if fast && len > 0 {
+        let (s, d) = (src as usize, dst as usize);
+        let apart = s.checked_add(len).is_some_and(|e| e <= d) || d.checked_add(len).is_some_and(|e| e <= s);
+        // SAFETY: `src` is `len` bytes of ours; a fault writing `dst` is
+        // taken by `install_copy_recovery`'s handler (the copy returns 0).
+        if apart && unsafe { fast_copy(dst, src, len) } != 0 {
+            return;
+        }
+    }
+    let _ = fast;
+    write_mapped(dst, src, len);
 }
 
 /// Copies host memory into title memory after a submission (what shaders
