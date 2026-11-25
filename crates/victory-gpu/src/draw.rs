@@ -2178,9 +2178,41 @@ impl State {
             let bytes = unsafe { std::slice::from_raw_parts(v.address as *const u8, four as usize) }.to_vec();
             vertices.push((slot as u32, v.stride, bytes));
         }
+        // Whether the title's vertex bytes may still be on the card only
+        // (written there and not copied back): ours would be stale.
+        let stale = self.vertex.iter().enumerate().any(|(slot, v)| {
+            p.slots & 1 << slot != 0
+                && crate::shadow::find_any(v.address, u64::from(v.size))
+                    .is_some_and(|s| s.writes_pending() || s.stale_under_writes(v.address as usize, (4 * v.stride) as usize))
+        });
+        once!(stale, "flat instances: title vertex bytes possibly stale on the CPU (logged once)");
+        let len = u64::from(stride);
+        // `VICTORY_FLAT_CHECK=vb`: the title's own pipeline, indices and
+        // instanced arguments over our vertex buffers (their first four
+        // vertices are the copy): an image as without the switch says the
+        // copy is right, and a wrong one the flat vertex shader.
+        if flat_check_vb() {
+            let buffers = flat_buffers(&pattern, &vertices)?;
+            args.refresh(list, arguments, len);
+            let bounded = crate::indirect::bound(list, (&args.buffer, args.offset(arguments)), None, (1, stride, 1))?;
+            if !self.prepare(list, true) {
+                crate::indirect::done(list, &bounded);
+                return Some(false);
+            }
+            // SAFETY: an open list with the pipeline bound; our buffers live
+            // for the run, the scratch buffer until the list is reset.
+            unsafe {
+                for (slot, view) in &buffers.vertices {
+                    list.list.IASetVertexBuffers(*slot, Some(&[*view]));
+                }
+                list.list.ExecuteIndirect(signature, 1, &bounded, 0, None, 0);
+            }
+            crate::indirect::done(list, &bounded);
+            self.drawn(list);
+            return Some(true);
+        }
         let flat = crate::pipeline::flat_pipeline(self.pipeline as This)?;
         let buffers = flat_buffers(&pattern, &vertices)?;
-        let len = u64::from(stride);
         args.refresh(list, arguments, len);
         let bounded = crate::indirect::bound_flat(list, (&args.buffer, args.offset(arguments)), stride, pattern.len() as u32)?;
         if !self.prepare(list, true) {
@@ -3272,6 +3304,12 @@ pub(crate) static FLAT_DRAWS: AtomicU64 = AtomicU64::new(0);
 /// `VICTORY_FLAT_INSTANCES=<shader hash prefix>,...`: the indexed indirect
 /// draws of pipelines naming one of those shaders have their small
 /// instances drawn flat (`State::draw_flat`). Unset: none.
+/// `VICTORY_FLAT_CHECK=vb` (see `State::draw_flat`).
+fn flat_check_vb() -> bool {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECK.get_or_init(|| std::env::var("VICTORY_FLAT_CHECK").is_ok_and(|v| v.trim() == "vb"))
+}
+
 fn flat_wanted(name: &str) -> bool {
     static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let wanted = WANTED.get_or_init(|| {
@@ -3365,7 +3403,21 @@ fn flat_buffers(pattern: &[u32], vertices: &[(u32, u32, Vec<u8>)]) -> Option<std
         ));
         kept.push(buffer);
     }
-    tracing::info!(?pattern, slots = vertices.len(), "flat instances: buffers made");
+    // The copied vertices, as words and as floats (what a check compares).
+    let words: Vec<String> = vertices
+        .iter()
+        .map(|(slot, stride, bytes)| {
+            let w: Vec<String> = bytes
+                .chunks_exact(4)
+                .map(|c| {
+                    let u = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    format!("{u:#x}={}", f32::from_bits(u))
+                })
+                .collect();
+            format!("slot {slot} stride {stride}: [{}]", w.join(", "))
+        })
+        .collect();
+    tracing::info!(?pattern, slots = vertices.len(), vertices = %words.join("; "), "flat instances: buffers made");
     let buffers = std::sync::Arc::new(FlatBuffers { index: index_view, vertices: views, _kept: kept });
     made.insert(key, buffers.clone());
     Some(buffers)
