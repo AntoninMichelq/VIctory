@@ -908,6 +908,9 @@ struct ClampChunks {
     used: usize,
     at: u64,
     barrier: bool,
+    /// Whether a clamp bound the clamps' root signature, pipeline and
+    /// budget in the list (`crate::indirect`, `VICTORY_CLAMP_BIND_ONCE`).
+    bound: bool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -5275,7 +5278,7 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-            (chunks.used, chunks.at, chunks.barrier) = (0, 0, false);
+            (chunks.used, chunks.at, chunks.barrier, chunks.bound) = (0, 0, false, false);
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6030,6 +6033,14 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         Some((buffer, 0))
+    }
+
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, the others find
+    /// them bound. After Belobug/VIctory-Belobug-AMD ab5ece8f (GPL-3).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
     }
 
     /// The clamped arguments written so far become readable as indirect

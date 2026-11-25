@@ -418,6 +418,19 @@ pub(crate) fn hoist_mode() -> u8 {
     })
 }
 
+/// `VICTORY_CLAMP_BIND_ONCE=1`: the hoisted clamps of a list bind their
+/// root signature, pipeline and budget once, not before each clamp (three
+/// calls fewer per indirect draw). After Belobug/VIctory-Belobug-AMD
+/// ab5ece8f (GPL-3). Off (the default): bound before each, as before.
+fn bind_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_CLAMP_BIND_ONCE").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "hoisted clamps bind their pipeline once a list (VICTORY_CLAMP_BIND_ONCE)");
+        on
+    })
+}
+
 /// Whether clamps of indirect draws go to a list before the one that draws.
 pub(crate) fn hoisting() -> bool {
     hoist_mode() != 0
@@ -465,14 +478,19 @@ pub(crate) fn bound_before(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
     // clamps write apart and charge the budget atomically.
+    // With `VICTORY_CLAMP_BIND_ONCE=1` the first clamp of the list binds
+    // the signature, pipeline and budget and the others find them bound:
+    // only clamps record compute state in `clamps`, and all bind the same.
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if !bind_once() || clamps.clamp_unbound() {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         if hoist_mode() == 7 {
             l.ResourceBarrier(&[uav_barrier()]);
