@@ -267,9 +267,14 @@ impl GraphicsState {
         g.rasterizer.CullMode = D3D12_CULL_MODE(r.raster.cull as i32);
         g.rasterizer.FrontCounterClockwise = r.raster.front_ccw.into();
         g.rasterizer.DepthClipEnable = r.raster.depth_clip.into();
-        g.rasterizer.DepthBias = r.raster.depth_bias;
-        g.rasterizer.SlopeScaledDepthBias = r.raster.slope_bias;
-        g.rasterizer.DepthBiasClamp = r.raster.bias_clamp;
+        if precompiled_depth_bias() {
+            g.rasterizer.DepthBias = r.raster.depth_bias;
+            g.rasterizer.SlopeScaledDepthBias = r.raster.slope_bias;
+            g.rasterizer.DepthBiasClamp = r.raster.bias_clamp;
+        }
+        if r.raster.conservative {
+            g.rasterizer.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        }
         if r.raster.wireframe {
             g.rasterizer.FillMode = D3D12_FILL_MODE_WIREFRAME;
         }
@@ -337,6 +342,16 @@ impl GraphicsState {
             }
         }
         blend
+    }
+
+    /// The depth bias and conservative rasterization of the title's own
+    /// state, if it has either (for the log: what the title sets where
+    /// precompiled pipelines have their registers).
+    pub(crate) fn bias_and_conservative(&self) -> Option<(i32, f32, f32, bool)> {
+        let r = &self.rasterizer;
+        let conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        (r.DepthBias != 0 || r.SlopeScaledDepthBias != 0.0 || r.DepthBiasClamp != 0.0 || conservative)
+            .then_some((r.DepthBias, r.SlopeScaledDepthBias, r.DepthBiasClamp, conservative))
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
@@ -451,6 +466,19 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+/// Whether precompiled pipelines get the depth bias their registers hold
+/// (`VICTORY_PRECOMPILED_DEPTH_BIAS=1`; off by default). Read as D3D12's
+/// (slope = scale / 16, as RADV writes it), it is (0.003 clamp, 1.8125
+/// slope) on every cascade shadow pass, and run 52 lost the shadows of
+/// hair and of a room's walls with it (the hair strands and the room lit
+/// by the sun, where runs 43 and 51, with the title's own pipelines and
+/// with no bias, have them in shadow): the units are not those. The
+/// title's own pipelines log their bias ([`GraphicsState::bias_and_conservative`]).
+fn precompiled_depth_bias() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED_DEPTH_BIAS").is_some_and(|v| v != "0"))
 }
 
 /// Whether a target's blending reads the pixel shader's second output
@@ -907,6 +935,15 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
+        if desc.RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+            && !host.conservative_raster()
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a pipeline rasterizes conservatively, which the host GPU does not: it does not")
+            });
+            desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+        }
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {

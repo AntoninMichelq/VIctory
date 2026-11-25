@@ -4089,6 +4089,28 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU rasterizes conservatively (any tier).
+    pub(crate) fn conservative_raster(&self) -> bool {
+        static TIER: OnceLock<bool> = OnceLock::new();
+        *TIER.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok
+                && options.ConservativeRasterizationTier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            tracing::info!(supported, tier = options.ConservativeRasterizationTier.0, "host conservative rasterization");
+            supported
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         self.new_list_of(false)

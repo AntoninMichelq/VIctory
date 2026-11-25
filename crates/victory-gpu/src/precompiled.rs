@@ -296,6 +296,8 @@ mod at {
     pub const STENCIL_REF_MASK_BF: usize = 49;
     /// `PA_SU_POLY_OFFSET_CLAMP`, then `_FRONT_SCALE` and `_FRONT_OFFSET`.
     pub const POLY_OFFSET: usize = 43;
+    /// `PA_SC_CONSERVATIVE_RASTERIZATION_CNTL`.
+    pub const CONSERVATIVE: usize = 72;
     /// `CB_TARGET_MASK`: four bits (RGBA) a target.
     pub const TARGET_MASK: usize = 51;
     /// `CB_BLEND0_CONTROL`, seven more after it.
@@ -377,6 +379,8 @@ pub struct Raster {
     pub depth_bias: i32,
     pub slope_bias: f32,
     pub bias_clamp: f32,
+    /// Overestimating conservative rasterization.
+    pub conservative: bool,
 }
 
 /// The pipeline state a graphics description's registers section holds,
@@ -417,6 +421,7 @@ impl GraphicsRegisters {
                 depth_bias: 0,
                 slope_bias: 0.0,
                 bias_clamp: 0.0,
+                conservative: false,
             },
         }
     }
@@ -565,6 +570,13 @@ impl GraphicsRegisters {
             } else {
                 notes.push("a polygon offset that is not a number: none");
             }
+        }
+        // PA_SC_CONSERVATIVE_RASTERIZATION_CNTL: `0x00100000` (RADV's
+        // default, NULL_SQUAD_AA_MASK_ENABLE) in nearly all; `0x00e00441`,
+        // bit 0 OVER_RAST_ENABLE, on fog volume proxies, trail maps and a
+        // pixel shader named `ps_light_proxy_conservative` (run 50).
+        if let Some(&cntl) = dwords.get(at::CONSERVATIVE) {
+            r.raster.conservative = bits(cntl, 0, 1) != 0;
         }
         (r, notes)
     }
@@ -1353,6 +1365,7 @@ mod tests {
                 depth_bias: 0,
                 slope_bias: 0.0,
                 bias_clamp: 0.0,
+                conservative: false,
             }
         );
         // Front culled, clockwise front, lines, no depth clipping.
@@ -1370,12 +1383,25 @@ mod tests {
                 depth_bias: 0,
                 slope_bias: 0.0,
                 bias_clamp: 0.0,
+                conservative: false,
             }
         );
         assert!(notes.is_empty(), "{notes:?}");
         let (r, notes) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 3)]));
         assert_eq!(r.raster.cull, 1);
         assert_eq!(notes.len(), 1);
+    }
+
+    /// Conservative rasterization (dword 72 of run 50's fog volume and
+    /// trail map passes), and its default.
+    #[test]
+    fn decodes_conservative_rasterization() {
+        let on = registers(&[(at::CONSERVATIVE, 0x00e0_0441)]);
+        assert!(GraphicsRegisters::decode(&on).0.raster.conservative);
+        let off = registers(&[(at::CONSERVATIVE, 0x0010_0000)]);
+        assert!(!GraphicsRegisters::decode(&off).0.raster.conservative);
+        // A section ending before it (none seen): off.
+        assert!(!GraphicsRegisters::decode(&on[..70]).0.raster.conservative);
     }
 
     /// The polygon offsets of run 50's descriptions: (clamp, scale,

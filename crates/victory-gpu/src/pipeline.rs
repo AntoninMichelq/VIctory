@@ -1291,6 +1291,20 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    // What precompiled pipelines have in registers whose units are not
+    // sure: the title's own depth bias and conservative rasterization, by
+    // shaders, once each (a run with `VICTORY_PRECOMPILED_GRAPHICS=0` has
+    // the title make the same pipelines this way).
+    #[cfg(windows)]
+    if let Some((bias, slope, clamp, conservative)) = graphics.bias_and_conservative() {
+        static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+        let key = format!("{shaders:?} {bias} {slope} {clamp} {conservative}");
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() < 4096 && seen.insert(key) {
+            tracing::info!(?shaders, bias, slope, clamp, conservative, "a title pipeline with depth bias or conservative rasterization");
+        }
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -1707,6 +1721,27 @@ mod rect_diag {
 /// victory-gpu --lib dumped_graphics -- --ignored --nocapture`.
 #[cfg(all(test, windows))]
 mod gfx_diag {
+    /// The shader pack's containers by the hash the log names them with,
+    /// and their names (`PS_<material>_..._Wrapped`), into
+    /// `VICTORY_PACK_NAMES=<file>`: `cargo test -p victory-gpu --lib
+    /// pack_names -- --ignored`.
+    #[test]
+    #[ignore = "reads the title's shader pack"]
+    fn pack_names() {
+        let (Some(pack), Some(out)) = (std::env::var_os("VICTORY_SHADER_PACK"), std::env::var_os("VICTORY_PACK_NAMES")) else {
+            return;
+        };
+        let file = std::fs::read(&pack).unwrap();
+        let lines: Vec<String> = victory_game::sgd5::records(&file)
+            .filter_map(|r| {
+                let c = r.unpack()?;
+                Some(format!("{} {}", &blake3::hash(&c).to_hex()[..16], r.name.unwrap_or("?")))
+            })
+            .collect();
+        std::fs::write(out, lines.join("
+")).unwrap();
+    }
+
     #[test]
     #[ignore = "reads the title's shader pack and dumps, and needs the host GPU"]
     fn dumped_graphics_descriptions_are_made() {

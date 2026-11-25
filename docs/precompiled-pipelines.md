@@ -138,7 +138,7 @@ against GFX10's public register layouts:
 | 31 | `0x00cc0010` (all) | `CB_COLOR_CONTROL`: normal mode, ROP3 copy (not read) |
 | 39 | `0x00080000` (all) | `PA_CL_CLIP_CNTL`: DX clip space; bits 26/27 (near/far clipping off) read as `DepthClipEnable` |
 | 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bit 11 front polygon offset on (read; set in all) |
-| 43-45 | `0` mostly; `0, 16.0, 1.0`; `0.003, 29.0, 0` (floats, run 50) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET` (read): `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset; the second set on passes without depth clipping (dword 39 `0x0c080000`) |
+| 43-45 | `0` mostly; `0, 16.0, 1.0` (contact markers, entity masks); `0.003, 29.0, 0` (every cascade shadow pass, hair strands included) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET`. Read as `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset, but **not applied by default** (`VICTORY_PRECOMPILED_DEPTH_BIAS=1`): run 52 lost the hair's and a room's shadows with it, where runs 43 (the title's own pipelines) and 51 (no bias) have them; the units are not those |
 | 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL` (read): stencil, depth, depth write, depth bounds, depth func (bits 4-6), two-sided stencil (7), stencil funcs (8-10, 20-22); `0x007007f0` = no depth test, no stencil; `0x7e2` = greater-or-equal test, no write |
 | 47 | `0` (62), `0x1001`, `0x80080` | `DB_STENCIL_CONTROL` (read): fail, depth-pass, depth-fail ops, front then back, 4 bits each (`0x80080` = add one wrapping on pass) |
 | 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (read: mask, write mask; the test value is the draw's reference on the host; op value 1 = D3D12's increments) |
@@ -146,7 +146,8 @@ against GFX10's public register layouts:
 | 52-59 | `0x80000000` (23), `0xe5040504` (25), ... | `CB_BLEND0..7_CONTROL` (read): colour source, function, destination (bits 0-4, 5-7, 8-12), the same for alpha (16-28), bit 29 separate alpha, bit 30 enable, bit 31 no ROP3; `0xe5040504` = source alpha / one minus source alpha |
 | 64-71 | `0x06000600` (23), `0x01540154` (25), ... | `SX_MRT0..7_BLEND_OPT`, matching dwords 52-59 (`6` = blending off; not read) |
 | 63 | `0` / `0x33333333` | not identified (0 where blending is on, `0x33333333` where it is off) |
-| 74 | `0x19fc0130` (47), `...01c0`, `...0120` | likely `DB_SHADER_CONTROL`: Z order in bits 4-5 (late Z with kill, bit 6, in `0x1c0`); nothing D3D12 needs |
+| 72 | `0x00100000` (all but 8 of 4,314 in run 50), `0x00e00441` | `PA_SC_CONSERVATIVE_RASTERIZATION_CNTL` (read): the default is RADV's (NULL_SQUAD_AA_MASK_ENABLE); bit 0 OVER_RAST_ENABLE on fog volume proxies, trail maps and `ps_light_proxy_conservative`: D3D12's conservative rasterization (where the host has it) |
+| 74 | `0x19fc0130` (47), `...01c0`, `...0120`, `...0131` | `DB_SHADER_CONTROL`: bit 0 Z export (the pixel shaders writing `SV_Depth`), Z order in bits 4-5, kill in bit 6; bit 11 (alpha to mask disable) never set; nothing D3D12 needs |
 | 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
 
 The eight blend controls and write masks become one description per
@@ -241,7 +242,18 @@ rectangle pass that composes them were refused for want of an input layout
 - The front face reading (bit 2 of dword 40): all run-45 states with
   culling that a section matches agree with it (counter-clockwise front).
 - The words of the info section's header besides the layout's size.
-- Dwords 63 and 92-96 of the graphics registers.
+- Dwords 22-38, 61-63 and 92-96 of the graphics registers. In run 50's
+  21,864 sections (95 to 105 dwords; the dwords read above are at the same
+  positions in all, the extra ones at the end) none looks like a state
+  D3D12 takes at creation: no alpha-to-coverage enable is set anywhere
+  (`DB_SHADER_CONTROL` bit 11 never; no `DB_ALPHA_TO_MASK`-like dword),
+  the sample masks (dwords 60, 86) are all ones, as the host's default.
+  Dword 30 (`0xf`, `0xff`, `0xfff`) looks like `CB_SHADER_MASK`, but is
+  `0xf` for the depth-only hair shadow pass too (a null export).
+- The units of the depth bias (dwords 43-45, above): the title's own
+  pipelines log theirs ("a title pipeline with depth bias or conservative
+  rasterization"); a run with `VICTORY_PRECOMPILED_GRAPHICS=0` gives them
+  for the same shaders.
 - Host pipelines of precompiled pipelines are not started early in later
   runs (their variants appear only at draws).
 - Whether the run-time code differs from the container's program in more
