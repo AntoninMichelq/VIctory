@@ -964,6 +964,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            // Two title textures over the same memory can have one host
+            // texture between them: the copy would be of that texture onto
+            // itself, which the host does not allow (its debug layer: a
+            // destination left in the source state) and which changes
+            // nothing. Left out (after fxceless/victory-fork a253706).
+            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(?dst, ?src, "a copy between two title textures that share one host texture is left out")
+                });
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
