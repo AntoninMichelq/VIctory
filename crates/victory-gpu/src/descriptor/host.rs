@@ -994,7 +994,20 @@ impl HostHeap {
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
         }
-        self.unmake(&mut made, index);
+        // A grey stand-in where it can be one: drawn until the queue makes
+        // the slot again, instead of a null view's zeros.
+        let grey = made
+            .get(index as usize)
+            .and_then(|&key| view_at(key as u32, (key >> 32) as u32))
+            .is_some_and(|view| grey_for(&view, self.cpu(index)));
+        if grey {
+            if let Some(key) = made.get_mut(index as usize) {
+                *key = 0;
+            }
+            self.keep(index, None);
+        } else {
+            self.unmake(&mut made, index);
+        }
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
@@ -2363,6 +2376,140 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// `VICTORY_EVICT_GREY` (on; `=0` off): [`grey_for`].
+fn evict_grey() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_GREY").is_none_or(|v| v != "0"))
+}
+
+/// The grey stand-in texture: 4x4, 6 slices (2D, 2D array, cube and cube
+/// array views fit), one level, RGB 0x80 and alpha 0, in CPU-written
+/// system memory (no list needed to fill it).
+struct Grey(ID3D12Resource);
+// SAFETY: written once at creation, then only read by the card.
+unsafe impl Send for Grey {}
+// SAFETY: as above.
+unsafe impl Sync for Grey {}
+
+fn grey_texture() -> Option<&'static ID3D12Resource> {
+    static GREY: std::sync::OnceLock<Option<Grey>> = std::sync::OnceLock::new();
+    GREY.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 6,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a CPU-visible texture.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut texture,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, "no grey stand-in texture for slots given up: they read zeros");
+            return None;
+        }
+        let texture = texture?;
+        let texels = [0x0080_8080u32; 16];
+        for slice in 0..6 {
+            // SAFETY: mapped with no pointer (as WriteToSubresource asks);
+            // 16 texels of 4 bytes, rows of 16 bytes, one slice; the
+            // texture is not in use yet.
+            let written = unsafe {
+                texture
+                    .Map(slice, None, None)
+                    .and_then(|()| texture.WriteToSubresource(slice, None, texels.as_ptr().cast(), 16, 64))
+            };
+            if let Err(e) = written {
+                tracing::warn!(error = %e, "the grey stand-in texture could not be written: slots given up read zeros");
+                return None;
+            }
+        }
+        Some(Grey(texture))
+    })
+    .as_ref()
+    .map(|g| &g.0)
+}
+
+/// For a texture slot given up for room ([`HostHeap::texture_slot_gone`]):
+/// a view of the grey stand-in of the dimension `view` has (2D, 2D array,
+/// cube, cube array) instead of a null view. Zeros drew characters as dark
+/// silhouettes with chrome streaks (black colour, normals of (-1, -1));
+/// mid-grey reads as a plain colour and a flat normal, alpha stays 0 as a
+/// null view's. False (nothing made) for other views or with
+/// `VICTORY_EVICT_GREY=0`.
+fn grey_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    if !evict_grey() {
+        return false;
+    }
+    let View::Shader(r, Some(words)) = view else {
+        return false;
+    };
+    if crate::resource::buffer_bytes(*r as crate::object::This).is_some() {
+        return false;
+    }
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_SRV_DIMENSION(words[1] as i32),
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            };
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: 1,
+                ArraySize: 6,
+                ..Default::default()
+            };
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            desc.Anonymous.TextureCube = D3D12_TEXCUBE_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            };
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            desc.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV {
+                MipLevels: 1,
+                NumCubes: 1,
+                ..Default::default()
+            };
+        }
+        _ => return false,
+    }
+    let (Some(host), Some(texture)) = (host(), grey_texture()) else {
+        return false;
+    };
+    // SAFETY: a live texture of 6 slices and a slot of our heap.
+    unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
+    true
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
