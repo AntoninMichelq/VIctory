@@ -369,6 +369,14 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 ///   `v_mad_legacy_f32`), see `legacy_mul`.
 /// - 2: `v_max_f32`/`v_min_f32` and their three-operand forms, see `max_min`.
 /// - 4: `v_med3_f32`, see `med3`.
+/// - 8: the D3D9 multiply as the plain product (one instruction), with
+///   the operations that make infinities kept from making them instead:
+///   `v_rcp_f32` takes a denominator of at least 1e-30 in size (a zero
+///   one becomes +1e-30), `v_rsq_f32` and `v_log_f32` an operand of at
+///   least 1e-30, `v_sqrt_f32` one of at least 0. An infinity that comes
+///   from memory or an overflow can still make a NaN (`0 × ∞`).
+/// - 16: a pixel program's float outputs that are not finite become 0
+///   (a NaN reaching a target spreads through blur and bloom passes).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -379,7 +387,7 @@ pub fn lean_math() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
-            & 7
+            & 31
     })
 }
 
@@ -3791,6 +3799,9 @@ impl<'a> Lower<'a> {
     /// a zero product may be -0 where the console's is +0.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if lean_math() & 8 != 0 {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
         if lean_math() & 1 != 0 {
             let finite = |bits: u32| bits & 0x7F80_0000 != 0x7F80_0000;
             for k in [a, b] {
@@ -7573,7 +7584,14 @@ impl<'a> Lower<'a> {
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
-                let a = f(self, 0)?;
+                let mut a = f(self, 0)?;
+                if lean_math() & 8 != 0 {
+                    // |a| < 1e-30 (NaN too: unordered) -> 1e-30
+                    let small = self.s.m.f32(1e-30f32.to_bits());
+                    let m = self.unary(6, a);
+                    let under = self.s.m.cmp(c, pred::ULT, m, small);
+                    a = self.s.m.select(c, under, small, a);
+                }
                 let one = self.s.m.f32(1.0f32.to_bits());
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 float(self, r)
@@ -7581,7 +7599,18 @@ impl<'a> Lower<'a> {
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
-                let a = f(self, 0)?;
+                let mut a = f(self, 0)?;
+                if lean_math() & 8 != 0 {
+                    let floor = match name {
+                        "v_rsq_f32" | "v_log_f32" => Some(1e-30f32),
+                        "v_sqrt_f32" => Some(0.0f32),
+                        _ => None,
+                    };
+                    if let Some(floor) = floor {
+                        let k = self.s.m.f32(floor.to_bits());
+                        a = self.binary(35, a, k);
+                    }
+                }
                 let op = match name {
                     "v_rsq_f32" => 25,
                     "v_sqrt_f32" => 24,
@@ -11385,10 +11414,21 @@ impl<'a> Lower<'a> {
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
-                    let f = match self.floats.get(&value) {
+                    let mut f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
+                    if lean_math() & 16 != 0 && self.s.pixel && !mesh {
+                        // finite: |bits| below the infinity's
+                        let c = self.cur;
+                        let bits = self.as_int(f);
+                        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+                        let m = self.s.m.bin(c, Bin::And, bits, magnitude);
+                        let inf = self.s.m.i32(0x7F80_0000);
+                        let finite = self.s.m.cmp(c, pred::IULT, m, inf);
+                        let zero = self.s.m.f32(0);
+                        f = self.s.m.select(c, finite, f, zero);
+                    }
                     (".f32", f)
                 }
                 _ => (".i32", x),
