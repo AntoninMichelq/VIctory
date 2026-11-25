@@ -613,11 +613,51 @@ fn find_player() -> Result<Player, String> {
         let m = read_matrix(a).unwrap_or_default();
         tracing::info!(address = format_args!("{a:#x}"), position = ?[m[12], m[13], m[14]], "tour: player matrix");
     }
-    match player.len() {
-        0 => Err("nothing moved with the player's walks (no control yet, or a cutscene?)".into()),
-        n if n > 64 => Err(format!("{n} matrices moved with the player: too many to tell apart")),
-        _ => Ok(Player { addresses: player }),
+    if player.is_empty() {
+        return Err("nothing moved with the player's walks (no control yet, or a cutscene?)".into());
     }
+    // The player's body is many matrices (a skeleton's bones, its physics,
+    // the camera that follows): all are written, they are recomputed from
+    // the player anyway. Those far from the crowd's middle are something
+    // else that happened to move alike.
+    let positions: Vec<(usize, [f32; 3])> =
+        player.iter().filter_map(|&a| read_matrix(a).map(|m| (a, [m[12], m[13], m[14]]))).collect();
+    let median = |k: usize| {
+        let mut v: Vec<f32> = positions.iter().map(|p| p.1[k]).collect();
+        v.sort_by(f32::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or_default()
+    };
+    let middle = [median(0), median(1), median(2)];
+    let near: Vec<usize> = positions
+        .iter()
+        .filter(|(_, p)| flat(*p, middle) < 5.0 && (p[2] - middle[2]).abs() < 5.0)
+        .map(|&(a, _)| a)
+        .collect();
+    tracing::info!(near = near.len(), ?middle, "tour: of those, the ones around the player");
+    if near.is_empty() || near.len() > 4096 {
+        return Err(format!("{} matrices around the player: cannot use them", near.len()));
+    }
+    let found = Player { addresses: near };
+    // Proof: lifted 8 m for 2 s, then let go; if the player itself moved,
+    // the matrices recomputed from it stay up there for a moment.
+    let up = [middle[0], middle[1], middle[2] + 8.0];
+    let hold = found.hold_at(up);
+    std::thread::sleep(Duration::from_secs(2));
+    drop(hold);
+    std::thread::sleep(Duration::from_millis(300));
+    let stayed = found
+        .addresses
+        .iter()
+        .filter_map(|&a| read_matrix(a))
+        .filter(|m| m[14] > middle[2] + 4.0)
+        .count();
+    tracing::info!(stayed, of = found.addresses.len(), "tour: matrices still up after the lift was let go");
+    if stayed * 4 < found.addresses.len() {
+        // Gone on with all the same: held over and over at a place, the
+        // matrices may still carry the player (the results will say).
+        tracing::warn!("tour: the lift did not seem to move the player; going on all the same");
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
