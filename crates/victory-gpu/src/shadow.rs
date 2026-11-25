@@ -181,6 +181,15 @@ fn card_room() -> u64 {
     })
 }
 
+/// `VICTORY_CARD_SEND_CHANGED=1` (off by default): a refresh of a copy in
+/// the card's memory sends to the card only the bytes that changed
+/// ([`Shadow::copy_changed`]), not every page the title (or our own
+/// copy-back) wrote.
+fn send_changed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SEND_CHANGED").is_some_and(|v| v == "1"))
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -2533,12 +2542,55 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if self.card.is_some() && send_changed() && from < to {
+            return self.copy_changed(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        to - from
+    }
+
+    /// [`Shadow::copy`] of a copy in the card's memory under
+    /// [`send_changed`]: title memory `[from, to)` (inside the buffer) is
+    /// read beside the CPU's side and only the runs that differ are put in
+    /// and go to the card. The card's side holds what the CPU's side holds
+    /// outside ranges still to be sent (those stay to be sent) and ranges
+    /// shaders write (never refreshed), so bytes equal to the CPU's side
+    /// need not go. Most of them were ours: bytes put back into title
+    /// memory after a submission show as title writes at the next refresh,
+    /// and their pages went up again whole (run cumul2 23:46: 83 MB sent a
+    /// frame for 54 MB put back).
+    fn copy_changed(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        let (a, b) = (from - start, to - start);
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(a), b - a) };
+        // What the read leaves (pages not there) stays as the CPU's side.
+        let mut now = pooled(b - a);
+        now.extend_from_slice(held);
+        crate::host::copy_mapped(now.as_mut_ptr(), from as *const u8, to - from, false);
+        // Runs that differ, joined across gaps of under 256 bytes (fewer,
+        // longer copies to the card).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (at, n) in changed_runs(&now, held) {
+            match runs.last_mut() {
+                Some(last) if at < last.1 + 256 => last.1 = at + n,
+                _ => runs.push((at, at + n)),
+            }
+        }
+        let mut sent = 0;
+        for &(x, y) in &runs {
+            held[x..y].copy_from_slice(&now[x..y]);
+            self.changed(a + x, a + y);
+            self.card_changed(a + x, a + y);
+            sent += y - x;
+        }
+        give_back(now);
+        self.top(crate::copytop::SAVED, (b - a - sent) as u64);
         to - from
     }
 

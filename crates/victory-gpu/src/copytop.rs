@@ -27,7 +27,11 @@ pub(crate) const SENT: usize = 1;
 pub(crate) const DECLARED: usize = 2;
 pub(crate) const SNAP: usize = 3;
 pub(crate) const BACK: usize = 4;
-const KINDS: usize = 5;
+/// Of `up`, for a copy in the card's memory with
+/// `VICTORY_CARD_SEND_CHANGED=1`: bytes read that equalled the copy and
+/// were not sent (mostly the echo of `back`).
+pub(crate) const SAVED: usize = 5;
+const KINDS: usize = 6;
 
 /// One copy's counts since the last line.
 struct Row {
@@ -120,7 +124,7 @@ pub(crate) fn line() {
     let [not_ready, cap, full, host] = [0, 1, 2, 3].map(refused);
     tracing::info!(
         "copy stats per frame (VICTORY_COPY_STATS=1), {} copies moved bytes: up {:.1} MB, sent to the card {:.1} MB, \
-         declared shader writes {:.1} MB, snapshotted {:.1} MB, back {:.1} MB; big buffers refused a card copy since the \
+         declared shader writes {:.1} MB, snapshotted {:.1} MB, back {:.1} MB, not sent as unchanged {:.1} MB; big buffers refused a card copy since the \
          last line: card not ready {} ({} MB), at VICTORY_CARD_BUFFERS_MB {} ({} MB), card past 80% of its budget {} ({} MB), \
          host refused {} ({} MB); the top {}:",
         all.len(),
@@ -129,6 +133,7 @@ pub(crate) fn line() {
         mb(sums[DECLARED]),
         mb(sums[SNAP]),
         mb(sums[BACK]),
+        mb(sums[SAVED]),
         not_ready.0,
         not_ready.1,
         cap.0,
@@ -143,7 +148,7 @@ pub(crate) fn line() {
         let per = |k: usize| r.times[k] as f64 / frames;
         tracing::info!(
             "copy stats #{:<2} copy {id} title {:#x}+{:.1} MB {}{}: up {:.2} MB ({:.0}x), sent {:.2} MB ({:.0}x), declared {:.2} MB ({:.0}x), \
-             snap {:.2} MB, back {:.2} MB ({:.0}x){}",
+             snap {:.2} MB, back {:.2} MB ({:.0}x), not sent {:.2} MB{}",
             rank + 1,
             r.start,
             r.len as f64 / 1e6,
@@ -158,6 +163,7 @@ pub(crate) fn line() {
             mb(r.bytes[SNAP]),
             mb(r.bytes[BACK]),
             per(BACK),
+            mb(r.bytes[SAVED]),
             // Echo: bytes read up again after we wrote them back.
             if r.bytes[BACK] > 0 && r.bytes[UP] > 0 { " (up includes the echo of back)" } else { "" }
         );
