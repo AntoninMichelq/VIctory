@@ -1915,11 +1915,6 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// What a draw or dispatch runs, for the device-removed report
-    /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
-    #[cfg(feature = "diagnostics")]
     /// `VICTORY_ARGS_PEEK=<hash prefix>,...`: the arguments (clamped, as
     /// the card reads them) of the indirect commands whose pipeline names
     /// one of those shaders, read back once the list has run and logged
@@ -1975,6 +1970,11 @@ impl State {
         });
     }
 
+    /// What a draw or dispatch runs, for the device-removed report
+    /// (diagnostics): the pipeline, then per stage the user data it gets
+    /// (with the view at that heap index, if one is), the host addresses
+    /// of its root views and the views its tables name.
+    #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
