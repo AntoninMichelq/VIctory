@@ -6610,11 +6610,12 @@ impl Meter {
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SPLIT_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
             let made = crate::texture::STAGING_POOL[0].swap(0, Ordering::Relaxed) as f64 / frames;
             let reused = crate::texture::STAGING_POOL[1].swap(0, Ordering::Relaxed) as f64 / frames;
+            let ahead = crate::texture::STAGING_POOL[3].swap(0, Ordering::Relaxed) as f64 / frames;
             if picked_ms >= 1.0 {
                 tracing::info!(
                     "heap passes per frame: {slots:.1} ms looking at slots, {views:.1} ms refreshing buffer views, \
                      {textures:.1} ms on textures picked by index ({mirrors:.1} ms making their host views, {staging:.1} ms \
-                     making them readable); staging buffers per frame: {made:.1} made, {reused:.1} reused \
+                     making them readable); staging buffers per frame: {made:.1} made, {reused:.1} reused, {ahead:.1} made ahead \
                      (VICTORY_STAGING_POOL_MB={}, {:.0} MB kept now)",
                     crate::texture::staging_pool_mb(),
                     crate::texture::STAGING_POOL[2].load(Ordering::Relaxed) as f64 / 1e6,
