@@ -15,6 +15,8 @@ mod host;
 pub mod modules;
 mod registry;
 pub mod runtime;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod tour;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};

@@ -105,6 +105,22 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// Keys the map tour (`crate::tour`) holds down, as virtual keys.
+#[cfg(feature = "diagnostics")]
+static TOUR_KEYS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Holds `keys` (virtual keys) down until the next call, as scripted keys
+/// are (`VICTORY_KEYS`): the stand-in pad and the first real pad see them.
+#[cfg(feature = "diagnostics")]
+pub fn hold_keys(keys: &[u8]) {
+    *TOUR_KEYS.lock().unwrap_or_else(|e| e.into_inner()) = keys.to_vec();
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn held_by_tour() -> Vec<u8> {
+    TOUR_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -1152,10 +1168,17 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
+                let scripted = scripted();
+                for &vk in &scripted {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                }
+                // The map tour walks with W/A/S/D: the left stick too.
+                let on = |vk: u8| if scripted.contains(&vk) { 1.0 } else { 0.0 };
+                let (x, y) = (on(b'D') - on(b'A'), on(b'W') - on(b'S'));
+                if x != 0.0 || y != 0.0 {
+                    (pad.left_x, pad.left_y) = (x, y);
                 }
             }
             Some(pad)
@@ -1231,10 +1254,17 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        for vk in super::held_by_tour() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
