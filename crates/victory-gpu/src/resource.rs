@@ -2082,7 +2082,7 @@ pub(crate) fn note_drawn(this: This) {
         return;
     }
     let frame = crate::frame::current();
-    if LOADING_OVER.load(Relaxed) == frame + 1 {
+    if LOADING_OVER.load(Relaxed) == frame.wrapping_add(1) {
         return;
     }
     let mut noted = LOADING_NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -2094,7 +2094,7 @@ pub(crate) fn note_drawn(this: This) {
     }
     if noted.1.len() >= LOADING_FULL_PER_FRAME {
         // The world's frame: none of its textures goes full size.
-        LOADING_OVER.store(frame + 1, Relaxed);
+        LOADING_OVER.store(frame.wrapping_add(1), Relaxed);
         noted.1.clear();
         return;
     }
@@ -2157,8 +2157,8 @@ pub(crate) fn loading_full_frame(ended: u64, loading: bool) {
     if !again.is_empty() {
         crate::descriptor::forget_views_of(&again);
     }
-    let over = LOADING_OVER.load(Relaxed) == ended + 1;
-    state.streak = if loading && !over { state.streak + 1 } else { 0 };
+    let over = LOADING_OVER.load(Relaxed) == ended.wrapping_add(1);
+    state.streak = if loading && !over { state.streak.saturating_add(1) } else { 0 };
     let mut old = Vec::new();
     let (mut went_full, mut went_back) = (0u32, 0u32);
     let mut first = None;
