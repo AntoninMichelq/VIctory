@@ -5972,7 +5972,27 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
+        // shortcut: an image descriptor the code reads only for its size, picked from a
+        // table by a computed index (the puddle passes read one texture's width, height
+        // and base level, then sample others of the same table by other indices): its
+        // kind is that of the nearest other load of as many dwords from the same table
+        // by a computed index that the code uses as a descriptor. The handle is still
+        // this load's own; a view of another kind there would give wrong sizes.
+        let sibling = || {
+            let a = address?;
+            if count != 8 || a.dynamic.is_none() {
+                return None;
+            }
+            let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
+            x.res
+                .scalar
+                .iter()
+                .filter(|(s, b)| *s != site && b.param == a.param && b.dynamic.is_some() && same(*s))
+                .filter_map(|(s, _)| use_of(*s).map(|u| (*s, u)))
+                .min_by_key(|(s, _)| (s.0.abs_diff(site.0), s.1.abs_diff(site.1)))
+                .map(|(_, u)| u)
+        };
+        let use_at = use_of(site).or_else(twin).or_else(sibling);
         let (at, first) = if let Some((at, first)) = use_at {
             (Some(at), first)
         } else {
@@ -6009,13 +6029,14 @@ impl<'a> Lower<'a> {
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                let records = if count > 2 { self.declared_records(site) } else { None };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
                         0 => self.write(inst, reg, lo, None),
                         1 => self.write(inst, reg, hi, None),
                         2 if inst.write(reg).is_some() => {
-                            match self.view_records(site) {
+                            match self.view_records(site).or(records) {
                                 Some(n) => self.write(inst, reg, n, None),
                                 None => {
                                     if let Some(v) = inst.write(reg) {
@@ -6489,6 +6510,30 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// The record count of a buffer descriptor the code never uses as one, from the
+    /// program's own list of the resources it declares (a buffer view of four dwords):
+    /// the console compiler tests a structured buffer's emptiness by its descriptor's
+    /// record count (dword 2). `None` where the list names no such view there.
+    fn declared_records(&mut self, site: Site) -> Option<V> {
+        let src = Source::Loaded { load: site, first: 0 };
+        let used = self.used_kind(&src)?;
+        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+            return None;
+        }
+        let u = if used.kind == ResourceType::Uav { 0x1000 } else { 0 };
+        let stride = used.stride;
+        let structured = stride >= 4 && stride.is_multiple_of(4);
+        let props = if structured { (12 | u, stride) } else { (11 | u, 0) };
+        let h = self.handle(site, &src, false, props).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        // A structured view counts elements, a raw one bytes.
+        Some(self.s.m.extract(c, d, 0))
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
@@ -12479,3 +12524,4 @@ mod tests {
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
 }
+
