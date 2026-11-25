@@ -241,7 +241,6 @@ impl GraphicsState {
                 InstanceDataStepRate: e.step_rate,
             })
             .collect();
-        g.blend.IndependentBlendEnable = true.into();
         for (i, target) in g.blend.RenderTarget.iter_mut().enumerate() {
             let b = &r.blend[i];
             *target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -256,6 +255,15 @@ impl GraphicsState {
                 ..*target
             };
         }
+        // The registers hold a blend control and write mask per target,
+        // the same for all in most descriptions. Blending with the pixel
+        // shader's second output (dual source) is target 0's alone in
+        // D3D12, which refuses it with independent blending
+        // (`E_INVALIDARG`: run 52 lost the window glass of the prison yard
+        // that way), so it takes target 0's description then.
+        let first = g.blend.RenderTarget[0];
+        let differ = g.blend.RenderTarget[1..].iter().any(|t| *t != first);
+        g.blend.IndependentBlendEnable = (differ && !dual_source(&first)).into();
         g.rasterizer.CullMode = D3D12_CULL_MODE(r.raster.cull as i32);
         g.rasterizer.FrontCounterClockwise = r.raster.front_ccw.into();
         g.rasterizer.DepthClipEnable = r.raster.depth_clip.into();
@@ -308,11 +316,16 @@ impl GraphicsState {
     /// console writes nothing there for want of an export, while the host
     /// would write undefined values (run 45 showed the title's own
     /// pipelines of such shaders with a write mask of 0).
+    /// Not with dual-source blending, where target 0's description is the
+    /// only one and the shader's outputs are its two sources.
     pub(crate) fn host_blend_writing(&self, written: Option<u8>) -> D3D12_BLEND_DESC {
         let mut blend = self.host_blend();
         let Some(written) = written.filter(|_| self.unwritten_masked) else {
             return blend;
         };
+        if dual_source(&blend.RenderTarget[0]) {
+            return blend;
+        }
         if !blend.IndependentBlendEnable.as_bool() {
             blend.IndependentBlendEnable = true.into();
             let first = blend.RenderTarget[0];
@@ -438,6 +451,19 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+/// Whether a target's blending reads the pixel shader's second output
+/// (`SRC1_*` factors), which D3D12 allows for target 0 alone and without
+/// independent blending.
+fn dual_source(t: &D3D12_RENDER_TARGET_BLEND_DESC) -> bool {
+    let second = |b: D3D12_BLEND| {
+        matches!(
+            b,
+            D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA
+        )
+    };
+    t.BlendEnable.as_bool() && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].into_iter().any(second)
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
@@ -1344,5 +1370,47 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// Precompiled state: independent blending only where the targets
+    /// differ, and never with dual-source blending (the window glass of
+    /// run 52: `CB_BLEND0..7` = `0xf1010f01`, one plus second source
+    /// colour, write mask `0xf` on target 0 alone).
+    #[test]
+    fn precompiled_blending_is_independent_only_where_it_may_be() {
+        use crate::precompiled::{GraphicsRegisters, TargetBlend, Targets};
+        let targets = Targets::new(&[10], 20, 1).drawing(4);
+        let mut r = GraphicsRegisters::console_defaults();
+        // All alike: one description.
+        let g = GraphicsState::precompiled(&r, &[], &targets);
+        assert!(!g.blend.IndependentBlendEnable.as_bool());
+        // Write masks differ: independent.
+        r.write_masks = [0xf, 0, 0, 0, 0, 0, 0, 0];
+        let g = GraphicsState::precompiled(&r, &[], &targets);
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        // Dual source (what `0xf1010f01` decodes to): target 0's alone,
+        // also when the pixel shader's outputs mask the others.
+        let glass = TargetBlend {
+            enable: true,
+            src: 2,
+            dest: 16,
+            op: 1,
+            src_alpha: 2,
+            dest_alpha: 18,
+            op_alpha: 1,
+        };
+        r.blend = [glass; 8];
+        let g = GraphicsState::precompiled(&r, &[], &targets);
+        let b = g.host_blend_writing(Some(0b11));
+        assert!(!b.IndependentBlendEnable.as_bool());
+        let t = b.RenderTarget[0];
+        assert_eq!((t.SrcBlend, t.DestBlend, t.DestBlendAlpha), (D3D12_BLEND_ONE, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_SRC1_ALPHA));
+        assert_eq!(t.RenderTargetWriteMask, 0xf);
+        // Without dual source, unwritten targets are masked.
+        r.blend = [TargetBlend::OFF; 8];
+        r.write_masks = [0xf; 8];
+        let b = GraphicsState::precompiled(&r, &[], &targets).host_blend_writing(Some(0b1));
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert_eq!((b.RenderTarget[0].RenderTargetWriteMask, b.RenderTarget[1].RenderTargetWriteMask), (0xf, 0));
     }
 }

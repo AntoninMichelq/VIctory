@@ -149,6 +149,15 @@ against GFX10's public register layouts:
 | 74 | `0x19fc0130` (47), `...01c0`, `...0120` | likely `DB_SHADER_CONTROL`: Z order in bits 4-5 (late Z with kill, bit 6, in `0x1c0`); nothing D3D12 needs |
 | 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
 
+The eight blend controls and write masks become one description per
+target, independent only where they differ, and never when target 0
+blends with the pixel shader's second output (`SRC1_*` factors, e.g.
+`0xf1010f01` = one plus second source colour, the prison-yard window glass
+and the like): D3D12 allows dual-source blending on target 0 alone and
+refuses it with independent blending (`E_INVALIDARG`). Runs 50-52 lost
+those passes that way (the fence and glass of the window); offline, 1,746
+of run 50's dumped descriptions (400 pairs of shaders) are all made now.
+
 What the host pipeline gets beyond these: the input layout of the info
 section (below), sample mask all, no alpha to coverage, D3D12's nearest for what has no exact equal (constant alpha
 blend factors as the blend factor, stencil ops `ONES` and

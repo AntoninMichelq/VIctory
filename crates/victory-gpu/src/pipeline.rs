@@ -1696,3 +1696,72 @@ mod rect_diag {
         }
     }
 }
+
+/// Diagnostics, run by hand on the host GPU: the precompiled graphics
+/// pipelines of the pairs named by `VICTORY_GFX_PAIRS` (`<vertex>/<pixel>`,
+/// as the log names them), from their dumped registers and info sections
+/// (`VICTORY_PRECOMPILED_GFX_DIR`, as `VICTORY_PRECOMPILED_DUMP` writes
+/// them) and their containers in the shader pack, drawn into
+/// `VICTORY_GFX_TARGETS` (`<format>,...[/<depth format>]`, DXGI numbers):
+/// each is to be made. `VICTORY_SHADER_PACK=<shaders.rpf> cargo test -p
+/// victory-gpu --lib dumped_graphics -- --ignored --nocapture`.
+#[cfg(all(test, windows))]
+mod gfx_diag {
+    #[test]
+    #[ignore = "reads the title's shader pack and dumps, and needs the host GPU"]
+    fn dumped_graphics_descriptions_are_made() {
+        let (Some(pack), Some(dir), Ok(pairs)) = (
+            std::env::var_os("VICTORY_SHADER_PACK"),
+            std::env::var_os("VICTORY_PRECOMPILED_GFX_DIR"),
+            std::env::var("VICTORY_GFX_PAIRS"),
+        ) else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+        if crate::host::host().is_none() {
+            return;
+        }
+        let spec = std::env::var("VICTORY_GFX_TARGETS").unwrap_or_else(|_| "28".into());
+        let (formats, depth) = spec.split_once('/').unwrap_or((&spec, "0"));
+        let formats: Vec<u32> = formats.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+        let targets = crate::precompiled::Targets::new(&formats, depth.trim().parse().unwrap_or(0), 1).drawing(4);
+        let wanted: Vec<(String, String)> = pairs
+            .split(',')
+            .filter_map(|p| p.split_once('/'))
+            .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+            .collect();
+        let file = std::fs::read(&pack).unwrap();
+        let mut by_hash = std::collections::HashMap::new();
+        for r in victory_game::sgd5::records(&file) {
+            let Some(c) = r.unpack() else { continue };
+            let hash = blake3::hash(&c).to_hex()[..16].to_owned();
+            if wanted.iter().any(|(v, p)| *v == hash || *p == hash) {
+                by_hash.insert(hash, c);
+            }
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let mut refused = Vec::new();
+        for (v, p) in &wanted {
+            let (Some(vc), Some(pc)) = (by_hash.get(v), by_hash.get(p)) else {
+                println!("{v}/{p}: not in the pack");
+                continue;
+            };
+            let (vs, ps) = (super::shader("vertex", vc), super::shader("pixel", pc));
+            for n in 0..16 {
+                let stem = format!("gfx-{v}-{p}-{n}");
+                let Ok(regs) = std::fs::read(dir.join(format!("{stem}-registers.bin"))) else { break };
+                let info = std::fs::read(dir.join(format!("{stem}-info.bin"))).unwrap_or_default();
+                let dwords: Vec<u32> = regs.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+                let (registers, notes) = crate::precompiled::GraphicsRegisters::decode(&dwords);
+                let inputs = crate::precompiled::input_layout(&info).unwrap_or_default();
+                let g = super::host::GraphicsState::precompiled(&registers, &inputs, &targets);
+                let made = super::host::HostPipeline::new(&[vs.clone(), ps.clone()], Some(&g)).is_some();
+                println!("{stem}: made {made} {notes:?}");
+                if !made {
+                    refused.push(stem);
+                }
+            }
+        }
+        assert!(refused.is_empty(), "refused: {refused:?}");
+    }
+}
