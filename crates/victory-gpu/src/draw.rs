@@ -1480,12 +1480,24 @@ impl State {
             return;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
-        let per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+        let mut per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        // With `VICTORY_WIDE_TEXTURES=1`: the bytes are a budget per 150 ms
+        // of frame, up to four times the frame's, so that the world's first
+        // frames (a second each while it streams in) take more of the queue
+        // (18,000 slots due then, in the run of 2026-11-25 02:18).
+        static FRAME_AT: AtomicU64 = AtomicU64::new(0);
+        static FRAME_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            let now = crate::host::now_ms();
+            let at = FRAME_AT.swap(now, Ordering::Relaxed);
+            FRAME_MS.store(if at == 0 { 0 } else { now - at }, Ordering::Relaxed);
+        }
+        if crate::host::wide_textures() {
+            per_frame = per_frame * FRAME_MS.load(Ordering::Relaxed).clamp(150, 600) / 150;
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever

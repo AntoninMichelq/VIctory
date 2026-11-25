@@ -5407,7 +5407,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5430,6 +5434,17 @@ impl HostList {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+/// Whether the textures a submission samples are brought up to date on
+/// several threads at once (`VICTORY_WIDE_TEXTURES=1`; off by default),
+/// as [`wide_refresh`] does for copies. They were read, hashed and
+/// detiled one after the other on the submitting thread: 230-530 ms a
+/// frame while the world streamed in, 50-70 ms in bursts later (run of
+/// 2026-11-25 02:18).
+pub(crate) fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
@@ -5453,6 +5468,8 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: the textures to refresh at the next flush.
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -5510,6 +5527,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        // The textures, several at a time ([`wide_textures`]): a refresh
+        // reads the texture's title memory and writes its own staging
+        // buffer, under its own lock. The time counted is the time it took,
+        // not the threads' sum.
+        if !self.due_textures.is_empty() {
+            let started = std::time::Instant::now();
+            let before = PREPARING[2].load(Ordering::Relaxed);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                .due_textures
+                .drain(..)
+                .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                .collect();
+            crate::shadow::wide_run(jobs);
+            let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+            PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        }
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
