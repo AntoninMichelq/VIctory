@@ -938,6 +938,14 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Whether a copy of one host texture onto itself is left out
+/// ([`copy_resource`]); `VICTORY_SELF_COPY=1` records it as before.
+#[cfg(windows)]
+fn skip_self_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELF_COPY").is_none_or(|v| v != "1"))
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
@@ -964,12 +972,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            crate::texture::host_written(dst);
             // Two title textures over the same memory can have one host
             // texture between them: the copy would be of that texture onto
             // itself, which the host does not allow (its debug layer: a
             // destination left in the source state) and which changes
-            // nothing. Left out (after fxceless/victory-fork a253706).
-            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
+            // nothing. Left out (after fxceless/victory-fork a253706), once the
+            // destination is noted as written; `VICTORY_SELF_COPY=1` records
+            // it as before.
+            if skip_self_copies() && windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::info!(?dst, ?src, "a copy between two title textures that share one host texture is left out")
@@ -978,7 +989,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             if crate::resource::skipped_mips(dst) != crate::resource::skipped_mips(src) {
