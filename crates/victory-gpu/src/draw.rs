@@ -1492,8 +1492,11 @@ impl State {
         static FRAME_AT: AtomicU64 = AtomicU64::new(0);
         static FRAME_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
+        // Time the passes of this frame took, all lists together.
+        static SPENT_US: AtomicU64 = AtomicU64::new(0);
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            SPENT_US.store(0, Ordering::Relaxed);
             let now = crate::host::now_ms();
             let at = FRAME_AT.swap(now, Ordering::Relaxed);
             FRAME_MS.store(if at == 0 { 0 } else { now - at }, Ordering::Relaxed);
@@ -1556,8 +1559,30 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        let span = std::time::Duration::from_millis(if loading { 1000 } else { 250 });
+        // A time for the frame, not for each pass: a loading frame gave a
+        // second to each list's pass, and the loading screens ran at
+        // 0.6 fps (1.6 s a frame) with the card and most cores idle, the
+        // title's own loading waiting on its frames. On loading frames the
+        // bytes are eight times more but the time is the same
+        // (`VICTORY_TEXTURE_PASS_MS`, default 200 ms a frame).
+        static PASS_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let pass_ms = *PASS_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_PASS_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(200)
+        });
+        let span = std::time::Duration::from_micros(
+            (pass_ms * 1000).saturating_sub(SPENT_US.load(Ordering::Relaxed)),
+        );
         let began = std::time::Instant::now();
+        struct Took<'a>(&'a AtomicU64, std::time::Instant);
+        impl Drop for Took<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let _took = Took(&SPENT_US, began);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
