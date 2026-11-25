@@ -1858,6 +1858,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let before = DISPATCHED.load(Ordering::Relaxed);
+        peek_dispatch(self.pipeline, [x, y, z]);
         self.dispatch_inner(list, x, y, z);
         #[cfg(feature = "diagnostics")]
         self.trace_op("dispatch", &[x.into(), y.into(), z.into()], DISPATCHED.load(Ordering::Relaxed) != before);
@@ -3310,6 +3311,37 @@ pub(crate) static FLAT_DRAWS: AtomicU64 = AtomicU64::new(0);
 fn flat_check_vb() -> bool {
     static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECK.get_or_init(|| std::env::var("VICTORY_FLAT_CHECK").is_ok_and(|v| v.trim() == "vb"))
+}
+
+/// `VICTORY_DISPATCH_PEEK=<hash prefix>,...`: the group counts of the
+/// title's direct dispatches with such a shader, logged (the first 40; any
+/// build). What a compute shader costs a frame is its groups times what one
+/// group does (2026-11-25: CS 39f0e9ae, one dispatch, 8.8 ms).
+fn peek_dispatch(pipeline: usize, groups: [u32; 3]) {
+    static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let wanted = WANTED.get_or_init(|| {
+        std::env::var("VICTORY_DISPATCH_PEEK")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if wanted.is_empty() {
+        return;
+    }
+    let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else {
+        return;
+    };
+    if !wanted.iter().any(|w| p.name.contains(w.as_str())) {
+        return;
+    }
+    static PEEKS: AtomicU64 = AtomicU64::new(0);
+    if PEEKS.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let [x, y, z] = groups;
+    tracing::info!(pipeline = %p.name, x, y, z, groups = u64::from(x) * u64::from(y) * u64::from(z), "VICTORY_DISPATCH_PEEK: a direct dispatch");
 }
 
 fn flat_wanted(name: &str) -> bool {
