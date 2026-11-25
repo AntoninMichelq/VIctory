@@ -445,6 +445,21 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// newer sent; the next send ends that idle stretch.
 static CARD_CLOCK_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Monotonic totals (never reset) for external readers such as dynamic FSR:
+/// `[0]` = card idle microseconds (same increments as `CARD_CLOCK_US[0]`),
+/// `[1]` = submission GPU-wait microseconds (same increments as `SUBMISSION_US[1]`),
+/// `[2]` = signals sent on the card's clock (non-zero once the clock is active).
+static CARD_TOTAL_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Monotonic `(card_idle_us, gpu_wait_us, clock_signals)` since start.
+pub(crate) fn card_totals_us() -> (u64, u64, u64) {
+    (
+        CARD_TOTAL_US[0].load(Ordering::Relaxed),
+        CARD_TOTAL_US[1].load(Ordering::Relaxed),
+        CARD_TOTAL_US[2].load(Ordering::Relaxed),
+    )
+}
+
 /// Of the thread that holds the submission lock: the microseconds it has
 /// worked so far (preparing, copying back; not its waits for the card), and
 /// since when it works now ([`now_us`] plus one; 0: it does not).
@@ -2921,6 +2936,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    CARD_TOTAL_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -3494,8 +3510,11 @@ impl Host {
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        CARD_TOTAL_US[2].fetch_add(1, Ordering::Relaxed);
         if let Some((since, worked_then)) = state.1.take() {
-            CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let idle_us = since.elapsed().as_micros() as u64;
+            CARD_CLOCK_US[0].fetch_add(idle_us, Ordering::Relaxed);
+            CARD_TOTAL_US[0].fetch_add(idle_us, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
         }
         drop(state);
@@ -4595,9 +4614,11 @@ impl Host {
                     }
                 }
                 let gpu = waiting.elapsed();
-                LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                let gpu_us = gpu.as_micros() as u64;
+                LATE_STATS[12].fetch_add(gpu_us, Ordering::Relaxed);
+                LATE_WAITED[why.min(10)].fetch_add(gpu_us, Ordering::Relaxed);
+                SUBMISSION_US[1].fetch_add(gpu_us, Ordering::Relaxed);
+                CARD_TOTAL_US[1].fetch_add(gpu_us, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -4912,8 +4933,10 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
+        let gpu_us = gpu.as_micros() as u64;
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(gpu_us, Ordering::Relaxed);
+        CARD_TOTAL_US[1].fetch_add(gpu_us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs

@@ -21,7 +21,9 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use victory_gpu::object::Object;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
@@ -46,6 +48,14 @@ const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
+
+/// `FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION` (`1 << 6`) in FidelityFX SDK 2.x.
+const UPSCALE_ENABLE_DYNAMIC_RESOLUTION: u32 = 1 << 6;
+
+/// Default dynamic scale bounds when `VICTORY_FFX_DYNAMIC` is set.
+const DEFAULT_SCALE_MAX: f32 = 0.5;
+const DEFAULT_SCALE_MIN: f32 = 0.38;
+const ABS_SCALE_MIN: f32 = 0.25;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -138,6 +148,279 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 static HOST: OnceLock<Host> = OnceLock::new();
+
+/// Writable 32-bit float slot in the title's scale-getter (`title_patch`),
+/// registered before title execution when `VICTORY_FFX_DYNAMIC` is active.
+static SCALE_SLOT: OnceLock<usize> = OnceLock::new();
+
+/// Target GPU frame time in ms from `VICTORY_FFX_DYNAMIC` (`None` = disabled,
+/// default fixed-scale behavior).
+pub fn dynamic_target_ms() -> Option<f64> {
+    static TARGET: OnceLock<Option<f64>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("VICTORY_FFX_DYNAMIC").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            return None;
+        }
+        match trimmed.parse::<f64>() {
+            Ok(ms) if ms.is_finite() && ms > 0.0 => Some(ms),
+            _ => {
+                tracing::warn!(
+                    value = trimmed,
+                    "VICTORY_FFX_DYNAMIC: expected positive target GPU time in ms (e.g. 33); disabled"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Registers the title's writable scale `f32` slot (4-byte aligned, mapped for
+/// the process lifetime) so dynamic FSR can update it atomically between frames.
+///
+/// # Safety
+/// `slot` must point to a 4-byte-aligned, writable `f32` location that remains
+/// valid for the rest of the process lifetime.
+pub unsafe fn register_scale_slot(slot: *const AtomicU32) {
+    let addr = slot as usize;
+    if addr != 0 && addr.is_multiple_of(align_of::<AtomicU32>()) {
+        let _ = SCALE_SLOT.set(addr);
+    }
+}
+
+fn write_scale_slot(scale: f32) -> bool {
+    let Some(&addr) = SCALE_SLOT.get() else {
+        return false;
+    };
+    // SAFETY: registered by `title_patch` as a 4-byte-aligned writable slot
+    // inside the loaded title image, alive for the process lifetime.
+    let slot = unsafe { &*(addr as *const AtomicU32) };
+    slot.store(scale.to_bits(), Ordering::Relaxed);
+    true
+}
+
+/// Parses `VICTORY_FFX_SCALE` (max scale, default 0.5) and
+/// `VICTORY_FFX_SCALE_MIN` (min scale, default 0.38).
+fn dynamic_bounds() -> (f32, f32) {
+    let max = std::env::var("VICTORY_FFX_SCALE")
+        .ok()
+        .and_then(|s| {
+            let head = s.split_once(',').map_or(s.as_str(), |(a, _)| a);
+            head.trim().parse::<f32>().ok()
+        })
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+        .unwrap_or(DEFAULT_SCALE_MAX);
+    let min = std::env::var("VICTORY_FFX_SCALE_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+        .unwrap_or(DEFAULT_SCALE_MIN)
+        .clamp(ABS_SCALE_MIN.min(max), max);
+    (min, max)
+}
+
+/// Pure hysteresis controller for dynamic FSR render scale.
+struct DynamicController {
+    target_ms: f64,
+    scale_min: f32,
+    scale_max: f32,
+    current_scale: f32,
+    ema_ms: Option<f64>,
+    wait_ema_ms: Option<f64>,
+    frames_seen: u64,
+    frames_since_step: u32,
+    adjustments: u64,
+    max_render: [u32; 2],
+    max_output: [u32; 2],
+    first_render: Option<[u32; 2]>,
+    title_followed: bool,
+}
+
+impl DynamicController {
+    /// Smoothing factor (~6–7 frames time constant).
+    const EMA_ALPHA: f64 = 0.15;
+    /// Deadband around `target_ms`: no scale change in `[0.88 * target, 1.05 * target]`.
+    const HIGH_RATIO: f64 = 1.05;
+    const LOW_RATIO: f64 = 0.88;
+    /// Frames after context creation before adjusting (keeps startup at `scale_max`).
+    const WARMUP_FRAMES: u64 = 12;
+    /// Minimum frames between consecutive scale adjustments (prevents pumping).
+    const STEP_COOLDOWN: u32 = 6;
+    /// Asymmetric steps: drop faster than we raise.
+    const MIN_STEP_DOWN: f32 = 0.005;
+    const MAX_STEP_DOWN: f32 = 0.02;
+    const STEP_UP: f32 = 0.005;
+    /// Clamp individual frame samples so streaming spikes do not skew the EMA.
+    const MAX_SAMPLE_MS: f64 = 250.0;
+
+    fn new(target_ms: f64, scale_min: f32, scale_max: f32) -> Self {
+        Self {
+            target_ms,
+            scale_min,
+            scale_max,
+            current_scale: scale_max,
+            ema_ms: None,
+            wait_ema_ms: None,
+            frames_seen: 0,
+            frames_since_step: 0,
+            adjustments: 0,
+            max_render: [0, 0],
+            max_output: [0, 0],
+            first_render: None,
+            title_followed: false,
+        }
+    }
+
+    fn on_context_created(&mut self, max_render: [u32; 2], max_output: [u32; 2]) {
+        self.max_render = max_render;
+        self.max_output = max_output;
+        self.frames_seen = 0;
+        self.frames_since_step = 0;
+    }
+
+    fn quantize_scale(&self, scale: f32) -> f32 {
+        let clamped = scale.clamp(self.scale_min, self.scale_max);
+        if clamped <= self.scale_min + 1e-4 {
+            return self.scale_min;
+        }
+        if clamped >= self.scale_max - 1e-4 {
+            return self.scale_max;
+        }
+        let out_w = self.max_output[0];
+        if out_w >= 64 {
+            let aligned_w = ((clamped * out_w as f32) / 8.0).round() * 8.0;
+            (aligned_w / out_w as f32).clamp(self.scale_min, self.scale_max)
+        } else {
+            clamped
+        }
+    }
+
+    /// Feeds one frame's GPU time sample and returns `Some(new_scale)` when the
+    /// render scale should be updated.
+    fn on_frame(&mut self, gpu_ms: f64, wait_ms: f64, render_size: [u32; 2]) -> Option<f32> {
+        if render_size[0] > 0 && render_size[1] > 0 {
+            match self.first_render {
+                None => self.first_render = Some(render_size),
+                Some(first) if render_size != first => self.title_followed = true,
+                _ => {}
+            }
+        }
+        if !gpu_ms.is_finite() || gpu_ms < 0.0 {
+            return None;
+        }
+        let sample = gpu_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
+        self.ema_ms = Some(match self.ema_ms {
+            Some(prev) => prev * (1.0 - Self::EMA_ALPHA) + sample * Self::EMA_ALPHA,
+            None => sample,
+        });
+        if wait_ms.is_finite() && wait_ms >= 0.0 {
+            let w = wait_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
+            self.wait_ema_ms = Some(match self.wait_ema_ms {
+                Some(prev) => prev * (1.0 - Self::EMA_ALPHA) + w * Self::EMA_ALPHA,
+                None => w,
+            });
+        }
+        self.frames_seen += 1;
+        self.frames_since_step = self.frames_since_step.saturating_add(1);
+        if self.frames_seen <= Self::WARMUP_FRAMES || self.frames_since_step < Self::STEP_COOLDOWN {
+            return None;
+        }
+        let ema = self.ema_ms?;
+        let high_ms = self.target_ms * Self::HIGH_RATIO;
+        let low_ms = self.target_ms * Self::LOW_RATIO;
+        let candidate = if ema > high_ms && self.current_scale > self.scale_min {
+            let ideal = self.current_scale * ((self.target_ms * 0.97) / ema).sqrt() as f32;
+            let step = (self.current_scale - ideal).clamp(Self::MIN_STEP_DOWN, Self::MAX_STEP_DOWN);
+            self.quantize_scale(self.current_scale - step)
+        } else if ema < low_ms && self.current_scale < self.scale_max {
+            self.quantize_scale(self.current_scale + Self::STEP_UP)
+        } else {
+            return None;
+        };
+        if (candidate - self.current_scale).abs() >= 1e-4 {
+            self.current_scale = candidate;
+            self.frames_since_step = 0;
+            self.adjustments += 1;
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+}
+
+struct DynamicState {
+    ctrl: DynamicController,
+    last_sample: Option<(Instant, u64, u64)>,
+    last_log: Instant,
+}
+
+fn dynamic_state() -> Option<&'static Mutex<DynamicState>> {
+    static STATE: OnceLock<Option<Mutex<DynamicState>>> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            let target_ms = dynamic_target_ms()?;
+            let (scale_min, scale_max) = dynamic_bounds();
+            tracing::info!(
+                target_ms = format_args!("{target_ms:.1}"),
+                scale_min = format_args!("{scale_min:.3}"),
+                scale_max = format_args!("{scale_max:.3}"),
+                slot_wired = SCALE_SLOT.get().is_some(),
+                "FidelityFX: dynamic resolution scaling enabled (VICTORY_FFX_DYNAMIC)"
+            );
+            Some(Mutex::new(DynamicState {
+                ctrl: DynamicController::new(target_ms, scale_min, scale_max),
+                last_sample: None,
+                last_log: Instant::now(),
+            }))
+        })
+        .as_ref()
+}
+
+fn dynamic_on_dispatch(render_size: [u32; 2]) {
+    let Some(lock) = dynamic_state() else {
+        return;
+    };
+    let now = Instant::now();
+    let (idle_us, wait_us, signals) = victory_gpu::external::card_totals_us();
+    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let sample = state.last_sample.replace((now, idle_us, wait_us));
+    if let Some((prev_now, prev_idle, prev_wait)) = sample {
+        let dt_wall_us = now.duration_since(prev_now).as_micros() as u64;
+        // Skip pauses / loading stalls longer than 1 s.
+        if dt_wall_us > 0 && dt_wall_us < 1_000_000 {
+            let dt_idle_us = idle_us.saturating_sub(prev_idle);
+            let dt_wait_us = wait_us.saturating_sub(prev_wait);
+            let wait_ms = dt_wait_us as f64 / 1000.0;
+            let gpu_ms = if signals > 0 {
+                (dt_wall_us.saturating_sub(dt_idle_us) as f64 / 1000.0).max(wait_ms)
+            } else {
+                wait_ms
+            };
+            if let Some(new_scale) = state.ctrl.on_frame(gpu_ms, wait_ms, render_size) {
+                write_scale_slot(new_scale);
+            }
+        }
+    }
+    if state.last_log.elapsed() >= Duration::from_secs(5) {
+        state.last_log = now;
+        let c = &state.ctrl;
+        tracing::info!(
+            scale = format_args!("{:.3}", c.current_scale),
+            min = format_args!("{:.3}", c.scale_min),
+            max = format_args!("{:.3}", c.scale_max),
+            gpu_ms = format_args!("{:.1}", c.ema_ms.unwrap_or(0.0)),
+            wait_ms = format_args!("{:.1}", c.wait_ema_ms.unwrap_or(0.0)),
+            target_ms = format_args!("{:.1}", c.target_ms),
+            render = ?render_size,
+            max_render = ?c.max_render,
+            steps = c.adjustments,
+            slot_wired = SCALE_SLOT.get().is_some(),
+            title_followed = c.title_followed,
+            "FidelityFX dynamic scale"
+        );
+    }
+}
 
 macro_rules! once {
     ($level:ident, $($arg:tt)*) => {{
@@ -309,6 +592,13 @@ extern "C" fn ffxCreateContext(
     }
     // SAFETY: an upscaler description, by its type.
     let mut upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    if let Some(lock) = dynamic_state() {
+        upscale.flags |= UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .ctrl
+            .on_context_created(upscale.max_render, upscale.max_output);
+    }
     let mut backend = Backend {
         header: Header {
             kind: HOST_BACKEND,
@@ -401,6 +691,8 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
+    // `renderSize` sits at `rest[4..6]` in `ffxDispatchDescUpscale`.
+    dynamic_on_dispatch([dispatch.rest[4], dispatch.rest[5]]);
     let list = dispatch.list.cast::<Object>().cast_const();
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
@@ -515,5 +807,51 @@ mod tests {
         assert_eq!(host_state(0x2), Some(0x8));
         assert_eq!(host_state(0x200), Some(0x10));
         assert_eq!(host_state(0x14), None);
+    }
+
+    #[test]
+    fn dynamic_controller_holds_steady_in_deadband() {
+        let mut ctrl = DynamicController::new(33.0, 0.38, 0.5);
+        ctrl.on_context_created([1920, 1080], [3840, 2160]);
+        // Oscillating inside [29.04, 34.65] ms must never pump the scale.
+        for i in 0..60 {
+            let gpu_ms = if i % 2 == 0 { 30.0 } else { 34.0 };
+            assert_eq!(ctrl.on_frame(gpu_ms, gpu_ms, [1920, 1080]), None);
+        }
+        assert_eq!(ctrl.current_scale, 0.5);
+        assert_eq!(ctrl.adjustments, 0);
+    }
+
+    #[test]
+    fn dynamic_controller_drops_to_min_and_recovers_slowly_to_max() {
+        let mut ctrl = DynamicController::new(33.0, 0.38, 0.5);
+        ctrl.on_context_created([1920, 1080], [3840, 2160]);
+        // Warmup keeps scale at max even when overloaded.
+        for _ in 0..DynamicController::WARMUP_FRAMES {
+            assert_eq!(ctrl.on_frame(70.0, 50.0, [1920, 1080]), None);
+        }
+        assert_eq!(ctrl.current_scale, 0.5);
+        // Sustained overload drops scale smoothly down to `scale_min`.
+        let mut drops = 0;
+        for _ in 0..120 {
+            if let Some(s) = ctrl.on_frame(70.0, 50.0, [1920, 1080]) {
+                assert!(s >= 0.38 && s <= 0.5);
+                drops += 1;
+            }
+        }
+        assert!(drops > 0);
+        assert!((ctrl.current_scale - 0.38).abs() < 1e-4);
+        assert!(!ctrl.title_followed);
+        // Simulate title following with a smaller render size and GPU time falling below deadband.
+        let mut raises = 0;
+        for _ in 0..300 {
+            if let Some(s) = ctrl.on_frame(20.0, 10.0, [1464, 824]) {
+                assert!(s >= 0.38 && s <= 0.5);
+                raises += 1;
+            }
+        }
+        assert!(ctrl.title_followed);
+        assert!(raises > drops, "scale should rise slower than it drops");
+        assert!((ctrl.current_scale - 0.5).abs() < 1e-4);
     }
 }

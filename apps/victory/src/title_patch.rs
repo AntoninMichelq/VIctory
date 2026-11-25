@@ -30,8 +30,10 @@ fn hex(s: &str) -> Option<usize> {
 }
 
 /// Writes `bytes` at title+`rva`, inside the image (checked), through a
-/// writable mapping for the moment. False if Windows refused it.
-fn write_code(image: &LoadedImage, rva: usize, bytes: &[u8]) -> bool {
+/// writable mapping for the moment. If `keep_writable` is true, the page stays
+/// `PAGE_EXECUTE_READWRITE` so a dynamic slot inside it can be updated
+/// atomically while the title runs. False if Windows refused it.
+fn write_code_mode(image: &LoadedImage, rva: usize, bytes: &[u8], keep_writable: bool) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     if rva.checked_add(bytes.len()).is_none_or(|end| end > image.info().size_of_image as usize) {
         return false;
@@ -44,9 +46,15 @@ fn write_code(image: &LoadedImage, rva: usize, bytes: &[u8]) -> bool {
             return false;
         }
         at.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
-        VirtualProtect(at.cast(), bytes.len(), old, &mut old);
+        if !keep_writable {
+            VirtualProtect(at.cast(), bytes.len(), old, &mut old);
+        }
     }
     true
+}
+
+fn write_code(image: &LoadedImage, rva: usize, bytes: &[u8]) -> bool {
+    write_code_mode(image, rva, bytes, false)
 }
 
 /// The direct calls and jumps (`E8`/`E9 rel32`) to `rva` in the image's
@@ -115,10 +123,15 @@ fn picker_stub(kind: u32) -> [u8; 6] {
 
 /// The bytes of the scale method [`patch_scale`] reads and writes.
 const SCALE_SPAN: usize = 0x68;
+/// Offset of the `f32` scale slot inside the patched scale method.
+const SCALE_SLOT: usize = 0x64;
 
 fn ffx_scale(image: &LoadedImage) {
-    let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
-        return;
+    let dynamic = victory_hle::modules::fidelityfx::dynamic_target_ms().is_some();
+    let spec = match std::env::var("VICTORY_FFX_SCALE") {
+        Ok(s) => s,
+        Err(_) if dynamic => "0.5".to_string(),
+        Err(_) => return,
     };
     let (scale, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
     let scale = scale.trim().parse::<f32>().ok().filter(|s| *s > 0.0 && *s <= 1.0);
@@ -135,8 +148,23 @@ fn ffx_scale(image: &LoadedImage) {
     let mut code = unsafe { std::slice::from_raw_parts((image.base() + rva) as *const u8, SCALE_SPAN) }.to_vec();
     if !patch_scale(&mut code, scale) {
         eprintln!("VIctory: FidelityFX scale not patched: unexpected code at title+{rva:#x} (wrong rva?)");
-    } else if write_code(image, rva, &code) {
-        eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+    } else if write_code_mode(image, rva, &code, dynamic) {
+        if dynamic {
+            let slot_addr = image.base() + rva + SCALE_SLOT;
+            // SAFETY: `slot_addr` is inside the mapped title image, kept
+            // `PAGE_EXECUTE_READWRITE` above, and lives for the whole process.
+            unsafe {
+                victory_hle::modules::fidelityfx::register_scale_slot(
+                    slot_addr as *const std::sync::atomic::AtomicU32,
+                );
+            }
+            eprintln!(
+                "VIctory: FidelityFX render scale at title+{rva:#x} set to {scale} (dynamic slot at +{:#x})",
+                rva + SCALE_SLOT
+            );
+        } else {
+            eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+        }
     } else {
         eprintln!("VIctory: FidelityFX scale at title+{rva:#x} not patched: not writable");
     }
@@ -148,14 +176,13 @@ fn ffx_scale(image: &LoadedImage) {
 /// code.
 fn patch_scale(code: &mut [u8], scale: f32) -> bool {
     const LOADS: [usize; 2] = [0x28, 0x32];
-    const SLOT: usize = 0x64;
     const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
-    if code.len() < SCALE_SPAN || LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP) || code[SLOT..SLOT + 4] != [0xCC; 4] {
+    if code.len() < SCALE_SPAN || LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP) || code[SCALE_SLOT..SCALE_SLOT + 4] != [0xCC; 4] {
         return false;
     }
-    code[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
+    code[SCALE_SLOT..SCALE_SLOT + 4].copy_from_slice(&scale.to_le_bytes());
     for l in LOADS {
-        let disp = (SLOT - (l + 8)) as i32;
+        let disp = (SCALE_SLOT - (l + 8)) as i32;
         code[l + 4..l + 8].copy_from_slice(&disp.to_le_bytes());
     }
     true
