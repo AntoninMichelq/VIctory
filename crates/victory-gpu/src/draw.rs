@@ -212,6 +212,8 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    /// The depth bounds set on the host list (`VICTORY_DEPTH_BOUNDS=1`).
+    bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -642,6 +644,12 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        let bounds = depth_bounds_for(min, max);
+        self.bounds = Some(bounds);
+        depth_bounds(list, bounds);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -685,6 +693,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some(bounds) = self.bounds {
+            depth_bounds(list, bounds);
         }
     }
 
@@ -3541,6 +3552,31 @@ pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+/// The title's depth bounds as the host takes them: within 0..=1 (D3D12
+/// wants both there). Bounds that are no range (min above max, NaN) pass
+/// every depth, as with the test dropped, rather than none: what the
+/// console does with them is not known. Reversed depth changes nothing:
+/// the bounds are depth values, compared with the stored depth as is.
+fn depth_bounds_for(min: f32, max: f32) -> (f32, f32) {
+    let (lo, hi) = (min.clamp(0.0, 1.0), max.clamp(0.0, 1.0));
+    if min.is_nan() || max.is_nan() || lo > hi {
+        static ODD: AtomicU64 = AtomicU64::new(0);
+        if ODD.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::info!(min, max, "depth bounds that are no range: every depth passes");
+        }
+        return (0.0, 1.0);
+    }
+    (lo, hi)
+}
+
+/// Sets depth bounds on the host list (`ID3D12GraphicsCommandList1`).
+fn depth_bounds(list: &HostList, (min, max): (f32, f32)) {
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
