@@ -477,7 +477,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_fill(to, address as *const u8, len as usize, crate::host::FillKind::RootConstants);
     Some(gpu)
 }
 
@@ -2736,7 +2736,7 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        list.defer_fill(to, address as *const u8, size as usize, crate::host::FillKind::TableConstants);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

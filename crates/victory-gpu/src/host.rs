@@ -1941,8 +1941,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory, and what
+    /// asked for it ([`FillKind`]).
+    Fill(usize, usize, usize, u8),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -2457,10 +2458,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(_, src, len, kind) => {
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            FILLS_BLOCKED[usize::from(kind).min(2)].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
                     }
@@ -2481,6 +2483,21 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
     None
 }
+
+/// What a [`Step::Fill`] is for.
+#[derive(Clone, Copy)]
+pub(crate) enum FillKind {
+    /// A root constant buffer view not 256-byte aligned on the card.
+    RootConstants = 0,
+    /// A constant buffer view in a descriptor table.
+    TableConstants = 1,
+    /// The source of a texture copy from a buffer footprint.
+    TextureCopy = 2,
+}
+
+/// Settles for a fill of upload memory from title memory flights write,
+/// by [`FillKind`] (since the start).
+pub(crate) static FILLS_BLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// `VICTORY_ALIAS_COPIES` (on; `=0` off): [`HostList::copy_aliased`].
 fn alias_copies() -> bool {
@@ -3116,6 +3133,18 @@ fn late_line(frames: f64) {
         return;
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    {
+        let f: Vec<f64> = FILLS_BLOCKED.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if f.iter().any(|&n| n > 0.0) {
+            tracing::info!(
+                "fills of upload memory that met flights' writes per frame, by what asked: root constants (not aligned) {:.1}, \
+                 constants in tables {:.1}, texture copies from buffers {:.1}",
+                f[0],
+                f[1],
+                f[2],
+            );
+        }
+    }
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
@@ -5867,10 +5896,10 @@ impl HostList {
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
-    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize, kind: FillKind) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, kind as u8));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -6164,7 +6193,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
