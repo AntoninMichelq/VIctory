@@ -37,9 +37,12 @@
 //! is the extent of the title's allocation around an address, which the
 //! memory module of the layer knows and this one does not ask yet.
 //!
-//! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 16 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! A numbered copy nothing names or finds for `VICTORY_MEMORY_IDLE_S`
+//! seconds (30) gives its number back, and the least recently used go while
+//! all of them pass `VICTORY_MEMORY_COPIES_MB` (2048); there are at most
+//! [`COPIES`] numbers. shortcut: a page given back that shaders still read
+//! through pointers alone reads 0 for a frame, until its fault brings the
+//! copy back. Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
@@ -62,6 +65,8 @@ use crate::shadow::Shadow;
 const COPIES: u32 = 4095;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
+/// Frames a number given back waits before it is given again.
+const COOL_FRAMES: u64 = 4;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
@@ -69,11 +74,19 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Copy `n` is `copies[n - 1]` (none: a number given back, see [`Memory::sweep`]).
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// When each number's copy was last named or found for a page.
+    touched: Vec<std::time::Instant>,
+    /// Numbers given back, with the frame: used again some frames later,
+    /// when no list still in flight can hold the old view.
+    cooling: Vec<(usize, u64)>,
+    /// Numbers given a copy during this `ready`: their copies are brought
+    /// up to date by this list.
+    fresh: Vec<usize>,
+    /// Per host view heap (by address): the first slot of its run, and per
+    /// number the copy whose view its slot holds (its id; 0: none).
+    heaps: HashMap<usize, (u32, Vec<u64>)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -111,6 +124,9 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            touched: Vec::new(),
+            cooling: Vec::new(),
+            fresh: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -128,7 +144,11 @@ impl Memory {
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
+        let had = unsafe { entry.read() };
+        if had != 0 {
+            if let Some(t) = self.touched.get_mut(had as usize - 1) {
+                *t = std::time::Instant::now();
+            }
             return;
         }
         let start = page * PAGE;
@@ -155,11 +175,25 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
+        let n = match self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &shadow))) {
+            Some(n) => {
+                self.touched[n] = std::time::Instant::now();
+                n
+            }
+            None if !self.cooling.is_empty() || self.copies.len() < COPIES as usize => {
+                let frame = self.frame;
+                let n = match self.cooling.iter().position(|&(_, f)| f + COOL_FRAMES <= frame) {
+                    Some(i) => self.cooling.swap_remove(i).0,
+                    None if self.copies.len() < COPIES as usize => {
+                        self.copies.push(None);
+                        self.touched.push(std::time::Instant::now());
+                        self.copies.len() - 1
+                    }
+                    None => return,
+                };
+                self.copies[n] = Some(shadow.clone());
+                self.touched[n] = std::time::Instant::now();
+                self.fresh.push(n);
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -194,6 +228,64 @@ impl Memory {
         unsafe {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
+        }
+    }
+
+    /// Gives number `n` back: its copy is let go (the shadow module frees it
+    /// once idle) and its pages read as without a copy until named again.
+    fn retire(&mut self, n: usize) {
+        let Some(shadow) = self.copies[n].take() else {
+            return;
+        };
+        let (first, len) = shadow.span();
+        let mut at = first & !(PAGE - 1);
+        while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+            // SAFETY: inside the directory's mapping.
+            let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+            // SAFETY: as above; the number first, so a shader never pairs
+            // it with another copy's offset.
+            unsafe {
+                if entry.read() == n as u32 + 1 {
+                    entry.write_volatile(0);
+                    entry.add(1).write_volatile(0);
+                }
+            }
+            at += PAGE;
+        }
+        self.cooling.push((n, self.frame));
+    }
+
+    /// Once a frame: copies nothing named or found for a while are given
+    /// back, then the least recently used ones while all of them are more
+    /// than the cap. Kept for the run, they stayed alive (the shadow module
+    /// lets a window go only when nothing else holds it) and every list
+    /// refreshed them all: with the structure builder on, 10 GB in four
+    /// minutes and ~450 ms of copies a frame. A page given back that a
+    /// shader still reads faults and has its copy again a frame later.
+    fn sweep(&mut self) {
+        static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let &(idle_s, cap) = LIMITS.get_or_init(|| {
+            let var = |name: &str, default: u64| {
+                std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            };
+            (var("VICTORY_MEMORY_IDLE_S", 30), var("VICTORY_MEMORY_COPIES_MB", 2048) << 20)
+        });
+        for n in 0..self.copies.len() {
+            if self.copies[n].is_some() && self.touched[n].elapsed().as_secs() >= idle_s {
+                self.retire(n);
+            }
+        }
+        let mut live: Vec<usize> = (0..self.copies.len()).filter(|&n| self.copies[n].is_some()).collect();
+        let mut bytes: u64 = live.iter().map(|&n| self.copies[n].as_ref().map_or(0, |c| c.span().1)).sum();
+        if bytes > cap {
+            live.sort_by_key(|&n| self.touched[n]);
+            for n in live {
+                if bytes <= cap {
+                    break;
+                }
+                bytes -= self.copies[n].as_ref().map_or(0, |c| c.span().1);
+                self.retire(n);
+            }
         }
     }
 
@@ -255,9 +347,11 @@ pub(crate) fn ready(
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
+    m.fresh.clear();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        m.sweep();
         m.take_faults();
         // What every list running such a shader brings up to date (and, with stores,
         // compares on the CPU): the numbered copies.
@@ -265,15 +359,16 @@ pub(crate) fn ready(
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if said.is_none_or(|t| t.elapsed().as_secs() >= 5) {
             *said = Some(std::time::Instant::now());
-            let bytes: u64 = m.copies.iter().map(|c| c.span().1).sum();
+            let live = m.copies.iter().flatten();
+            let (count, bytes) = live.fold((0, 0u64), |(n, b), c| (n + 1, b + c.span().1));
             tracing::info!(
-                copies = m.copies.len(),
+                copies = count,
+                numbers = m.copies.len(),
                 mb = bytes >> 20,
                 "title memory by address: numbered copies, each refreshed by every list that runs such a shader"
             );
         }
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -292,20 +387,34 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    if !m.heaps.contains_key(&key) {
+        // Held for the heap's life: not given back with a list's slots.
+        let base = heap.dynamic(COPIES + 1)?;
+        heap.null_raw_uav_at(base);
+        m.heaps.insert(key, (base, Vec::new()));
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let Memory { heaps, copies, .. } = &mut *m;
+    let (base, views) = heaps.get_mut(&key)?;
+    let base = *base;
+    views.resize(copies.len(), 0);
+    // A slot whose number has another copy now gets that copy's view; one
+    // given back is made null, so that the slot no longer keeps the copy's
+    // buffer (the shadow module frees a copy only when nothing holds it;
+    // lists in flight hold theirs through their refreshes).
+    for (n, copy) in copies.iter().enumerate() {
+        match copy {
+            Some(shadow) if views[n] != shadow.id() => {
+                let (_, len) = shadow.span();
+                heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+                views[n] = shadow.id();
+            }
+            None if views[n] != 0 => {
+                heap.null_raw_uav_at(base + 1 + n as u32);
+                views[n] = 0;
+            }
+            _ => {}
+        }
+    }
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -315,11 +424,15 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
+        let Some(shadow) = shadow else {
+            continue;
+        };
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        let fresh = m.fresh.contains(&n);
+        if first_read || fresh {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && (first_write || fresh) {
             shadow.gpu_writes(list, start, len);
         }
     }
