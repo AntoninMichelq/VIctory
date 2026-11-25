@@ -947,10 +947,15 @@ struct ClampChunks {
     /// state, and the entries taken since the reset.
     ledger: Option<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     entries: u32,
-    /// Clamps settled in one pass (`crate::indirect::batching`), all in the
-    /// first buffer: how many since the reset, and the host-memory table of
-    /// the offsets of their heads, in order (made on first use).
+    /// Clamps settled in one pass (`crate::indirect::batching`): how many
+    /// wait for their pass, the first of them in the table of heads, and
+    /// the buffer that holds them all (one pass reads one buffer); the
+    /// heads taken since the reset, and the host-memory table of the
+    /// offsets of their heads, in order (made on first use).
     later: u32,
+    later_from: u32,
+    later_chunk: usize,
+    heads_used: u32,
     heads: Option<(ID3D12Resource, usize)>,
     /// Whether a clamp bound the clamps' root signature, pipeline and
     /// budget in the list (`crate::indirect`, `VICTORY_CLAMP_BIND_ONCE`).
@@ -5324,6 +5329,7 @@ impl HostList {
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             (chunks.used, chunks.at, chunks.barrier, chunks.entries, chunks.later, chunks.bound) = (0, 0, false, 0, 0, false);
+            chunks.heads_used = 0;
             *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6132,37 +6138,73 @@ impl HostList {
 
     /// As [`HostList::clamp_room`], for a clamp settled in one pass with
     /// the list's others (`crate::indirect::batching`): 16 bytes more for
-    /// its head, in the list's first buffer only, at most
-    /// `crate::indirect::LATER_MOST` of them. The buffer and the head's
-    /// offset; None when the clamp must wait for the one before instead.
+    /// its head, at most `crate::indirect::LATER_MOST` heads a list. The
+    /// buffer and the head's offset; None when the clamp must charge the
+    /// budget in turn instead. Whenever the clamps waiting for their pass
+    /// cannot take this one (another buffer, or none), their pass is
+    /// recorded first: the list's budget is charged in the draws' order.
     pub(crate) fn clamp_room_later(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
         const CHUNK: u64 = 256 << 10;
         let bytes = bytes.next_multiple_of(16) + 16;
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-            let fits = match chunks.used {
-                0 => bytes <= CHUNK,
-                1 => chunks.at + bytes <= CHUNK,
-                _ => false,
-            };
-            if !fits || chunks.later as usize >= crate::indirect::LATER_MOST {
+            let in_this = chunks.used > 0 && chunks.at + bytes <= CHUNK;
+            if bytes > CHUNK || chunks.heads_used as usize >= crate::indirect::LATER_MOST {
+                self.settle_later(&mut chunks);
                 return None;
             }
+            if !in_this {
+                self.settle_later(&mut chunks);
+            }
             if chunks.heads.is_none() {
-                let (buffer, data) = host()?.shared_buffer(4 * crate::indirect::LATER_MOST as u64)?;
+                let Some((buffer, data)) = host()?.shared_buffer(4 * crate::indirect::LATER_MOST as u64) else {
+                    self.settle_later(&mut chunks);
+                    return None;
+                };
                 name(&buffer, || "heads of hoisted clamps".to_string());
                 chunks.heads = Some((buffer, data as usize));
             }
         }
         let (buffer, at) = self.clamp_room(bytes)?;
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-        let n = chunks.later as usize;
+        if chunks.later == 0 {
+            (chunks.later_from, chunks.later_chunk) = (chunks.heads_used, chunks.used - 1);
+        }
+        let n = chunks.heads_used as usize;
         let (_, data) = chunks.heads.as_ref()?;
-        // SAFETY: the table's own mapped words (`BATCH_MOST` of them); the
+        // SAFETY: the table's own mapped words (`LATER_MOST` of them); the
         // list has not been submitted since its reset.
         unsafe { (*data as *mut u32).add(n).write_volatile(at as u32) };
         chunks.later += 1;
+        chunks.heads_used += 1;
         Some((buffer, at))
+    }
+
+    /// Records the pass of the clamps waiting for it, if any
+    /// ([`HostList::clamp_room_later`]).
+    fn settle_later(&self, chunks: &mut ClampChunks) {
+        if chunks.later == 0 {
+            return;
+        }
+        let clamps = std::mem::take(&mut chunks.later);
+        let (Some((chunk, _)), Some((heads, _)), Some(budget)) =
+            (chunks.all.get(chunks.later_chunk), chunks.heads.as_ref(), self.budget())
+        else {
+            tracing::warn!(clamps, "clamps recorded to be settled were not: their budget is not charged");
+            return;
+        };
+        // SAFETY: a live buffer.
+        let heads = unsafe { heads.GetGPUVirtualAddress() } + 4 * u64::from(chunks.later_from);
+        if crate::indirect::settle_later(&self.list, chunk, heads, clamps, budget) {
+            // Another pipeline: the next clamp binds its own again.
+            chunks.bound = false;
+            static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SHOWN.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::info!(clamps, "clamps of a list settled in one pass, without waits between them");
+            }
+        } else {
+            tracing::warn!(clamps, "clamps recorded to be settled were not: their budget is not charged");
+        }
     }
 
     /// The clamped arguments written so far become readable as indirect
@@ -6171,21 +6213,7 @@ impl HostList {
     pub(crate) fn clamp_end(&self) {
         crate::indirect::flush_batch(self);
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-        if chunks.later > 0
-            && let (Some((chunk, _)), Some((heads, _))) = (chunks.all.first(), chunks.heads.as_ref())
-        {
-            // SAFETY: a live buffer.
-            let heads = unsafe { heads.GetGPUVirtualAddress() };
-            if crate::indirect::settle_later(&self.list, chunk, heads, chunks.later) {
-                static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if SHOWN.fetch_add(1, Ordering::Relaxed) < 4 {
-                    tracing::info!(clamps = chunks.later, "clamps of a list settled in one pass, without waits between them");
-                }
-            } else {
-                tracing::warn!(clamps = chunks.later, "clamps recorded to be settled were not: their budget is not charged");
-            }
-            chunks.later = 0;
-        }
+        self.settle_later(&mut chunks);
         let used = chunks.used;
         let entries = std::mem::take(&mut chunks.entries);
         let settled = match &chunks.ledger {

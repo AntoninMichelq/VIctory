@@ -250,14 +250,17 @@ void main(uint t : SV_GroupIndex) {
 /// the one before (`VICTORY_HOIST_CLAMPS=7`), so the records past the
 /// budget are the same from frame to frame. `heads` holds the offset in
 /// `chunk` of each clamp's head ([`SOURCE`], bit 5), in the draws' order.
-/// The cost of a record is read back from its clamped words.
+/// The cost of a record is read back from its clamped words. The pass
+/// starts from what the list's budget (`u1`, word 0) holds, the clamps
+/// charged before these, and leaves there what it charged on top.
 const SETTLE_LATER: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Settle : register(b0) {
     uint clamps;
 };
 ByteAddressBuffer heads : register(t0);
 RWByteAddressBuffer chunk : register(u0);
+RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint WIDE = 1024;
 groupshared uint scan[WIDE];
@@ -277,7 +280,7 @@ uint cost_at(uint at, uint kind) {
 [RootSignature(RS)]
 [numthreads(1024, 1, 1)]
 void main(uint tid : SV_GroupIndex) {
-    if (tid == 0) carry = 0;
+    if (tid == 0) carry = min(budget.Load(0), BUDGET);
     GroupMemoryBarrierWithGroupSync();
     for (uint base = 0; base < clamps; base += WIDE) {
         uint i = base + tid;
@@ -328,6 +331,7 @@ void main(uint tid : SV_GroupIndex) {
         if (tid == WIDE - 1) carry = plus(carry, scan[WIDE - 1]);
         GroupMemoryBarrierWithGroupSync();
     }
+    if (tid == 0) budget.Store(0, carry);
 }
 "#;
 
@@ -837,38 +841,46 @@ pub(crate) fn batching() -> bool {
 /// wait for each other as before.
 pub(crate) const LATER_MOST: usize = 4096;
 
-/// Records, in `l`, the pass that charges the budget of the `clamps` clamps
-/// recorded without waits into `chunk` (heads at the offsets `heads` holds),
-/// after a wait for them. False if the pass is not available.
-pub(crate) fn settle_later(l: &ID3D12GraphicsCommandList, chunk: &ID3D12Resource, heads: u64, clamps: u32) -> bool {
+/// Records, in `l`, the pass that charges the list's budget (`budget`, as
+/// [`HostList::budget`] gives it) for the `clamps` clamps recorded without
+/// waits into `chunk` (heads at the offsets `heads` holds), after a wait
+/// for every earlier write (those clamps, and clamps charged in turn
+/// before them), with a wait after it for the clamps that charge in turn
+/// after it. False if the pass is not available.
+pub(crate) fn settle_later(
+    l: &ID3D12GraphicsCommandList,
+    chunk: &ID3D12Resource,
+    heads: u64,
+    clamps: u32,
+    budget: u64,
+) -> bool {
     let Some(c) = settler_later() else {
         return false;
     };
-    settle_later_with(c, l, chunk, heads, clamps);
+    settle_later_with(c, l, chunk, heads, clamps, budget);
     true
 }
 
-fn settle_later_with(c: &Clamp, l: &ID3D12GraphicsCommandList, chunk: &ID3D12Resource, heads: u64, clamps: u32) {
+fn settle_later_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    chunk: &ID3D12Resource,
+    heads: u64,
+    clamps: u32,
+    budget: u64,
+) {
     // SAFETY: an open list; our root signature and pipeline; live buffers
-    // (`chunk` writable, `heads` mapped host memory).
+    // (`chunk` and `budget` writable, `heads` mapped host memory).
     unsafe {
-        let barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    // A borrowed pointer; the barrier never releases it.
-                    pResource: std::mem::transmute_copy(chunk),
-                }),
-            },
-        };
-        l.ResourceBarrier(std::slice::from_ref(&barrier));
+        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstant(0, clamps, 0);
         l.SetComputeRootShaderResourceView(1, heads);
         l.SetComputeRootUnorderedAccessView(2, chunk.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, budget);
         l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
 }
 
@@ -1818,6 +1830,22 @@ void main() {
     /// after it; the other words untouched.
     #[test]
     fn warp_settled_clamps_charge_the_budget_in_order() {
+        // What survives: the first clamp (2^26); the mesh (384); the
+        // third's first record (2^25), its second crosses the budget; the
+        // fourth runs nothing; the last only its first record, which costs
+        // nothing.
+        settled_case(0, [&[true], &[true], &[true, false, false], &[], &[true, false]]);
+    }
+
+    /// The same after clamps charged in turn before them spent half the
+    /// budget: the first clamp spends the rest exactly, all after it run
+    /// empty but the record that costs nothing.
+    #[test]
+    fn warp_settled_clamps_start_from_the_budget_spent_before() {
+        settled_case(1 << 26, [&[true], &[false], &[false, false, false], &[], &[true, false]]);
+    }
+
+    fn settled_case(start: u32, kept: [&[bool]; 5]) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1844,7 +1872,7 @@ void main() {
         // SAFETY: mapped buffers have sufficient capacity.
         unsafe {
             std::ptr::write_bytes(src_ptr, 0, src_size as usize);
-            (budget_ptr as *mut u32).write_volatile(0);
+            (budget_ptr as *mut u32).write_volatile(start);
             std::ptr::write_bytes(readback_ptr, 0xEE, 64 << 10);
         }
         let mut layout = Vec::new();
@@ -1895,7 +1923,7 @@ void main() {
             src_at += len.next_multiple_of(16);
             head += len.next_multiple_of(16) + 16;
         }
-        settle_later_with(&settler, &warp.list, &chunk, heads_gpu, clamps.len() as u32);
+        settle_later_with(&settler, &warp.list, &chunk, heads_gpu, clamps.len() as u32, budget_gpu);
         // SAFETY: an open list and live buffers.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
@@ -1915,11 +1943,6 @@ void main() {
             // SAFETY: GPU work completed; inside the readback.
             unsafe { (readback_ptr.add(at as usize) as *const u32).read_volatile() }
         };
-        // What survives: the first clamp (2^26); the mesh (384); the
-        // third's first record (2^25), its second crosses the budget; the
-        // fourth runs nothing; the last only its first record, which costs
-        // nothing.
-        let kept: [&[bool]; 5] = [&[true], &[true], &[true, false, false], &[], &[true, false]];
         for (n, (kind, stride, records, active)) in clamps.iter().enumerate() {
             let at = layout[n];
             let head_words: Vec<u32> = (0..4).map(|w| word(at - 16 + 4 * w)).collect();
@@ -1940,7 +1963,7 @@ void main() {
         }
         // SAFETY: GPU work completed.
         let charged = unsafe { (budget_ptr as *const u32).read_volatile() };
-        assert_eq!(charged, 0, "settled clamps charge nothing as they clamp");
+        assert_eq!(charged, 1 << 27, "the settling pass leaves the budget it charged (crossed: all of it)");
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
