@@ -1524,6 +1524,54 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    /// The title writes the page numbers after it enqueued and submitted:
+    /// a worker that is early waits for them instead of failing.
+    #[test]
+    fn page_numbers_written_after_submit() {
+        use crate::modules::xmem;
+        let mut real = [0usize; 1];
+        let mut n = 1;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, real.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, real.as_ptr()), mapped);
+
+        let plain = pattern(100);
+        let (queue, array) = (new_queue(1), status_array(2));
+        // Not written yet: a number no allocation has.
+        let late = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(usize::MAX)));
+        let never = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(usize::MAX)));
+        for (index, numbers) in [&*late, &*never].into_iter().enumerate() {
+            let r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                numbers.as_ptr().cast(),
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            enqueue(queue, &r);
+            enqueue_status(queue, array, index as u32);
+        }
+        void(queue, 0x30);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        late.store(real[0], Ordering::Release);
+        assert_eq!(wait(array, 0), S_OK);
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 100) };
+        assert_eq!(seen, plain);
+        // One the title never writes still fails, after the wait.
+        assert_ne!(wait(array, 1), S_OK);
+    }
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
