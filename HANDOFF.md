@@ -139,6 +139,7 @@ Notes on that env:
 |---|---|---|
 | `fix/evict-grey` `056a9b5` (on b74ac64) | texture slots given up for VRAM room point at a 4x4 grey stand-in instead of a NULL view (`VICTORY_EVICT_GREY=0` = old) | superseded by the next line |
 | **`fix/wait-grey` `89e0bb6`** (on 056a9b5) | also slots still **waiting** for their host copy, and placed/streamed textures; integer formats stay 0 (`VICTORY_WAIT_GREY=0` = control) | Run 2026-11-25 20:48 (run-20261125-204839-jouer-evictgrey): shirt matte at the window, BUT posters solid black, face/neck black in corridor A102, NPCs in cells still chrome; given-up count doubled (65.6k at w+300); no "grey" line in the log, so the stand-in use is unconfirmed; 4.90 fps (heavy scene), 21.8 GB. **Not clean, not promoted.** |
+| **`fix/partly-clamp` `d1e021b5`** (on 89e0bb6) | ~1,700 slots stay "uploaded in part" (streamed textures, memory partly mapped): their missing top levels read as zeros. Remakes those slots with `ResourceMinLODClamp` at the first fully mapped level, drops the clamp once whole (`VICTORY_PARTLY_CLAMP=0` = off). Expect INFO "texture slots uploaded in part remade…" | **Not built yet.** Needs Windows clippy -D warnings, then a common-room run with shots at w+360/400 |
 | `fix/loading-sharp` `2cde495` | TEXTURE_HALF skips non-power-of-two textures (loading art sharp again); `VICTORY_TEXTURE_HALF_NPOT=1` = old | compiled, not run alone |
 | `jouer/peau3-overlay` `bbc847a` (aeebeec + fix) | overlay only shows console mode + FSR lines; box sized to its lines | compiled |
 | `perf/lean-math` `4237bce` | `VICTORY_LEAN_MATH` bitmask: 1 legacy mul in 3 ops (+0 for zero product), 2 plain max/min, 4 med3 w/o NaN, 8 plain mul + operand clamps, 16 finite pixel outputs, 32 v_mad as FMad, 64 fast rcp. In the cache key. | L7 6.68 fps (+4%, GPU 70.7 ms, grey-white hair at w+120 before the 4237bce fix); L31 6.93 (+8%, GPU 61.6); L127 in the group. **Chrome seen on L31 was also on the Peau3 control → not proof against it.** L1/L6/L97 split pending |
@@ -163,8 +164,8 @@ Notes on that env:
 
 ## 8. Open problems, ranked
 
-1. **Random chrome / rainbow / black patches on characters and floors** (also on Jouer). Cause: texture slots evicted or waiting under VRAM pressure were NULL views → zeros (black albedo, normal (-1,-1), roughness 0 = mirror). `fix/wait-grey` only partly helps (it also doubled given-up slots; find the views that still stay null — posters, faces). Real fix next: give up far fewer slots — evict least-recently-sampled instead of oldest-made, or keep/remake small mips instead of emptying the slot. Code: `crates/victory-gpu` texture queue / `texture_slots_evict`, `resource::room()` (90% of the VRAM budget).
-2. **Floating head / torso missing** with the ledger (`HOIST_CLAMPS=9`) and/or flat tiles (`FLAT_INSTANCES`). Bisect with the group splits A/B/C; logs of ledger `8a89721` show 49–80k "a flight's shaders write it".
+1. **Random chrome / rainbow / black patches on characters and floors** (also on Jouer). Cause: texture slots evicted or waiting under VRAM pressure were NULL views → zeros (black albedo, normal (-1,-1), roughness 0 = mirror). `fix/wait-grey` only partly helps (it also doubled given-up slots). Next leads: (a) `fix/partly-clamp` d1e021b5 for partly mapped streamed textures; (b) black faces/necks are probably the **baked skin** (PS_BakeDecorations render target), separate from eviction; (c) evict less. Real fix next: give up far fewer slots — evict least-recently-sampled instead of oldest-made, or keep/remake small mips instead of emptying the slot. Code: `crates/victory-gpu` texture queue / `texture_slots_evict`, `resource::room()` (90% of the VRAM budget).
+2. **Floating head / torso missing**: seen only on trial builds with the clamp ledger (mode 9, 8a89721/7068acc) — its logs show 49–80k "a flight's shaders write it" refreshes vs 0–72 on other builds; flat tiles (`FLAT_INSTANCES`) not cleared either. Bisect with the group splits A/B/C; logs of ledger `8a89721` show 49–80k "a flight's shaders write it".
 3. **Speed: GPU-bound ~70 ms/frame** (~6.4 fps, user's goal was 10). Biggest card costs (F0d, 105.7 ms/frame diag): ScreenProbes `39f0e9ae` 8.8 ms (1 dispatch, scalar-bound; idea: async compute queue), tiles `e732a8b4`/`456f02b5` 8.5, hoisted clamps 7.0, scattering gathers ~9, shadowmask `5cf00dc3` 2.6. Levers: lean math (−8..−18 ms), ledger, flat tiles, fx merge, `FFX_SCALE=0.4`.
 4. Eyes glowing white in cutscenes, satin streaks on shirts, blotchy inmate faces (some may be #1).
 5. Loading screens blurry (fix ready) and overlay too long (fix ready).
@@ -190,7 +191,7 @@ Newest first. "Branch" = fork branch.
 - **Écrire le document de reprise** — this file.
 - **Sync with latest VIctory and xcl** (the PC-driving thread) — built every Jouer, ran all trials (L7/L31/L127, control, group, sans-sondes, evict-grey). Owns `_work` bats. Pushed `essai/groupe*`.
 - **Make the texture and lighting calculations work** — `fix/wait-grey` 89e0bb6 (chrome cause). Earlier: copy-back runs 379f21a, root-UAV bisect, `fix/root-uav-gpu-owned`.
-- **Éclairer le corps et les habits du personnage** (characters) — skin/hair: bake textures 63a1e8c8, evict requeue deee1941 (`VICTORY_EVICT_REQUEUE_FRAMES=30`), alias copies refreshed d8780f2a (ponytail, no chrome shirts), `fix/evict-grey` 056a9b5. Offline tool pedtool (private). Next: evict fewer slots.
+- **Éclairer le corps et les habits du personnage** (characters) — proven in Peau3: evict requeue deee1941, alias copies cff6214b/d8780f2a (INPLACE=1 loses torsos). New: `fix/partly-clamp` d1e021b5. Earlier skin/hair: bake textures 63a1e8c8, evict requeue deee1941 (`VICTORY_EVICT_REQUEUE_FRAMES=30`), alias copies refreshed d8780f2a (ponytail, no chrome shirts), `fix/evict-grey` 056a9b5. Offline tool pedtool (private). Next: evict fewer slots.
 - **Accélérer les shaders traduits** — `perf/lean-math` (section 6). Method notes in `docs/notes` and memory: corpus `_work\shaders-corpus.tgz`, `examples/dump.rs`, a local-only DXIL datalayout hack (never commit).
 - **Reprendre les optimisations AMD de deux forks** — `port/fx-d510ee4` 23e5a09, plan `docs/notes/fx-d510ee4-essai.md`. Not run.
 - **Simplifier la liste de l'overlay** — aeebeec + bbc847a (`jouer/peau3-overlay`).
@@ -269,7 +270,7 @@ Liste ce qui peut aider une RX 7600 8 Go (vitesse, image, mémoire), classé, av
 The fork had ~310 branches. Kept (everything an agent needs):
 `main`, `docs/handoff`, `jouer/peau3` (current Jouer), `jouer/peau2` (fallback), `jouer/peau3-overlay`,
 `essai/groupe`, `essai/groupe-base`, `essai/groupe-overlay`, `perf/lean-math`, `perf/clamp-ledger`, `perf/tiles-probe`,
-`fix/loading-sharp`, `fix/evict-grey`, `fix/wait-grey`, `port/fx-d510ee4`, and `archive/branches`.
+`fix/loading-sharp`, `fix/evict-grey`, `fix/wait-grey`, `fix/partly-clamp`, `port/fx-d510ee4`, `scratch/smem` (PC worktree `_work\VIctory-fix`), and `archive/branches`.
 
 **`archive/branches`** is one commit whose parents are the tips of every other branch (296 at first), with
 `ARCHIVE.md` listing `branch | commit`. Nothing is lost: `git fetch fork archive/branches`, then

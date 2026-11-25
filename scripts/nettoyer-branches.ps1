@@ -17,7 +17,7 @@ $Keep = @(
   'jouer/peau3', 'jouer/peau2', 'jouer/peau3-overlay',
   'essai/groupe', 'essai/groupe-base', 'essai/groupe-overlay',
   'perf/lean-math', 'perf/clamp-ledger', 'perf/tiles-probe',
-  'fix/loading-sharp', 'fix/evict-grey', 'fix/wait-grey', 'port/fx-d510ee4'
+  'fix/loading-sharp', 'fix/evict-grey', 'fix/wait-grey', 'fix/partly-clamp', 'port/fx-d510ee4', 'scratch/smem'
 )
 $ForkUrl = 'https://github.com/AntoninMichelq/VIctory-forkAMD'
 
@@ -28,7 +28,7 @@ if (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -l
 
 function GitOk { & git.exe @args; if ($LASTEXITCODE -ne 0) { throw "git $args a echoue" } }
 
-if (-not ((git remote) -contains 'fork')) { Git remote add fork $ForkUrl }
+if (-not ((git remote) -contains 'fork')) { GitOk remote add fork $ForkUrl }
 GitOk fetch fork --prune
 
 $current = (git branch --show-current)
