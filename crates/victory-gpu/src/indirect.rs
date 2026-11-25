@@ -67,6 +67,8 @@ static const uint BUDGET = 1u << 27;
 static const uint LEDGER_CAP = 1u << 30;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Instances a flat draw holds at most (`FLAT_MOST` in `indirect.rs`).
+static const uint FLAT_MOST = 32768u;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -108,6 +110,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint instances = min(asked.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
+        // Bit 2: instances drawn flat (`bound_flat`), six indices each
+        // (three with bit 3), as one instance; the index buffer and vertex
+        // buffers are ours.
+        if ((has_count & 4u) != 0) {
+            uint per = (has_count & 8u) != 0 ? 3u : 6u;
+            draw_counts = uint2(min(asked.y, FLAT_MOST) * per, min(asked.y, 1u));
+            cost = draw_counts.x;
+        }
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
@@ -158,7 +168,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         dst_args.Store2(dst_at, draw_counts);
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            // (a flat draw starts at our buffers' first index and instance)
+            dst_args.Store(dst_at + off, (has_count & 4u) != 0 ? 0u : src_args.Load(src_at + off));
         }
     } else {
         if (over) {
@@ -519,6 +530,38 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    record_clamp_flags(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), u32::from(ahead) << 1)
+}
+
+/// The instances a flat draw ([`bound_flat`]) holds at most.
+pub(crate) const FLAT_MOST: u32 = 32768;
+
+/// [`bound`] for one indexed record whose instances are drawn flat: the
+/// record becomes `per` (six, or three) indices per instance (up to
+/// [`FLAT_MOST`]) of one instance, from index 0, vertex 0 and instance 0 of
+/// the caller's buffers.
+pub(crate) fn bound_flat(list: &HostList, src: (&ID3D12Resource, u64), stride: u32, per: u32) -> Option<ID3D12Resource> {
+    const INDEXED: u32 = 1;
+    let spec = (INDEXED, stride, 1);
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let flags = if per == 3 { 4 | 8 } else { 4 };
+    record_clamp_flags(c, &list.list, &dst, budget, src, None, spec, flags).then_some(dst)
+}
+
+/// [`record_clamp_as`] with the shader's flag bits: 2 ahead, 4 flat, 8
+/// flat with three indices per instance.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_flags(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    flags: u32,
+) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,
@@ -562,7 +605,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`

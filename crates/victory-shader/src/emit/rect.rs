@@ -40,6 +40,23 @@ const VERTICES: u32 = 6;
 /// output components).
 const MAX_SCALARS: u32 = 1024;
 
+thread_local! {
+    /// See [`with_flat_rects`].
+    static FLAT_RECTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`rect_list_gs`] made for a draw whose instances of one
+/// rectangle each are drawn flat as one instance
+/// (`super::with_flat_instances`): the pixel shader's primitive id is then
+/// 0, the rectangle's number within its own instance, not the running
+/// count the host's one instance gives.
+pub fn with_flat_rects<R>(f: impl FnOnce() -> R) -> R {
+    let was = FLAT_RECTS.replace(true);
+    let r = f();
+    FLAT_RECTS.set(was);
+    r
+}
+
 /// The geometry shader (a DXIL container) for rectangle lists drawn with
 /// the translated vertex shader `vs` and, if the pipeline has one, the
 /// translated pixel shader `ps` (both as [`super::HostShader::dxil`]). Its
@@ -206,7 +223,13 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     // The rectangle's number: the triangle's, three vertices a rectangle.
     let mut number = None;
     if let Some(id) = primitive {
-        let n = s.op(b, "primitiveID.i32", Attr::ReadNone, s.t.i32, 108, &[]);
+        // Instances drawn flat (`with_flat_rects`): every rectangle is the
+        // first of its instance, as the console numbers them.
+        let n = if FLAT_RECTS.get() {
+            s.m.i32(0)
+        } else {
+            s.op(b, "primitiveID.i32", Attr::ReadNone, s.t.i32, 108, &[])
+        };
         number = Some((id, n));
     }
     let stream = s.m.i8(0);
