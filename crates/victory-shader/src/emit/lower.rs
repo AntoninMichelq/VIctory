@@ -3798,10 +3798,11 @@ impl<'a> Lower<'a> {
     /// instructions are one), and the exact form costs a multiply, two
     /// compares, an or and a select. The lean form: a finite non-zero
     /// literal times anything is the plain product, a zero literal gives 0,
-    /// and otherwise the product's NaN (which `0 × ∞` makes) becomes 0: a
-    /// multiply, a compare and a select. What differs from the console: a
-    /// NaN operand gives 0 instead of NaN (where the other is not 0), and
-    /// a zero product may be -0 where the console's is +0.
+    /// and otherwise a product that is NaN (which `0 × ∞` makes) or zero
+    /// becomes +0: a multiply, a compare and a select. What differs from
+    /// the console: a NaN operand gives 0 instead of NaN (where the other
+    /// is not 0), a product of non-zeros that underflows is +0, and a
+    /// literal times -0 may be -0.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         if lean_math() & 8 != 0 {
@@ -3819,10 +3820,12 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            // NaN or either zero -> +0: the console's sign for 0 × -x too
+            // (a -0 here turned a later reciprocal into -∞).
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
-            let nan = self.s.m.cmp(c, pred::UNO, m, m);
-            return self.s.m.select(c, nan, zero, m);
+            let nan_or_zero = self.s.m.cmp(c, pred::UEQ, m, zero);
+            return self.s.m.select(c, nan_or_zero, zero, m);
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
