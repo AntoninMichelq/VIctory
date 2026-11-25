@@ -216,11 +216,27 @@ extern "system" fn create_queue(
     )
 }
 
+/// Compressed bytes in flight at least (`VICTORY_DSTORAGE_STAGING_MB`,
+/// default 128): the console's 32 MiB is for its hardware decompression;
+/// ours runs on the CPU workers, and a few large compressed reads held all
+/// of it while the other workers waited (a cutscene's new area streamed in
+/// with the card idle).
+fn staging_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
+            << 20
+    })
+}
+
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(staging_floor());
     }
     S_OK
 }
@@ -404,7 +420,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: STAGING.max(staging_floor()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -477,18 +493,31 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
-                requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
-                staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
-                waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
-            );
+            // At info while reads wait (streaming that lags is what shows
+            // as missing buildings), at debug otherwise.
+            macro_rules! line {
+                ($level:ident) => {
+                    tracing::$level!(
+                        requests = *requests,
+                        mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
+                        busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
+                        reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
+                        staging_waits = self.refused,
+                        staging_mb = self.staging >> 20,
+                        bcpack_mb = self.bcpack.0 / 1_000_000,
+                        bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                        waiting,
+                        "dstorage: last {:.1} s",
+                        elapsed.as_secs_f64()
+                    )
+                };
+            }
+            if waiting > 0 || self.refused > 0 {
+                line!(info);
+            } else {
+                line!(debug);
+            }
+            self.refused = 0;
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
