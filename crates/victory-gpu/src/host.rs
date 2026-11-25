@@ -252,7 +252,7 @@ fn memory_line(card: Option<[u64; 4]>) {
          {} MB; host textures the title fills {} alive {} MB; host lists {} alive, scratch {} chunks {} MB ({} spare {} MB), \
          other upload buffers {} {} MB; made so far: upload {} {} MB, shared {} {} MB, card {} {} MB; {} objects waiting for \
          submissions to finish; {} shaders {} MB, {} translations {} MB; library file {} MB; lists in the air {}, landed \
-         lists not yet reset {}",
+         lists not yet reset {}; texture passes with the loading budget so far {}",
         copies[0],
         mb(copies[1]),
         copies[2],
@@ -282,6 +282,7 @@ fn memory_line(card: Option<[u64; 4]>) {
         mb(kept[4]),
         lists,
         landed,
+        crate::draw::HEAP_TEXTURES_PRELOAD.load(Ordering::Relaxed),
     );
 }
 
@@ -1767,16 +1768,17 @@ fn card_gather() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_GATHER").is_some_and(|v| v == "1"))
 }
 
-/// Gathered pieces a plan has room for (`VICTORY_CARD_GATHER_PIECES`, 64:
-/// 4.2 MB of the PC's memory per plan in the air). A flight flagged about
-/// 30 pieces in the runs of 2026-11-25.
+/// Gathered pieces a plan has room for (`VICTORY_CARD_GATHER_PIECES`, 160:
+/// 10.5 MB of the PC's memory per plan in the air). With 64, about 515
+/// pieces a frame were still fetched beside 410 gathered (run T1b,
+/// 2026-11-25).
 fn gather_cap() -> u32 {
     static CAP: OnceLock<u32> = OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("VICTORY_CARD_GATHER_PIECES")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(64)
+            .unwrap_or(160)
             .clamp(1, 16_000)
     })
 }
@@ -1785,7 +1787,7 @@ fn gather_cap() -> u32 {
 /// from what the card copied out within submissions, their bytes, and
 /// pieces fetched after all (past a plan's room, or of a copy merged from
 /// a newer fetch since).
-static GATHER_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static GATHER_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// A plan's memory for [`CARD_GATHER`]: the buffer, its mapping, its slots.
 #[derive(Clone)]
@@ -2897,11 +2899,13 @@ fn late_line(frames: f64) {
         );
     }
     if card_gather() {
-        let [pieces, bytes, fetched] = [0, 1, 2].map(|i| GATHER_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let [pieces, bytes, fetched, over, newer] = [0, 1, 2, 3, 4].map(|i| GATHER_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "card gather per frame (VICTORY_CARD_GATHER=1): {pieces:.0} pieces ({:.1} MB) merged from what the card copied out \
-             within their submission, {fetched:.0} fetched after all",
-            bytes / 1e6
+             within their submission, {fetched:.0} fetched after all ({over:.0} past a plan's room of {}, {newer:.0} of pieces \
+             merged from a newer fetch since)",
+            bytes / 1e6,
+            gather_cap()
         );
     }
     if late_exact() {
@@ -3823,18 +3827,21 @@ impl Host {
                     Some(gather) => {
                         // SAFETY: the mapping's counter and slots; the
                         // submission that wrote them has run.
-                        let count = unsafe { std::ptr::read_volatile(gather.data as *const u32) }.min(gather.cap);
+                        let all = unsafe { std::ptr::read_volatile(gather.data as *const u32) };
+                        GATHER_STATS[3].fetch_add(u64::from(all.saturating_sub(gather.cap)), Ordering::Relaxed);
+                        let count = all.min(gather.cap);
                         let slots = unsafe { std::slice::from_raw_parts((gather.data + 16) as *const u32, count as usize) };
                         let by_dword: std::collections::HashMap<u32, u32> =
                             slots.iter().enumerate().map(|(slot, &d)| (d, slot as u32)).collect();
                         let mut out = std::collections::HashMap::new();
                         for r in plan.ranges.iter().filter(|r| r.compared) {
-                            if r.shadow.card_merged_after() > plan.sent_as {
-                                continue;
-                            }
                             let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                             for p in 0..r.span.pieces {
                                 if let Some(&slot) = by_dword.get(&(r.at + p)) {
+                                    if r.shadow.card_merged_after(r.span.first + p) > plan.sent_as {
+                                        GATHER_STATS[4].fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
                                     let piece = r.span.first + p;
                                     let lo = (piece as usize * 65536).saturating_sub(r.span.skew as usize) & !15;
                                     let at = gather.data + GATHER_DATA as usize + slot as usize * GATHER_STRIDE as usize;

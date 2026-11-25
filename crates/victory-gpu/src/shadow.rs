@@ -99,11 +99,14 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
-    /// With [`relay`]: the newest send number a merge into this copy was
-    /// made after (`Shadow::card_merge_relay`). A piece the card copied out
-    /// within an older submission (`crate::host`'s gather) holds older
-    /// bytes than what was merged since, and is fetched instead.
-    merged_after: std::sync::atomic::AtomicU64,
+    /// With [`relay`]: by piece, the newest send number a merge into it
+    /// was made after (`Shadow::card_merge_relay`). A piece the card copied
+    /// out within an older submission (`crate::host`'s gather) holds older
+    /// bytes than what was merged since, and is fetched instead. By piece:
+    /// by copy, one fetch made every plan in the air fall back to fetching
+    /// the whole copy, whose fetch did the same to the next ones (515
+    /// pieces a frame fetched beside 410 gathered, run T1b).
+    merged_after: Mutex<std::collections::HashMap<u32, u64>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -2586,10 +2589,13 @@ impl Shadow {
         written
     }
 
-    /// With [`relay`]: the newest send number a merge into this copy was
-    /// made after (0 for a copy not in the card's memory).
-    pub(crate) fn card_merged_after(&self) -> u64 {
-        self.card.as_ref().map_or(0, |c| c.merged_after.load(Ordering::Relaxed))
+    /// With [`relay`]: the newest send number a merge into piece `piece`
+    /// (as `CardSpan` numbers them) was made after (0 for none, or a copy
+    /// not in the card's memory).
+    pub(crate) fn card_merged_after(&self, piece: u32) -> u64 {
+        self.card.as_ref().map_or(0, |c| {
+            c.merged_after.lock().unwrap_or_else(|e| e.into_inner()).get(&piece).copied().unwrap_or(0)
+        })
     }
 
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
@@ -2619,7 +2625,18 @@ impl Shadow {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        card.merged_after.fetch_max(fetched_after, Ordering::Relaxed);
+        {
+            let mut merged = card.merged_after.lock().unwrap_or_else(|e| e.into_inner());
+            if merged.len() > 4096 {
+                // Older than every fetch still to be merged: of no use.
+                let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+                merged.retain(|_, n| *n > fetched);
+            }
+            for piece in pieces_of(start, at, at + gpu.len().max(1)) {
+                let n = merged.entry(piece as u32).or_insert(0);
+                *n = (*n).max(fetched_after);
+            }
+        }
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -2819,7 +2836,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
-                    merged_after: std::sync::atomic::AtomicU64::new(0),
+                    merged_after: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3036,7 +3053,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
-                merged_after: std::sync::atomic::AtomicU64::new(0),
+                merged_after: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
