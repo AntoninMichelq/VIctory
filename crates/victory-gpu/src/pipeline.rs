@@ -811,6 +811,241 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// The console stage of a shader container's program, as the stage names
+/// of [`Shader::stage`]; `None` if it is not a container we read.
+#[cfg(windows)]
+fn container_stage(bytes: &[u8]) -> Option<&'static str> {
+    use victory_shader::{Container, FourCC, HwStage};
+    let c = Container::parse(bytes).ok()?;
+    let part = c.part(FourCC::DXIL)?;
+    let programs = victory_shader::native_programs(part.data).ok()?;
+    programs.iter().find_map(|p| match p.stage {
+        HwStage::Cs => Some("compute"),
+        HwStage::Ms => Some("mesh"),
+        HwStage::Ps => Some("pixel"),
+        HwStage::Vs => Some("vertex"),
+        _ => None,
+    })
+}
+
+/// The shader whose container holds `code` as a program's GFX10 machine
+/// code (or begins with it), among the shaders the title has given us so
+/// far (the index is brought up to date with the shaders added since the
+/// last look), else among the containers of the shader pack ([`pack`]).
+#[cfg(windows)]
+fn by_code(code: &[u8]) -> Option<Arc<Shader>> {
+    use victory_shader::{Container, FourCC};
+    struct Index {
+        /// Shaders looked at (by container hash).
+        seen: std::collections::HashSet<[u8; 32]>,
+        /// A program's whole code, and its first 256 bytes, by hash.
+        whole: HashMap<[u8; 32], Arc<Shader>>,
+        head: HashMap<[u8; 32], Arc<Shader>>,
+    }
+    static INDEX: Mutex<Option<Index>> = Mutex::new(None);
+    const HEAD: usize = 256;
+    let all: Vec<([u8; 32], Arc<Shader>)> = SHADERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
+        .unwrap_or_default();
+    let mut guard = INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let index = guard.get_or_insert_with(|| Index {
+        seen: Default::default(),
+        whole: HashMap::new(),
+        head: HashMap::new(),
+    });
+    for (key, s) in all {
+        if !index.seen.insert(key) {
+            continue;
+        }
+        let Ok(c) = Container::parse(&s.container) else { continue };
+        let Some(part) = c.part(FourCC::DXIL) else { continue };
+        let Ok(programs) = victory_shader::native_programs(part.data) else { continue };
+        for p in programs {
+            index.whole.insert(*blake3::hash(&p.code).as_bytes(), s.clone());
+            if p.code.len() >= HEAD {
+                index.head.entry(*blake3::hash(&p.code[..HEAD]).as_bytes()).or_insert_with(|| s.clone());
+            }
+        }
+    }
+    let found = index
+        .whole
+        .get(blake3::hash(code).as_bytes())
+        .or_else(|| (code.len() >= HEAD).then(|| index.head.get(blake3::hash(&code[..HEAD]).as_bytes())).flatten())
+        .cloned();
+    drop(guard);
+    // Else the container in the shader pack, if one is named.
+    found.or_else(|| {
+        let bytes = pack::container(code)?;
+        container_stage(&bytes).map(|stage| shader(stage, &bytes))
+    })
+}
+
+/// The title's shader pack (`VICTORY_SHADER_PACK`, the path of its
+/// `shaders.rpf`; unset, none is read): the containers of the programs that
+/// precompiled descriptions name ([`crate::precompiled`]), which the title
+/// never hands over itself.
+#[cfg(windows)]
+mod pack {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use crate::precompiled::PackIndex;
+
+    struct Pack {
+        path: PathBuf,
+        index: PackIndex,
+    }
+
+    static PACK: OnceLock<Option<Pack>> = OnceLock::new();
+
+    /// The container holding `code` (padding and all), read from the pack;
+    /// the pack is indexed on first use.
+    pub(super) fn container(code: &[u8]) -> Option<Vec<u8>> {
+        let pack = PACK
+            .get_or_init(|| {
+                let path = PathBuf::from(std::env::var_os("VICTORY_SHADER_PACK")?);
+                let started = std::time::Instant::now();
+                match index(&path) {
+                    Ok(index) => {
+                        tracing::info!(path = %path.display(), programs = index.programs(), ms = started.elapsed().as_millis() as u64, "shader pack indexed for precompiled pipelines");
+                        Some(Pack { path, index })
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), %e, "shader pack not read: precompiled pipelines stay unmade");
+                        None
+                    }
+                }
+            })
+            .as_ref()?;
+        let at = pack.index.find(code)?;
+        record(&pack.path, at).inspect_err(|e| tracing::warn!(%e, at, "shader pack record not read")).ok().flatten()
+    }
+
+    fn index(path: &Path) -> std::io::Result<PackIndex> {
+        let file = std::fs::read(path)?;
+        let records: Vec<_> = victory_game::sgd5::records(&file).collect();
+        if records.is_empty() {
+            return Err(std::io::Error::other("no SGD5 records"));
+        }
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let chunk = records.len().div_ceil(threads);
+        let parts: Vec<PackIndex> = std::thread::scope(|s| {
+            let handles: Vec<_> = records
+                .chunks(chunk)
+                .map(|part| {
+                    s.spawn(move || {
+                        PackIndex::build(part.iter().map(|r| (r.offset, r.unpack().unwrap_or_default())), programs)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        let mut index = PackIndex::default();
+        for part in parts {
+            index.merge(part);
+        }
+        Ok(index)
+    }
+
+    /// The native programs of a container.
+    fn programs(container: &[u8]) -> Vec<Vec<u8>> {
+        use victory_shader::{Container, FourCC};
+        let Ok(c) = Container::parse(container) else { return Vec::new() };
+        let Some(part) = c.part(FourCC::DXIL) else { return Vec::new() };
+        victory_shader::native_programs(part.data)
+            .map(|ps| ps.into_iter().map(|p| p.code).collect())
+            .unwrap_or_default()
+    }
+
+    /// The container of the record whose marker is at `at`: its sizes, then
+    /// the record, read from the file (with the six bytes before the marker
+    /// a record is found by).
+    fn record(path: &Path, at: usize) -> std::io::Result<Option<Vec<u8>>> {
+        let mut f = std::fs::File::open(path)?;
+        let start = at.checked_sub(6).ok_or_else(|| std::io::Error::other("record at the start"))?;
+        f.seek(SeekFrom::Start(start as u64))?;
+        let mut head = [0u8; 18];
+        f.read_exact(&mut head)?;
+        let n = u32::from_le_bytes(head[2..6].try_into().expect("4 bytes")) as usize;
+        let mut buf = head.to_vec();
+        buf.resize(6 + n, 0);
+        f.read_exact(&mut buf[18..])?;
+        Ok(victory_game::sgd5::records(&buf).next().and_then(|r| r.unpack()))
+    }
+}
+
+/// Device methods 0x1c8 and 0x218 (`slot`), whose descriptions name
+/// precompiled parts ([`crate::precompiled`]): the shaders of the
+/// description's programs (or, if the words do not read as a description,
+/// of any (address, bytes) pair among them), each a container we read or
+/// GFX10 code whose container we know ([`by_code`]; `read` reads title
+/// memory through the kernel, neither pointer is known to be mapped). A single compute shader is made into a compute
+/// pipeline as [`create_compute`] makes one, which reads nothing of its
+/// description but the shader either; anything else is left (`None`), and
+/// the stages found are returned for the log.
+/// shortcut: what else the description holds (registers, info and maps,
+/// which the container has in its own form) is ignored; graphics
+/// descriptions are not made, their pipeline state not being decoded.
+#[cfg(windows)]
+pub(crate) fn create_from_words(
+    slot: usize,
+    words: &[u64],
+    read: impl Fn(usize, &mut [u8]) -> bool,
+    iid: *const Iid,
+    out: *mut This,
+) -> (Option<HRESULT>, Vec<String>) {
+    let mut found: Vec<Arc<Shader>> = Vec::new();
+    // For the log: each readable candidate's size and first bytes.
+    let mut seen: Vec<String> = Vec::new();
+    // The programs of a description read as one (`crate::precompiled`),
+    // else every (address, size) pair among the words.
+    let pairs: Vec<(u64, u64)> = match crate::precompiled::Description::parse(slot, words) {
+        Some(d) => d.code().map(|s| (s.address, s.size)).collect(),
+        None => words.windows(2).map(|p| (p[0], p[1])).collect(),
+    };
+    for (at, len) in pairs {
+        let (at, len) = (at as usize, len as usize);
+        // Containers of the title's run from a few hundred bytes to a few
+        // MB, machine code from 64 bytes; addresses are user-mode and
+        // 4-byte aligned.
+        if !(64..=(8 << 20)).contains(&len) || !(0x10000..1 << 47).contains(&at) || !at.is_multiple_of(4) {
+            continue;
+        }
+        let mut bytes = vec![0u8; len];
+        if !read(at, &mut bytes) {
+            continue;
+        }
+        let head: String = bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        seen.push(format!("{len:#x}:{head}"));
+        let known = if bytes.starts_with(b"DXBC") {
+            container_stage(&bytes).map(|stage| shader(stage, &bytes))
+        } else {
+            // GFX10 machine code: the container the title made another
+            // pipeline from that holds this code.
+            by_code(&bytes)
+        };
+        if let Some(s) = known
+            && !found.iter().any(|f| Arc::ptr_eq(f, &s))
+        {
+            found.push(s);
+        }
+    }
+    let mut stages: Vec<String> = found.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    if found.is_empty() {
+        stages = seen;
+    }
+    if let [cs] = found.as_slice()
+        && cs.stage == "compute"
+    {
+        return (Some(hand_out(found.clone(), None, iid, out)), stages);
+    }
+    (None, stages)
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]

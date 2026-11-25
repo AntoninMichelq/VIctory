@@ -696,6 +696,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-formats",
+ "victory-game",
  "victory-pipeline",
  "victory-shader",
  "windows",

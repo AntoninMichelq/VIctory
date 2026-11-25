@@ -48,6 +48,7 @@ pub mod object;
 #[cfg(windows)]
 mod overlay;
 pub mod pipeline;
+pub mod precompiled;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
