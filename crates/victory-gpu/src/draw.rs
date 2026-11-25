@@ -1735,8 +1735,11 @@ impl State {
         static FRAME_AT: AtomicU64 = AtomicU64::new(0);
         static FRAME_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
+        // Time the passes of this frame took, all lists together.
+        static SPENT_US: AtomicU64 = AtomicU64::new(0);
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            SPENT_US.store(0, Ordering::Relaxed);
             let now = crate::host::now_ms();
             let at = FRAME_AT.swap(now, Ordering::Relaxed);
             FRAME_MS.store(if at == 0 { 0 } else { now - at }, Ordering::Relaxed);
@@ -1822,19 +1825,28 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(if loading {
-            1000
-        } else {
-            *SPAN_MS.get_or_init(|| {
-                std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-            })
+        // A loading frame has one time for the frame, not a second for each
+        // list's pass: the loading screens ran at 0.6 fps (1.6 s a frame)
+        // with the card and most cores idle, the title's own loading waiting
+        // on its frames. Its bytes are still eight times more
+        // (`VICTORY_TEXTURE_PASS_MS`, default 200 ms a frame).
+        static PASS_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let pass_ms = *PASS_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_PASS_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(200)
         });
+        let span = if loading {
+            std::time::Duration::from_micros((pass_ms * 1000).saturating_sub(SPENT_US.load(Ordering::Relaxed)))
+        } else {
+            std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+                std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            }))
+        };
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && !loading && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -1845,6 +1857,13 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        struct Took<'a>(&'a AtomicU64, std::time::Instant);
+        impl Drop for Took<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let _took = Took(&SPENT_US, began);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
