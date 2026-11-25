@@ -277,6 +277,8 @@ The fork had ~310 branches. Kept (everything an agent needs):
 `git branch <name> <sha>` restores any of them (e.g. `nuit/tour-3b` 54d8982 for the map tour, `ancien-main` 70564ae,
 `perf/preload`, `feat/host-fsr`, `perf/heap-pass`...). Old fork PRs #1–#13 point at archived branches.
 
+Done on 2026-11-25 ~21:05 Paris from the PC: fork 313 → 18 branches (the list above + `fix/ci`), PC local branches 70 → 2 (`main`, `scratch/smem`), worktrees untouched. `archive/branches` = **090920e** (parents: cd3126a + local build-B e00f127f, build-C 60d35c8c, pr25 f1485bc1). ARCHIVE.md does not name every local branch (e.g. build-A), but all their commits are inside the archive.
+
 The cloud could create the archive but not delete branches. `scripts/nettoyer-branches.ps1` does the deletions from the PC
 (fork + local branches + clean extra worktrees, archiving any tip not yet saved first). Dry run by default, `-Apply` to do it;
 it refuses to run while VIctory is running.

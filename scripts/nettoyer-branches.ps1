@@ -12,6 +12,9 @@
 #    not in $Keep are deleted (never the checked-out one).
 param([switch]$Apply)
 
+# Text piped into git must not start with a UTF-8 BOM (git mktree then fails and the archive commit is empty).
+$OutputEncoding = New-Object Text.UTF8Encoding $false
+
 $Keep = @(
   'main', 'docs/handoff', 'archive/branches',
   'jouer/peau3', 'jouer/peau2', 'jouer/peau3-overlay',
@@ -68,7 +71,11 @@ if ($new.Count -gt 0) {
   [IO.File]::WriteAllText($tmp, $list, (New-Object Text.UTF8Encoding $false))
   $blob = (git hash-object -w $tmp)
   $tree = ("100644 blob $blob`tARCHIVE.md" | git mktree)
+  if ($tree -notmatch '^[0-9a-f]{40}$') { throw "git mktree a echoue ('$tree') : rien n'est pousse" }
   $commit = (git commit-tree $tree @parents -m "Archive: branches removed on $date")
+  if ($commit -notmatch '^[0-9a-f]{40}$') { throw "git commit-tree a echoue ('$commit') : rien n'est pousse" }
+  git merge-base --is-ancestor $archive $commit
+  if ($LASTEXITCODE -ne 0) { throw 'le nouveau commit d''archive ne contient pas l''ancien : rien n''est pousse' }
   GitOk push fork "${commit}:refs/heads/archive/branches"
   Remove-Item $tmp
 }
