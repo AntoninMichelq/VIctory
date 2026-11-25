@@ -228,6 +228,11 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// The instructions made so far, in or out of a block.
+    pub(crate) fn instruction_count(&self) -> usize {
+        self.insts.len()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

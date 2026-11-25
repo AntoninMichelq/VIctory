@@ -188,6 +188,23 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The size, in instructions the lowering made, above which a program gets
+/// every clean-up pass whatever [`shader_opt`] says
+/// (`VICTORY_SHADER_OPT_BIG`, decimal; unset or 0: none does). A run with
+/// `VICTORY_SHADER_OPT=0` (fxceless #310) then still gives the driver's
+/// compiler and the card a smaller form of its biggest programs (the screen
+/// probes' ray activation: 66k instructions without, about 15k with).
+/// Part of the translation: the shader cache keys on it.
+pub fn shader_opt_big() -> u32 {
+    static SIZE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("VICTORY_SHADER_OPT_BIG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {

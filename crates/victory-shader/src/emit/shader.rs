@@ -458,7 +458,12 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let big = super::shader_opt_big();
+        let passes = if big != 0 && self.m.instruction_count() > big as usize {
+            super::bitcode::opt::MODULE
+        } else {
+            super::shader_opt() & super::bitcode::opt::MODULE
+        };
         // Whatever the passes, a branch on a constant goes one way: the
         // lowering branches on literal lane skips, and a big program left
         // with every never-taken side (ScreenProbes 39f0e9ae: 22k blocks,

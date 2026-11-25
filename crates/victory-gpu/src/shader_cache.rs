@@ -84,6 +84,11 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                // (Unset leaves the key as it was, so caches stay warm.)
+                let big = victory_shader::emit::shader_opt_big();
+                if big != 0 {
+                    bytes.extend_from_slice(&big.to_le_bytes());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
