@@ -392,15 +392,16 @@ fn no_wait() -> bool {
 
 /// How many threads detile a large 2D subresource (4 MiB or more), in row
 /// bands; small mips stay serial so thread startup does not dominate.
-/// By default it follows the PC: one per physical core (about half the
-/// logical processors), less two for the title's main and render threads,
-/// at most 8 (16 threads: 6). `VICTORY_TEXTURE_DETILE_WORKERS=n` sets it
+/// By default it follows the PC: all logical processors but four, at most
+/// 12 (16 threads: 12; it was 6). `VICTORY_TEXTURE_DETILE_WORKERS=n` sets it
 /// (1 is serial).
 fn detile_workers() -> usize {
     static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WORKERS.get_or_init(|| {
         let logical = std::thread::available_parallelism().map_or(1, usize::from);
-        let automatic = (logical / 2).saturating_sub(2).clamp(1, 8);
+        // All but four threads, at most 12: the CPU sat at 13-30% while
+        // a cutscene's textures waited (2026-11-25 run, 16 threads).
+        let automatic = logical.saturating_sub(4).clamp(1, 12);
         std::env::var("VICTORY_TEXTURE_DETILE_WORKERS")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
