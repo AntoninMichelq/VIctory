@@ -1671,10 +1671,12 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// that keep a level after the cut. An 8 GB card filled with the title's
 /// textures left thousands of those that shaders pick by index without a
 /// host copy (drawn black: the skin and clothes of characters).
-/// Textures whose sides are not both powers of two (loading screen art,
-/// menu pictures, screen-sized images) keep every level: the world's
-/// textures are powers of two, and a quarter-size loading picture is drawn
-/// blurred full screen (`VICTORY_TEXTURE_HALF_NPOT=1` cuts them too).
+/// Pictures drawn full screen keep every level, or a quarter-size loading
+/// picture is drawn blurred: textures whose sides are not both powers of
+/// two, and wide ones (at least twice as wide as high: the loading art is
+/// 2048x1024, loaded together with 2048x512 pieces, while the world's
+/// big textures are mostly square). `VICTORY_TEXTURE_HALF_NPOT=1` cuts
+/// them too.
 /// shortcut: a shader reading texels by coordinates (not sampling) reads
 /// the smaller level; copies to or from such a texture are dropped.
 #[cfg(windows)]
@@ -1702,7 +1704,7 @@ pub(crate) fn mip_skip(desc: &ResourceDesc) -> u32 {
     if w.min(h) < min {
         return 0;
     }
-    if !npot && !(w.is_power_of_two() && h.is_power_of_two()) {
+    if !npot && (!(w.is_power_of_two() && h.is_power_of_two()) || w >= 2 * h) {
         return 0;
     }
     // Levels: 0 is the whole chain.

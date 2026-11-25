@@ -47,7 +47,10 @@ const WIDTH: i32 = 330;
 /// The box's height: five lines of numbers, a separator and the
 /// settings' lines.
 fn height() -> i32 {
-    98 + settings().len() as i32 * 17 + if settings().is_empty() { 0 } else { 8 }
+    // Consolas at 15 px takes about 18 px a line: give each 19 and keep
+    // room above and below so the last line is never cut.
+    let lines = 5 + if settings().is_empty() { 0 } else { 1 + settings().len() as i32 };
+    12 + lines * 19
 }
 
 /// The special settings this run has on, as the user calls them: the
