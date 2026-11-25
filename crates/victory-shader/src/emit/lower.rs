@@ -286,6 +286,9 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Pixel programs: per IR block whether every lane runs it ([`quad_lane_blocks`]), where
+    /// in-quad lane reads go through quad operations ([`Self::quad_place`]).
+    quad_blocks: Option<Vec<bool>>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -394,6 +397,28 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
     for (_, region) in lane_regions(st)? {
+        for b in (0..n).filter(|&b| region[b]) {
+            all[b] = false;
+        }
+    }
+    Some(all)
+}
+
+/// Per IR block of a pixel program, whether every lane that is still running runs it:
+/// [`all_lane_blocks`], except that a branch one of whose ways ends the program at once
+/// (lanes that an alpha test or a fade has killed, leaving) does not count. On the console
+/// those lanes stay for their quad (EXEC is the quad mask again); on the host they have left,
+/// as a discarded lane would.
+fn quad_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let n = st.exits.len();
+    let ends = |b: usize| matches!(st.exits.get(b), Some(LaneExit::End));
+    let mut all = vec![true; n];
+    for (branch, region) in lane_regions(st)? {
+        if let Some(&LaneExit::Branch { taken, not_taken, .. }) = st.exits.get(branch)
+            && (ends(taken) || ends(not_taken))
+        {
+            continue;
+        }
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -1662,6 +1687,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            quad_blocks: if x.native.stage == HwStage::Ps { quad_lane_blocks(x.st) } else { None },
             clane: None,
             pair: None,
             halves,
@@ -4595,22 +4621,55 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// Whether a lane read that stays in the quad goes through quad reads
-    /// ([`Self::quad_pick`]) rather than a wave read: in mesh programs, and
-    /// in pixel programs, where a wave read of a helper lane is undefined
-    /// (helper lanes are not active lanes for wave operations), while the
-    /// console's quad swizzles read them. The title's G-buffer programs take
-    /// normal derivatives that way (`ds_swizzle` quad modes): with wave reads
-    /// every quad on a triangle's edge read garbage from its helper lanes,
-    /// which drew the triangle edges as thin lines in the normals target.
-    fn quad_reads(&self, quad: bool) -> bool {
-        quad && (self.s.mesh.is_some() || self.s.pixel)
+    /// Where a lane read that stays in the quad goes through quad operations, as the host
+    /// block to read in, rather than a wave read: in mesh programs, here; in pixel programs,
+    /// where a wave read of a helper lane is undefined (helper lanes are not active lanes for
+    /// wave operations) while the console's quad swizzles read them. The title's G-buffer
+    /// programs take normal derivatives that way (`ds_swizzle` quad modes): with wave reads
+    /// every quad on a triangle's edge read garbage from its helper lanes, which drew the
+    /// triangle edges as thin lines in the normals target.
+    ///
+    /// Pixel: only in a block every lane runs. In a per-lane branch the lanes of a quad that
+    /// went the other way would not be at the read (the console reads them anyway, `fi`),
+    /// and AMD's compiler crashed on such quad reads (`amdxc64` access violation, the
+    /// studio-shot programs' depth-aware quad blur 4a2b54a7, de38b6e2, dd98419e). So the read
+    /// moves up to the block that made `from`, when every lane runs that one; else it stays a
+    /// wave read.
+    fn quad_place(&self, quad: bool, from: Option<Value>) -> Option<usize> {
+        if !quad {
+            return None;
+        }
+        if self.s.mesh.is_some() {
+            return Some(self.cur);
+        }
+        if !self.s.pixel {
+            return None;
+        }
+        let all = self.quad_blocks.as_ref()?;
+        let every = |b: usize| all.get(b).copied().unwrap_or(false);
+        if every(self.cur_ir) {
+            return Some(self.cur);
+        }
+        let from = from?;
+        let &b = self.def_block.get(&from)?;
+        if b == self.cur_ir || !every(b) || !matches!(self.vals.get(&from), Some(Val::I32(_))) {
+            return None;
+        }
+        self.tail[b]
     }
 
     /// `x` of the lane `perm` names for this lane's place in its quad (two
     /// bits per place, place 0 lowest), as one quad operation when the
     /// pattern is a swap or a broadcast, else through [`Self::quad_pick`].
-    fn quad_perm(&mut self, x: V, perm: u8) -> V {
+    fn quad_perm(&mut self, at: usize, x: V, perm: u8) -> V {
+        let here = self.cur;
+        self.cur = at;
+        let r = self.quad_perm_here(x, perm);
+        self.cur = here;
+        r
+    }
+
+    fn quad_perm_here(&mut self, x: V, perm: u8) -> V {
         let c = self.cur;
         let place = |k: u8| perm >> (2 * k) & 3;
         if (0..4).all(|k| place(k) == k) {
@@ -4757,12 +4816,16 @@ impl<'a> Lower<'a> {
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             // Pixel: so do they, because wave reads skip helper lanes
-            // ([`Self::quad_reads`]).
-            let by_quad = self.quad_reads(quad);
-            if !(by_quad && self.s.mesh.is_some()) {
+            // ([`Self::quad_place`]).
+            // The source sits in the address field.
+            let from = match addr {
+                Some(Operand::Vector { reg, .. }) => inst.read(Reg::V(*reg)),
+                _ => None,
+            };
+            let place = self.quad_place(quad, from);
+            if !(place.is_some() && self.s.mesh.is_some()) {
                 self.cross_lane(quad)?;
             }
-            // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4784,12 +4847,10 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if by_quad && offset & 0x8000 != 0 {
-                self.quad_perm(x, (offset & 0xFF) as u8)
-            } else if by_quad {
-                self.quad_pick(x, src)
-            } else {
-                self.read_lane(x, src)
+            let r = match place {
+                Some(at) if offset & 0x8000 != 0 => self.quad_perm(at, x, (offset & 0xFF) as u8),
+                Some(at) if at == c => self.quad_pick(x, src),
+                _ => self.read_lane(x, src),
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
@@ -7068,8 +7129,8 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let by_quad = self.quad_reads(quad);
-        if !(by_quad && self.s.mesh.is_some()) {
+        let place = self.quad_place(quad, inst.read(Reg::V(reg)));
+        if !(place.is_some() && self.s.mesh.is_some()) {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -7147,12 +7208,10 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if let (true, Dpp::Row { ctrl: perm @ 0..=0xFF, .. }) = (by_quad, dpp) {
-            self.quad_perm(x, perm as u8)
-        } else if by_quad {
-            self.quad_pick(x, src)
-        } else {
-            self.read_lane(x, src)
+        let mut r = match (place, dpp) {
+            (Some(at), Dpp::Row { ctrl: perm @ 0..=0xFF, .. }) => self.quad_perm(at, x, perm as u8),
+            (Some(at), _) if at == c => self.quad_pick(x, src),
+            _ => self.read_lane(x, src),
         };
         let mut enable = None;
         if let Some(inside) = inside {
