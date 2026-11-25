@@ -219,8 +219,21 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) == 0 && passes & BRANCHES != 0 {
-            while self.prune() {}
+        if passes & (FOLD | REUSE | FACTS | LOADS) == 0 && passes & BRANCHES != 0 && self.prune() {
+            // The blocks nothing reaches any more are not written: what
+            // only they call or read leaves the module too (the validator
+            // refuses a declaration nothing uses).
+            if passes & DEAD == 0 {
+                let reached = self.reached();
+                for (b, blk) in self.blocks.iter_mut().enumerate() {
+                    if !reached[b] {
+                        blk.body.clear();
+                        blk.phis.clear();
+                    }
+                }
+                self.drop_unused_functions();
+                self.drop_unused_tables();
+            }
         }
         if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
             // Values merged in one round can make two joins the same in
@@ -1264,6 +1277,26 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_branch_on_a_literal_goes_one_way_with_no_pass_asked_for() {
+        // VICTORY_SHADER_OPT=0: only the literal branch goes, and a function
+        // only the side never taken called leaves the module with it.
+        let Kit { mut m, b, reads, writes, .. } = kit();
+        let one = m.i32(1);
+        let x = m.call(b, reads, vec![one, one]);
+        let yes = m.bool(true);
+        let (taken, never) = (m.new_block(), m.new_block());
+        m.terminate(b, Term::CondBr(yes, taken, never));
+        m.terminate(taken, Term::Ret);
+        m.call(never, writes, vec![x, x]);
+        m.terminate(never, Term::Ret);
+        m.optimise(BRANCHES);
+        assert!(matches!(m.blocks[b].term, Some(Term::Br(t)) if t == taken));
+        assert!(!m.funcs.iter().any(|f| f.name.contains("Store")), "unused declaration left");
+        assert_eq!(body(&m, b), 1, "nothing else dropped");
+        m.write();
     }
 
     #[test]
