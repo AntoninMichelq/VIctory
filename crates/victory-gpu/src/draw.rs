@@ -2861,6 +2861,11 @@ pub(crate) static HEAP_TEXTURES_PRELOAD: AtomicU64 = AtomicU64::new(0);
 /// Whether the frame before `frame` drew under `VICTORY_PRELOAD_DRAWS`
 /// (400) draws: a loading screen or a frame with little on it, whose time
 /// goes to loading what comes next (`VICTORY_PRELOAD_DRAWS=0`: never).
+/// Whether the title is loading now (its last frame drew little).
+pub(crate) fn loading_now() -> bool {
+    loading_frame(crate::frame::current())
+}
+
 fn loading_frame(frame: u64) -> bool {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);

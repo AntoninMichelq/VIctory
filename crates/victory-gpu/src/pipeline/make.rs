@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Started early only because of `VICTORY_PIPELINES_ALL_EARLY` (no
+    /// earlier run drew with it): made only while the title loads.
+    speculative: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,6 +59,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            speculative: AtomicBool::new(false),
         }
     }
 
@@ -146,7 +150,15 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 pub(crate) fn early(p: &Arc<Pending>) {
     static ALL: OnceLock<bool> = OnceLock::new();
     let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PIPELINES_ALL_EARLY").is_some_and(|v| v == "1"));
-    if !p.shaders.is_empty() && (all || super::library::wanted_early(&p.key)) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    let wanted = super::library::wanted_early(&p.key);
+    // Every pipeline early only while the title loads: in the world (cold
+    // run 44add24) 84k early starts kept the workers busy for 12 min,
+    // ~1.9 fps and ~886 draws dropped per frame.
+    if wanted || (all && crate::draw::loading_now()) {
+        p.speculative.store(!wanted, Ordering::Relaxed);
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -256,8 +268,21 @@ impl Queue {
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            let loading = self.early.is_empty() || crate::draw::loading_now();
+            std::iter::from_fn(|| self.early.pop_front()).find(|p| {
+                if p.queue_state.load(Ordering::Relaxed) != EARLY {
+                    return false;
+                }
+                // Out of loading, ones started only because all are
+                // started go back out of the queue: a draw asks again.
+                if !loading && p.speculative.load(Ordering::Relaxed) {
+                    p.queue_state.store(NOT_QUEUED, Ordering::Relaxed);
+                    WAITING.fetch_sub(1, Ordering::Relaxed);
+                    SET_ASIDE.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            })
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
@@ -265,6 +290,8 @@ impl Queue {
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
+/// Early-only pipelines taken out of the queue once the title stopped loading.
+static SET_ASIDE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
@@ -439,6 +466,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            set_aside = SET_ASIDE.load(Ordering::Relaxed),
             waited_for_memory = THROTTLED.load(Ordering::Relaxed),
             tried_again = super::library::RETRIED.load(Ordering::Relaxed),
             "host pipelines all made"
