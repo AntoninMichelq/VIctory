@@ -2039,6 +2039,10 @@ fn host_texture(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // What the card renders to or writes stays on it first.
+        if d.flags & (TARGET | DEPTH | UNORDERED) != 0 {
+            crate::host::residency_high(t);
+        }
     }
     texture
 }
