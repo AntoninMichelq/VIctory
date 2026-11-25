@@ -1075,6 +1075,11 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            // The high half cut to the 40 bits of an address (the runtime
+            // table's pointer).
+            || high.is_some() && matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                |(_, [a, b])| a == want && b == Term::Const(0xFF) || b == want && a == Term::Const(0xFF)
+            ))
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
