@@ -1155,6 +1155,9 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// A loading screen showed it ([`loading_full_frame`]): its host copy
+    /// keeps every level whatever [`mip_skip`] says, for as long as it lives.
+    full: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1303,7 +1306,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let full = r.host.full.load(Relaxed);
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, full) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1732,13 +1736,175 @@ pub(crate) fn mip_skip(desc: &ResourceDesc) -> u32 {
 #[cfg(windows)]
 pub(crate) static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// [`mip_skip`] of title texture `this`.
+/// [`mip_skip`] of title texture `this` (0 once a loading screen showed it:
+/// [`loading_full_frame`]).
 #[cfg(windows)]
 pub(crate) fn skipped_mips(this: This) -> u32 {
     if this.is_null() {
         return 0;
     }
-    mip_skip(&resource(this).desc)
+    let r = resource(this);
+    if r.host.full.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    mip_skip(&r.desc)
+}
+
+/// Levels left off the top of a host texture `host_width` wide made for a
+/// title texture described by `desc`: by the host texture itself, so that
+/// a view or an upload made of a copy made before the texture went full
+/// size ([`loading_full_frame`]) still matches that copy.
+#[cfg(windows)]
+pub(crate) fn skip_for(desc: &ResourceDesc, host_width: u64) -> u32 {
+    if host_width >= desc.width {
+        0
+    } else {
+        mip_skip(desc)
+    }
+}
+
+/// `VICTORY_LOADING_FULL`: how many host copies cut by [`mip_skip`] may be
+/// made again at full size because a loading screen drew them (default
+/// 128; `0`: none, as before).
+#[cfg(windows)]
+fn loading_full_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LOADING_FULL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(128)
+    })
+}
+
+/// Distinct cut textures a frame's draws may read and still count as a
+/// loading screen's ("Americas": four 2048x2048 pieces and a 1024x2048 one).
+#[cfg(windows)]
+const LOADING_FULL_PER_FRAME: usize = 24;
+
+/// Host copies made again at full size ([`loading_full_frame`]).
+#[cfg(windows)]
+pub(crate) static LOADING_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The cut textures the draws of a frame read: the frame and their
+/// addresses.
+#[cfg(windows)]
+static LOADING_NOTED: std::sync::Mutex<(u64, Vec<usize>)> = std::sync::Mutex::new((u64::MAX, Vec::new()));
+
+/// One past the last frame whose draws read more cut textures than a
+/// loading screen does ([`LOADING_FULL_PER_FRAME`]).
+#[cfg(windows)]
+static LOADING_OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A draw (not the pass over textures picked by index) reads title texture
+/// `this`: noted if its host copy is cut ([`mip_skip`]), for
+/// [`loading_full_frame`] to make it again at full size if the frame turns
+/// out to be a loading screen's.
+#[cfg(windows)]
+pub(crate) fn note_drawn(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || LOADING_FULL.load(Relaxed) >= loading_full_most() {
+        return;
+    }
+    let r = resource(this);
+    if r.host.full.load(Relaxed) || mip_skip(&r.desc) == 0 {
+        return;
+    }
+    let frame = crate::frame::current();
+    if LOADING_OVER.load(Relaxed) == frame + 1 {
+        return;
+    }
+    let mut noted = LOADING_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+    if noted.0 != frame {
+        *noted = (frame, Vec::new());
+    }
+    if noted.1.contains(&(this as usize)) {
+        return;
+    }
+    if noted.1.len() >= LOADING_FULL_PER_FRAME {
+        // The world's frame: none of its textures goes full size.
+        LOADING_OVER.store(frame + 1, Relaxed);
+        noted.1.clear();
+        return;
+    }
+    noted.1.push(this as usize);
+}
+
+/// Frame `ended` is over; `loading`: it drew little (a loading screen,
+/// `crate::draw::loading_now`). The cut textures its draws read
+/// ([`note_drawn`]) are then the loading screen's pictures, drawn blurred
+/// by the cut: each goes full size for as long as it lives. Its cut host
+/// copy is let go (as [`let_go_idle`] does: the next use makes it again,
+/// now with every level, and uploads it) and the host slots that showed it
+/// are made again ([`crate::descriptor::unmake_views_of`]).
+/// The world's textures, made by the thousand while the loading screen
+/// shows, are not drawn by its frames: they keep the cut.
+/// `VICTORY_LOADING_FULL=0`: nothing goes full size.
+#[cfg(windows)]
+pub(crate) fn loading_full_frame(ended: u64, loading: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let most = loading_full_most();
+    if LOADING_FULL.load(Relaxed) >= most {
+        return;
+    }
+    let picked = {
+        let mut noted = LOADING_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if noted.0 != ended {
+            return;
+        }
+        std::mem::take(&mut noted.1)
+    };
+    if !loading || picked.is_empty() || LOADING_OVER.load(Relaxed) == ended + 1 {
+        return;
+    }
+    let mut old = Vec::new();
+    let mut first = None;
+    {
+        let all = textures();
+        for at in picked {
+            if LOADING_FULL.load(Relaxed) >= most {
+                break;
+            }
+            // Released since: not in the table any more.
+            if !all.contains(&at) {
+                continue;
+            }
+            // SAFETY: a texture leaves the table before it is freed, under
+            // the lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            // Contents the host copied into it exist on the host alone.
+            if !fills(&r.desc) || crate::texture::host_wrote(at) || r.host.full.load(Relaxed) {
+                continue;
+            }
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            r.host.full.store(true, Relaxed);
+            // Under the lock, as in `let_go_idle`.
+            crate::texture::unstage(at as This);
+            if let Some((host, _)) = made.take() {
+                old.push(host);
+            }
+            drop(made);
+            LOADING_FULL.fetch_add(1, Relaxed);
+            first.get_or_insert((r.desc.width, r.desc.height, r.desc.format));
+        }
+    }
+    let Some((width, height, format)) = first else {
+        return;
+    };
+    let raws: Vec<*mut c_void> = old.iter().map(|h| windows::core::Interface::as_raw(&h.texture)).collect();
+    let slots = crate::descriptor::unmake_views_of(&raws);
+    for host in old {
+        crate::host::retire(host);
+    }
+    tracing::info!(
+        total = LOADING_FULL.load(Relaxed),
+        frame = ended,
+        slots,
+        width,
+        height,
+        format,
+        "loading screen pictures made again at full size (VICTORY_LOADING_FULL)"
+    );
 }
 
 /// The host subresource of title texture `this`'s subresource `sub`
@@ -1781,6 +1947,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    full: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1792,7 +1959,8 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
-    let skip = mip_skip(desc);
+    // A loading screen's picture keeps every level ([`loading_full_frame`]).
+    let skip = if full { 0 } else { mip_skip(desc) };
     if skip > 0 {
         d.width >>= skip;
         d.height >>= skip;
@@ -1957,6 +2125,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            full: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

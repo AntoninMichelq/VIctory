@@ -1433,7 +1433,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        skip: crate::resource::mip_skip(&desc),
+        // By the host copy itself: one made at full size for a loading
+        // screen keeps every level (`crate::resource::loading_full_frame`).
+        skip: crate::resource::skip_for(&desc, d.Width),
         bytes: total,
         memory,
         last: Mutex::default(),
