@@ -1441,14 +1441,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// `VICTORY_VRAM_HYSTERESIS=<high>,<low>` (percents of the card's budget,
 /// e.g. `85,75`): the card counts as full for new textures from `high`
 /// until it is back under `low`. Unset: full at 90 %, room again under it.
+/// Live (`crate::live`): each look at the room reads it.
 fn hysteresis() -> Option<(u64, u64)> {
-    static PAIR: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
-    *PAIR.get_or_init(|| {
-        let v = std::env::var("VICTORY_VRAM_HYSTERESIS").ok()?;
-        let (high, low) = v.split_once(',')?;
-        let (high, low) = (high.trim().parse::<u64>().ok()?, low.trim().parse::<u64>().ok()?);
-        (low < high && high <= 100).then_some((high, low))
-    })
+    static PAIR: crate::live::Switch = crate::live::Switch::new();
+    let pair = PAIR.get("VICTORY_VRAM_HYSTERESIS", |v, _| {
+        let pair = (|| {
+            let (high, low) = v?.split_once(',')?;
+            let (high, low) = (high.trim().parse::<u64>().ok()?, low.trim().parse::<u64>().ok()?);
+            (low < high && high <= 100).then_some(high << 32 | low)
+        })();
+        pair.unwrap_or(u64::MAX)
+    });
+    (pair != u64::MAX).then_some((pair >> 32, pair & 0xffff_ffff))
 }
 
 #[cfg(windows)]
@@ -1996,31 +2000,26 @@ pub(crate) fn skip_for(desc: &ResourceDesc, host_width: u64) -> u32 {
 
 /// `VICTORY_LOADING_FULL`: how many host copies cut by [`mip_skip`] may be
 /// at full size at once because a loading screen drew them (default 32;
-/// `0`: none, as before).
+/// `0`: none, as before). Live (`crate::live`): textures already full
+/// size stay so.
 #[cfg(windows)]
 fn loading_full_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LOADING_FULL")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(32)
+    static MOST: crate::live::Switch = crate::live::Switch::new();
+    MOST.get("VICTORY_LOADING_FULL", |v, _| {
+        v.and_then(|v| v.trim().parse().ok()).unwrap_or(32)
     })
 }
 
 /// `VICTORY_LOADING_FULL_FRAMES`: how many loading frames in a row (few
 /// draws, few cut textures) before their pictures go full size (default 8).
 /// A menu, a pause or a fade shows for a frame or two in a row as often as
-/// a loading screen; the loading screen stays for seconds.
+/// a loading screen; the loading screen stays for seconds. Live
+/// (`crate::live`).
 #[cfg(windows)]
 fn loading_full_frames() -> u64 {
-    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *FRAMES.get_or_init(|| {
-        std::env::var("VICTORY_LOADING_FULL_FRAMES")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(8)
-            .max(1)
+    static FRAMES: crate::live::Switch = crate::live::Switch::new();
+    FRAMES.get("VICTORY_LOADING_FULL_FRAMES", |v, _| {
+        v.and_then(|v| v.trim().parse().ok()).unwrap_or(8).max(1)
     })
 }
 

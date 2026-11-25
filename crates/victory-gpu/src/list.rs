@@ -892,13 +892,16 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
 /// After upstream Marvisak/VIctory ea812894 (GPL-3), written anew for our
 /// uploads. Off (the default): one barrier after each texture, as before.
 #[cfg(windows)]
+/// Live (`crate::live`): each [`HoldReads`] reads it when it starts.
 pub(crate) fn upload_barriers_held() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_UPLOAD_BARRIERS").is_ok_and(|v| v.trim() == "1");
-        tracing::info!(on, "uploaded textures made readable in one batch (VICTORY_UPLOAD_BARRIERS)");
-        on
-    })
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_UPLOAD_BARRIERS", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if first {
+            tracing::info!(on, "uploaded textures made readable in one batch (VICTORY_UPLOAD_BARRIERS)");
+        }
+        u64::from(on)
+    }) == 1
 }
 
 #[cfg(windows)]
