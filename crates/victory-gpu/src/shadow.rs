@@ -1602,7 +1602,6 @@ pub(crate) fn let_go_idle() {
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
         let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());

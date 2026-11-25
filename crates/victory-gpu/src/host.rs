@@ -232,6 +232,56 @@ fn memory_line(card: Option<[u64; 4]>) {
         mb(quieted_bytes),
         crate::texture::REMADE.load(Ordering::Relaxed),
         SHORT_TIMES.load(Ordering::Relaxed),
+    );    // What holds it, ours: host copies of title memory (with windows
+    // outside buffers) and snapshot memory kept; host copies of textures
+    // the title fills; host lists and their upload memory; buffers made so
+    // far; objects waiting for submissions to finish; shaders and
+    // translations kept; the pipeline library's file.
+    let copies = crate::shadow::memory();
+    let kinds = [0, 1].map(|i| crate::resource::KINDS[i].load(Ordering::Relaxed));
+    let alive: Vec<u64> = ALIVE.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    let made: Vec<u64> = MADE.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    let retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let kept = crate::pipeline::kept();
+    let (lists, landed) = {
+        let line = line();
+        (line.lists, line.landed.len())
+    };
+    tracing::info!(
+        "memory, ours: host copies of title memory {} alive {} MB (windows outside buffers {} {} MB), snapshot memory kept {} \
+         {} MB; host textures the title fills {} alive {} MB; host lists {} alive, scratch {} chunks {} MB ({} spare {} MB), \
+         other upload buffers {} {} MB; made so far: upload {} {} MB, shared {} {} MB, card {} {} MB; {} objects waiting for \
+         submissions to finish; {} shaders {} MB, {} translations {} MB; library file {} MB; lists in the air {}, landed \
+         lists not yet reset {}",
+        copies[0],
+        mb(copies[1]),
+        copies[2],
+        mb(copies[3]),
+        copies[4],
+        mb(copies[5]),
+        kinds[0],
+        mb(kinds[1]),
+        alive[0],
+        alive[1],
+        mb(alive[2]),
+        alive[3],
+        mb(alive[4]),
+        alive[6],
+        mb(alive[7]),
+        made[0],
+        mb(made[1]),
+        made[2],
+        mb(made[3]),
+        made[4],
+        mb(made[5]),
+        retired,
+        kept[0],
+        mb(kept[1]),
+        kept[2],
+        mb(kept[3]),
+        mb(kept[4]),
+        lists,
+        landed,
     );
 }
 
