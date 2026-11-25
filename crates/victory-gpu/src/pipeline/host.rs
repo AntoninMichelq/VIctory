@@ -360,10 +360,10 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
@@ -371,16 +371,33 @@ impl HostPipeline {
             return refuse("its shader is on VICTORY_NO_COMPILE (the driver's compile of it fills the PC's memory)", shaders);
         }
         let mesh = find("mesh");
+        // With a geometry stage: the merged ES+GS stage's two halves, in
+        // place of the title's vertex shader (vertex, pixel, then geometry).
+        let merged = match (find("geometry"), find("vertex")) {
+            (Some(gs), Some(vs)) if mesh.is_none() => match super::merged_halves(vs, gs) {
+                Some(halves) => Some(halves),
+                None => return None,
+            },
+            (Some(_), _) => return refuse("a geometry stage without a vertex stage", shaders),
+            _ => None,
+        };
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
-            let first = match (mesh, find("vertex")) {
-                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
-                (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+            let first = match (mesh, &merged, find("vertex")) {
+                (Some(ms), _, _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
+                (None, Some((vs, _)), _) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                (None, None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                (None, None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            if let Some((_, gs)) = &merged {
+                if stages.len() < 2 {
+                    return refuse("a geometry stage without a pixel stage", shaders);
+                }
+                stages.push((gs, D3D12_SHADER_VISIBILITY_GEOMETRY));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -613,7 +630,7 @@ impl HostPipeline {
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
+        if g.topology.0 == RECTANGLES && merged.is_none() {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
@@ -626,12 +643,14 @@ impl HostPipeline {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
+            GS: match &rect_gs {
+                Some(gs) => D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
-                }
-            }),
+                },
+                // The merged stage's geometry half (third), if any.
+                None => code(2),
+            },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -656,6 +675,12 @@ impl HostPipeline {
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
+            None if merged.is_some() => super::library::name(
+                "graphics geometry",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &code_bytes(&code(2))],
+                &state,
+            ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,

@@ -74,7 +74,25 @@ pub enum Input {
     /// runtime's table, in the first two user-data SGPRs
     /// ([`crate::merged::RUNTIME_TABLE`]).
     RuntimeTable(u8),
+    /// Merged ES+GS stage, translated as a host vertex and geometry shader:
+    /// v0 (`0`) or v1 (`1`) of the GS half, the packed LDS offsets of the
+    /// primitive's vertices. They are given as vertex `n` at `n * GS_VERTEX_BYTES`,
+    /// so that an LDS address names its vertex ([`GS_VERTEX_BYTES`]).
+    GsVertexOffsets(u8),
+    /// Merged ES+GS stage: s3, the wave info whose lane counts set EXEC on
+    /// entry (and the LDS bases): every lane is a whole vertex or primitive
+    /// on the host.
+    MergedLanes,
+    /// Merged ES+GS stage: s2, the GS half's offset in the ring of output
+    /// records (its records go to the host's outputs, by offset alone).
+    RingOffset,
 }
+
+/// Merged ES+GS stage: the bytes between the records of two input vertices
+/// of a primitive as [`Input::GsVertexOffsets`] gives them (4 x 4096 dwords,
+/// more than a record of the ES half ever has; the console masks an offset
+/// with 0x3fffc, which keeps three such vertices).
+pub const GS_VERTEX_BYTES: u32 = 0x4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -214,12 +232,24 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            let mut loaded = vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ];
+        (StageIo::Vs { inputs, outputs }, HwStage::Vs | HwStage::Es) => {
+            // The ES half of a merged stage gets the vertex id in v5 and the
+            // instance id in v8 (after the GS half's v0-v4), and hands its
+            // record over through LDS: it exports nothing.
+            let es = native.stage == HwStage::Es;
+            let mut loaded = if es {
+                vec![
+                    (Reg::V(5), Input::VertexId),
+                    (Reg::V(8), Input::InstanceId),
+                    (Reg::S(3), Input::MergedLanes),
+                ]
+            } else {
+                vec![
+                    (Reg::V(0), Input::VertexId),
+                    (Reg::V(2), Input::PrimitiveId),
+                    (Reg::V(3), Input::InstanceId),
+                ]
+            };
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
                     let input = Input::Attribute {
@@ -229,7 +259,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     loaded.push((Reg::V(i.vgpr + channel), input));
                 }
             }
-            (loaded, &[][..], &outputs[..])
+            (loaded, &[][..], if es { &[][..] } else { &outputs[..] })
         }
         // Compute: thread ids in v0-v2, group ids and the group info in the
         // SGPRs after the user data.
@@ -315,10 +345,17 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 let at = u32::from(native.stage.user_sgpr(p.user_data));
                 at < u32::from(first) + 2 && u32::from(first) < at + p.sgprs
             });
-            let loaded = (0..2u8)
+            let mut loaded: Vec<(Reg, Input)> = (0..2u8)
                 .filter(|_| !taken)
                 .map(|k| (Reg::S(first + k), Input::RuntimeTable(k)))
                 .collect();
+            loaded.extend([
+                (Reg::V(0), Input::GsVertexOffsets(0)),
+                (Reg::V(1), Input::GsVertexOffsets(1)),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::S(2), Input::RingOffset),
+                (Reg::S(3), Input::MergedLanes),
+            ]);
             (loaded, &[][..], &[][..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),

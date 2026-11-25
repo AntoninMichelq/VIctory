@@ -295,6 +295,7 @@ pub fn run(
         t.gs_stopped,
         emit::GS_EMIT
     );
+    merged_pairs(validate.then_some(dll.as_deref()));
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -365,6 +366,7 @@ fn translate(
     // `~`: the hash of the code alone; containers that differ only around
     // it are translated once, the others listed as duplicates of it.
     let code = blake3::hash(dxil);
+    note_merged_half(source, &bytes, dxil, code);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
@@ -818,6 +820,82 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
                 t.lane_branches += 1;
             }
         }
+    }
+}
+
+/// A container with a half of a merged ES+GS stage: its name without the
+/// stage prefix (`VS_`, `GS_`: the halves of one shader share the rest),
+/// whether it is the GS half, its bytes and the hash of its code.
+type Half = (String, bool, Vec<u8>, blake3::Hash);
+
+static HALVES: Mutex<Vec<Half>> = Mutex::new(Vec::new());
+
+/// Keeps a container holding an ES or GS program for [`merged_pairs`].
+fn note_merged_half(source: &Source, bytes: &[u8], dxil: &[u8], code: blake3::Hash) {
+    let Ok(programs) = native_programs(dxil) else { return };
+    let gs = programs.iter().any(|p| p.stage == HwStage::Gs);
+    if !gs && !programs.iter().any(|p| p.stage == HwStage::Es) {
+        return;
+    }
+    let label = source.label();
+    let name = label.rsplit(['/', '\\', ' ']).next().unwrap_or("");
+    let key = name.split_once('_').map_or(name, |(_, rest)| rest).to_owned();
+    lock(&HALVES).push((key, gs, bytes.to_vec(), code));
+}
+
+/// Merged ES+GS stages (the GS programs' pipelines): each geometry
+/// container with the vertex containers of the same name, the first pair
+/// that translates ([`emit::translate_es_gs`]) and, with `validator`, both
+/// host shaders validated.
+fn merged_pairs(validator: Option<Option<&Path>>) {
+    let halves = std::mem::take(&mut *lock(&HALVES));
+    let mut v = validator.and_then(|dll| Validator::load(dll).ok());
+    let (mut programs, mut translated, mut validated) = (0, 0, 0);
+    let mut failed: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for (key, _, gs, code) in halves.iter().filter(|h| h.1) {
+        if !seen.insert(*code) {
+            continue;
+        }
+        programs += 1;
+        let mut last = "no vertex container of the same name".to_owned();
+        let mut done = false;
+        let mut tried = HashSet::new();
+        for (_, _, vs, vcode) in halves.iter().filter(|h| !h.1 && &h.0 == key) {
+            if !tried.insert(*vcode) {
+                continue;
+            }
+            match emit::translate_es_gs(vs, gs) {
+                Ok((mut hv, mut hg)) => {
+                    translated += 1;
+                    done = true;
+                    if let Some(v) = v.as_mut() {
+                        match (v.validate(&mut hv.dxil), v.validate(&mut hg.dxil)) {
+                            (Ok(()), Ok(())) => validated += 1,
+                            (Err(e), _) => last = format!("validator (vertex half): {}", e.lines().find(|l| l.contains("error")).unwrap_or("")),
+                            (_, Err(e)) => last = format!("validator (geometry half): {}", e.lines().find(|l| l.contains("error")).unwrap_or("")),
+                        }
+                        if !last.starts_with("validator") {
+                            break;
+                        }
+                        let entry = failed.entry(last.clone()).or_insert((0, key.clone()));
+                        entry.0 += 1;
+                    }
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        if !done {
+            let entry = failed.entry(last).or_insert((0, key.clone()));
+            entry.0 += 1;
+        }
+    }
+    println!(
+        "geometry     {translated} of {programs} geometry programs translated with their ES half as a vertex and a geometry shader; {validated} pairs validated"
+    );
+    for (reason, (n, example)) in failed {
+        println!("  {n:>7}  geometry pair: {reason}  (e.g. {example})");
     }
 }
 
