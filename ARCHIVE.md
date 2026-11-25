@@ -301,3 +301,11 @@ Restore one: `git fetch fork archive/branches && git branch <name> <sha> && git 
 | victory-stack-d7 | 894faec582384a211e22d7ed8096b88b05dbb4d3 |
 | victory-stack-d8 | b55312e7889385d82d6296dfb36cebecda8497a5 |
 | victory-stack-d9 | f8b6260e28bb9cf2dd6d087e2482c97dc3b1cc92 |
+
+## Added 2026-11-25 21:04 (from the PC)
+
+| branch | commit |
+|---|---|
+| local/build-B | e00f127f51777171f3d297427c27cd51c46cc9b2 |
+| local/build-C | 60d35c8c266e05452463c065386563c6620e669d |
+| local/pr25 | f1485bc1e320cb415915538660b47fd891c36ab0 |
