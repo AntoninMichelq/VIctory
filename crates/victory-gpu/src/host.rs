@@ -150,6 +150,94 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Whether the PC is short of memory: less than `VICTORY_MEMORY_LOW_MB`
+/// (2048) of physical memory free, or of commit left. Looked at most every
+/// half second. Then what is kept for speed only (staging buffers of
+/// textures that hold still, idle windows of title memory) goes sooner,
+/// and no more host copies of textures picked by index are made: a run
+/// that filled the PC's 33 GB drew garbage and then crashed (2026-11-25).
+pub(crate) fn memory_short() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LOW: OnceLock<u64> = OnceLock::new();
+    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let now = now_ms();
+    let last = CHECKED.load(Ordering::Relaxed);
+    if last != u64::MAX && now < last + 500 {
+        return SHORT.load(Ordering::Relaxed);
+    }
+    CHECKED.store(now, Ordering::Relaxed);
+    let low = *LOW.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_LOW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2048)
+            << 20
+    });
+    // SAFETY: a zeroed structure with its size set.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    let short = (unsafe { GlobalMemoryStatusEx(&mut m) }) != 0 && (m.ullAvailPhys < low || m.ullAvailPageFile < low);
+    if short && !SHORT.load(Ordering::Relaxed) {
+        SHORT_TIMES.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            free_mb = m.ullAvailPhys >> 20,
+            commit_left_mb = m.ullAvailPageFile >> 20,
+            "the PC is short of memory: staging buffers and idle copies go at once, no new textures picked by index"
+        );
+    }
+    SHORT.store(short, Ordering::Relaxed);
+    short
+}
+
+/// Every five seconds, in every build: what the process and the PC have,
+/// and what of it is ours to let go (staging buffers of textures), so a
+/// run's log says what grows.
+fn memory_line(card: Option<[u64; 4]>) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mb = |b: u64| b >> 20;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) };
+    // SAFETY: a zeroed structure with its size set.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    let [staged, staged_bytes] = crate::texture::staged_now();
+    let [quieted, quieted_bytes] = [0, 1].map(|i| crate::texture::QUIETED[i].load(Ordering::Relaxed));
+    let [local_budget, local, shared_budget, shared] = card.unwrap_or_default();
+    tracing::info!(
+        "memory: the process {} MB private, {} MB in memory; the PC {} MB free of {} MB, {} MB left to commit; \
+         the card {} of {} MB, the PC's memory shared with it {} of {} MB; staging buffers of textures {} alive {} MB \
+         ({} let go since the start as their texture held still, {} MB; {} made again); the PC was short of memory {} times",
+        mb(c.PrivateUsage as u64),
+        mb(c.WorkingSetSize as u64),
+        mb(m.ullAvailPhys),
+        mb(m.ullTotalPhys),
+        mb(m.ullAvailPageFile),
+        mb(local),
+        mb(local_budget),
+        mb(shared),
+        mb(shared_budget),
+        staged,
+        mb(staged_bytes),
+        quieted,
+        mb(quieted_bytes),
+        crate::texture::REMADE.load(Ordering::Relaxed),
+        SHORT_TIMES.load(Ordering::Relaxed),
+    );
+}
+
+/// How often the PC became short of memory ([`memory_short`]).
+pub(crate) static SHORT_TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -2164,6 +2252,69 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Two host copies of the same title memory (a title buffer inside
+/// another, aliased buffers, a window beside a buffer): shaders write one,
+/// and a submission refreshes the other from title memory.
+///
+/// - Behind flights: the writer's bytes reach title memory only when the
+///   flight is settled and copied back, so the refresh would take the bytes
+///   from before them and the reader runs a frame (or more) behind. With
+///   `VICTORY_ALIAS_SETTLE` on (the default; `=0` turns it off) the flights
+///   are settled first, as for [`stale_under_flights`].
+/// - Within this submission: the writer's shaders run after the refresh,
+///   whatever the order of the commands; that is only counted and logged.
+///
+/// Suspected for the pedestrians' hair drawn as long streaks and their
+/// bodies as spikes in some frames: vertices a frame apart.
+fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
+    use std::sync::Arc;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SETTLE").is_none_or(|v| v != "0"));
+    let flights: Vec<(usize, usize)> = if behind { line().written.clone() } else { Vec::new() };
+    // This submission's writes so far, by copy: (copy, from, to).
+    let mut own: Vec<(usize, usize, usize, (u64, u64))> = Vec::new();
+    let mut settle = false;
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::GpuWrite(shadow, address, len) => {
+                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
+                }
+                Step::Refresh(shadow, address, len) => {
+                    let (from, to) = (*address, *address + *len);
+                    let me = Arc::as_ptr(shadow) as usize;
+                    if let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
+                        alias_note(false, shadow.span(), (from, to), Some(w.3));
+                    }
+                    if !shadow.writes_pending() && touches(&flights, from, to) {
+                        alias_note(true, shadow.span(), (from, to), None);
+                        settle = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    settle && on
+}
+
+/// Counts and logs (the first ones, then every 1,000th) a refresh of a copy
+/// whose title memory another copy's shaders write ([`aliased_under_flights`]).
+fn alias_note(flight: bool, reader: (u64, u64), range: (usize, usize), writer: Option<(u64, u64)>) {
+    static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let n = SEEN[usize::from(flight)].fetch_add(1, Ordering::Relaxed);
+    if n < 12 || n.is_multiple_of(1000) {
+        tracing::warn!(
+            kind = if flight { "a flight's shaders write it" } else { "this submission's shaders write it, after" },
+            seen = n + 1,
+            reader = format_args!("{:#x}+{:#x}", reader.0, reader.1),
+            range = format_args!("{:#x}+{:#x}", range.0, range.1 - range.0),
+            writer = format_args!("{}", writer.map_or("-".to_owned(), |w| format!("{:#x}+{:#x}", w.0, w.1))),
+            "a host copy refreshed from title memory that another copy of it is written in"
+        );
+    }
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -4042,16 +4193,20 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
+            } else if !behind {
+                aliased_under_flights(runs, false);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        } else if !behind {
+            aliased_under_flights(runs, false);
         }
         for list in runs {
             list.run_deferred(&mut batch);
@@ -5900,6 +6055,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            memory_line(host().and_then(|h| h.video_memory()));
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

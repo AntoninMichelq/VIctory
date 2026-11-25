@@ -387,6 +387,22 @@ fn room_to_make() -> Making {
     }
 }
 
+/// On a pipeline worker, after the driver refused a compile for lack of
+/// memory: waits, up to `most`, until this worker is the only one
+/// compiling and the PC has memory again (`crate::host::memory_short`).
+/// Whether this is a worker (elsewhere nothing waits: the submitting
+/// thread must not stop for seconds).
+pub(crate) fn wait_to_retry(most: Duration) -> bool {
+    if !std::thread::current().name().is_some_and(|n| n.starts_with("victory-pipelines-")) {
+        return false;
+    }
+    let began = std::time::Instant::now();
+    while began.elapsed() < most && (MAKING_NOW.load(Ordering::Relaxed) > 1 || crate::host::memory_short()) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
 /// Compiles that waited for memory (logged when the workers run out).
 static THROTTLED: AtomicU64 = AtomicU64::new(0);
 
@@ -403,6 +419,7 @@ fn drained() {
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             waited_for_memory = THROTTLED.load(Ordering::Relaxed),
+            tried_again = super::library::RETRIED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
