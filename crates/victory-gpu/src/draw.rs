@@ -2199,6 +2199,8 @@ impl State {
                 crate::indirect::done(list, &bounded);
                 return Some(false);
             }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect flat check (title draw, our vertices), stride {stride}"), false));
             // SAFETY: an open list with the pipeline bound; our buffers live
             // for the run, the scratch buffer until the list is reset.
             unsafe {

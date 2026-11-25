@@ -496,12 +496,31 @@ pub(crate) fn flat_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         });
         let shaders: Vec<Arc<Shader>> =
             p.shaders.iter().map(|s| if s.stage == "vertex" { flat.clone() } else { s.clone() }).collect();
-        let made = host::HostPipeline::new(&shaders, p.host.graphics.as_deref())?;
+        let made = victory_shader::emit::with_flat_rects(|| host::HostPipeline::new(&shaders, p.host.graphics.as_deref()))?;
         if made.root != base.root {
             tracing::warn!(?shaders, "flat-instance pipeline has another root signature; not used");
             return None;
         }
-        tracing::info!(?shaders, "flat-instance pipeline made");
+        // What the check of a wrong image needs: that the vertex program
+        // differs from the title's, and whether the pixel shader numbers
+        // its primitives (then 0 for each rectangle, `with_flat_rects`).
+        let ps_primitive = p.shaders.iter().find(|s| s.stage == "pixel").and_then(|s| s.translated()).is_some_and(|t| {
+            victory_shader::Container::parse(&t.host.dxil)
+                .ok()
+                .and_then(|c| c.part(victory_shader::FourCC::ISG1).map(|part| part.data.windows(14).any(|w| w == b"SV_PrimitiveID")))
+                .unwrap_or(false)
+        });
+        let flat_dxil = flat.translated().map_or(0, |t| t.host.dxil.len());
+        let same = flat.translated().is_some_and(|t| t.host.dxil == base_vs.host.dxil);
+        tracing::info!(
+            ?shaders,
+            base_vs_bytes = base_vs.host.dxil.len(),
+            flat_vs_bytes = flat_dxil,
+            same_vs = same,
+            ps_primitive,
+            rects = made.rects,
+            "flat-instance pipeline made"
+        );
         let made: &'static host::HostPipeline = Box::leak(Box::new(made));
         Some(made)
     })();
