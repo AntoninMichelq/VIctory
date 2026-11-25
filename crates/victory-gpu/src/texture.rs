@@ -395,7 +395,19 @@ fn no_wait() -> bool {
 /// By default it follows the PC: all logical processors but four, at most
 /// 12 (16 threads: 12; it was 6). `VICTORY_TEXTURE_DETILE_WORKERS=n` sets it
 /// (1 is serial).
+/// While host pipelines are being made, at most the old default (16
+/// threads: 6): with 12 detiling, the pipelines drained at ~30 a minute
+/// against ~250 (tout4 run, 2026-11-25).
 fn detile_workers() -> usize {
+    let workers = detile_workers_free();
+    if crate::pipeline::making() > 0 {
+        let logical = std::thread::available_parallelism().map_or(1, usize::from);
+        return workers.min((logical / 2).saturating_sub(2).max(1));
+    }
+    workers
+}
+
+fn detile_workers_free() -> usize {
     static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WORKERS.get_or_init(|| {
         let logical = std::thread::available_parallelism().map_or(1, usize::from);
