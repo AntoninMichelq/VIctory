@@ -469,16 +469,16 @@ impl GraphicsState {
 }
 
 /// Whether precompiled pipelines get the depth bias their registers hold
-/// (`VICTORY_PRECOMPILED_DEPTH_BIAS=1`; off by default). Read as D3D12's
-/// (slope = scale / 16, as RADV writes it), it is (0.003 clamp, 1.8125
-/// slope) on every cascade shadow pass, and run 52 lost the shadows of
-/// hair and of a room's walls with it (the hair strands and the room lit
-/// by the sun, where runs 43 and 51, with the title's own pipelines and
-/// with no bias, have them in shadow): the units are not those. The
-/// title's own pipelines log their bias ([`GraphicsState::bias_and_conservative`]).
+/// (on; `VICTORY_PRECOMPILED_DEPTH_BIAS=0` leaves it out, for A/B runs).
+/// Read as D3D12's (slope = scale / 16, as RADV writes it), it is what
+/// the title gives its own pipelines of the same shaders: run 61 logged
+/// them ([`GraphicsState::bias_and_conservative`]), and every pair also
+/// dumped in run 50 agrees exactly (e.g. the hair strands' cascade shadow,
+/// (0.003, 29, 0) = slope 1.8125, clamp 0.003, bias 0; contact markers,
+/// (0, 16, 1) = slope 1, bias 1).
 fn precompiled_depth_bias() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED_DEPTH_BIAS").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED_DEPTH_BIAS").is_none_or(|v| v != "0"))
 }
 
 /// Whether a target's blending reads the pixel shader's second output

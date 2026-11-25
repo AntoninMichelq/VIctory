@@ -1742,6 +1742,48 @@ mod gfx_diag {
 ")).unwrap();
     }
 
+    /// For each pixel shader of the dumped graphics descriptions
+    /// (`VICTORY_PRECOMPILED_GFX_DIR`), the targets its translation writes
+    /// against the registers' write mask (dword 51) and dword 30: lines
+    /// where a target the registers write has no output in the
+    /// translation, which the no-colour rule silences.
+    #[test]
+    #[ignore = "reads the title's shader pack and dumps"]
+    fn dumped_pixel_outputs_against_registers() {
+        let (Some(pack), Some(dir)) = (std::env::var_os("VICTORY_SHADER_PACK"), std::env::var_os("VICTORY_PRECOMPILED_GFX_DIR")) else {
+            return;
+        };
+        let mut wanted: std::collections::HashMap<String, Vec<(String, Vec<u32>)>> = Default::default();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix("-registers.bin") else { continue };
+            let parts: Vec<&str> = stem.split('-').collect();
+            let regs = std::fs::read(e.path()).unwrap();
+            let dwords: Vec<u32> = regs.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            wanted.entry(parts[2].to_owned()).or_default().push((stem.to_owned(), dwords));
+        }
+        let file = std::fs::read(&pack).unwrap();
+        let (mut silenced, mut looked) = (0, 0);
+        for r in victory_game::sgd5::records(&file) {
+            let Some(c) = r.unpack() else { continue };
+            let hash = blake3::hash(&c).to_hex()[..16].to_owned();
+            let Some(sections) = wanted.get(&hash) else { continue };
+            let ps = super::shader("pixel", &c);
+            let written = ps.translated().and_then(|t| victory_shader::emit::pixel_targets(&t.host.dxil));
+            looked += 1;
+            for (stem, d) in sections {
+                let (mask, d30) = (d[51], d[30]);
+                let Some(w) = written else { continue };
+                let lost: Vec<usize> = (0..8).filter(|&i| w & 1 << i == 0 && (mask >> (4 * i)) & 0xf != 0 && (d30 >> (4 * i)) & 0xf != 0).collect();
+                if !lost.is_empty() {
+                    silenced += 1;
+                    println!("{stem} {} written {w:#04b} mask {mask:08x} d30 {d30:08x} lost {lost:?}", r.name.unwrap_or("?"));
+                }
+            }
+        }
+        println!("pixel shaders {looked}, sections with a silenced target {silenced}");
+    }
+
     #[test]
     #[ignore = "reads the title's shader pack and dumps, and needs the host GPU"]
     fn dumped_graphics_descriptions_are_made() {

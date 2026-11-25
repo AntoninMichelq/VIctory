@@ -138,7 +138,7 @@ against GFX10's public register layouts:
 | 31 | `0x00cc0010` (all) | `CB_COLOR_CONTROL`: normal mode, ROP3 copy (not read) |
 | 39 | `0x00080000` (all) | `PA_CL_CLIP_CNTL`: DX clip space; bits 26/27 (near/far clipping off) read as `DepthClipEnable` |
 | 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bit 11 front polygon offset on (read; set in all) |
-| 43-45 | `0` mostly; `0, 16.0, 1.0` (contact markers, entity masks); `0.003, 29.0, 0` (every cascade shadow pass, hair strands included) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET`. Read as `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset, but **not applied by default** (`VICTORY_PRECOMPILED_DEPTH_BIAS=1`): run 52 lost the hair's and a room's shadows with it, where runs 43 (the title's own pipelines) and 51 (no bias) have them; the units are not those |
+| 43-45 | `0` mostly; `0, 16.0, 1.0` (contact markers, entity masks); `0.003, 29.0, 0` (cascade shadow passes, hair strands included) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET` (read): `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset. Every pair of shaders run 61 drew with the title's own pipelines (`VICTORY_PRECOMPILED_GRAPHICS=0`, which logs their bias) and run 50 dumped agrees exactly: (0.003, 29, 0) = slope 1.8125, clamp 0.003 (one of the title's four cascade biases for those shaders), (0, 16, 1) = slope 1, bias 1. `VICTORY_PRECOMPILED_DEPTH_BIAS=0` leaves it out |
 | 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL` (read): stencil, depth, depth write, depth bounds, depth func (bits 4-6), two-sided stencil (7), stencil funcs (8-10, 20-22); `0x007007f0` = no depth test, no stencil; `0x7e2` = greater-or-equal test, no write |
 | 47 | `0` (62), `0x1001`, `0x80080` | `DB_STENCIL_CONTROL` (read): fail, depth-pass, depth-fail ops, front then back, 4 bits each (`0x80080` = add one wrapping on pass) |
 | 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (read: mask, write mask; the test value is the draw's reference on the host; op value 1 = D3D12's increments) |
@@ -250,10 +250,12 @@ rectangle pass that composes them were refused for want of an input layout
   the sample masks (dwords 60, 86) are all ones, as the host's default.
   Dword 30 (`0xf`, `0xff`, `0xfff`) looks like `CB_SHADER_MASK`, but is
   `0xf` for the depth-only hair shadow pass too (a null export).
-- The units of the depth bias (dwords 43-45, above): the title's own
-  pipelines log theirs ("a title pipeline with depth bias or conservative
-  rasterization"); a run with `VICTORY_PRECOMPILED_GRAPHICS=0` gives them
-  for the same shaders.
+- The brighter hair of run 52 against run 51 (frame 4608): not the depth
+  bias (its units match the title's own pipelines, which run 43 drew
+  right) nor the rule writing nothing to targets a pixel shader has no
+  output for (in run 50's 21,864 sections it only touches pixel shaders
+  whose translation writes no colour at all: depth copies, shadow and
+  mask passes, passes writing through views). Not found here.
 - Host pipelines of precompiled pipelines are not started early in later
   runs (their variants appear only at draws).
 - Whether the run-time code differs from the container's program in more

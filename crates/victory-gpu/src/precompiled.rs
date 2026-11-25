@@ -1404,9 +1404,13 @@ mod tests {
         assert!(!GraphicsRegisters::decode(&on[..70]).0.raster.conservative);
     }
 
-    /// The polygon offsets of run 50's descriptions: (clamp, scale,
-    /// offset) of (0, 16, 1) and, on passes without depth clipping,
-    /// (0.003, 29, 0).
+    /// The polygon offsets of run 50's descriptions, against the depth
+    /// bias the title gives its own pipelines of the same shaders (run 61,
+    /// `VICTORY_PRECOMPILED_GRAPHICS=0`): (clamp, scale, offset) of
+    /// (0.003, 29, 0) for the hair strands' cascade shadow (vertex
+    /// 643101624bd14159, pixel f758c2f8e6b9b517) is the title's slope
+    /// 1.8125, clamp 0.003, bias 0; (0, 16, 1) for contact markers is
+    /// slope 1, bias 1; (0, 16, 0) for distant lights slope 1, bias 0.
     #[test]
     fn decodes_the_depth_bias() {
         let bias = |words: [u32; 3], enable: u32| {
@@ -1416,6 +1420,7 @@ mod tests {
             (r.depth_bias, r.slope_bias, r.bias_clamp)
         };
         assert_eq!(bias([0, 0x4180_0000, 0x3f80_0000], 1), (1, 1.0, 0.0));
+        assert_eq!(bias([0, 0x4180_0000, 0], 1), (0, 1.0, 0.0));
         assert_eq!(
             bias([0x3b44_9ba6, 0x41e8_0000, 0], 1),
             (0, 1.8125, f32::from_bits(0x3b44_9ba6))
