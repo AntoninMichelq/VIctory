@@ -377,6 +377,11 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 ///   from memory or an overflow can still make a NaN (`0 × ∞`).
 /// - 16: a pixel program's float outputs that are not finite become 0
 ///   (a NaN reaching a target spreads through blur and bloom passes).
+/// - 32: `v_mad_f32`/`v_mac_f32` (and the D3D9 forms with bit 8) as one
+///   FMad, which the host may fuse (one rounding instead of two).
+/// - 64: `v_rcp_f32` as a `fast` division, which the host computes with
+///   its reciprocal instruction (as approximate as the console's) instead
+///   of a full division.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -387,7 +392,7 @@ pub fn lean_math() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
-            & 31
+            & 127
     })
 }
 
@@ -7544,8 +7549,10 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
+                let lean_mac = lean_math() & 32 != 0 && (name == "v_mac_f32" || lean_math() & 8 != 0);
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
+                    _ if lean_mac => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
@@ -7559,6 +7566,10 @@ impl<'a> Lower<'a> {
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                if lean_math() & 32 != 0 && (name != "v_mad_legacy_f32" || lean_math() & 8 != 0) {
+                    let r = self.fmad(a, bb, cc);
+                    return float(self, r);
+                }
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
@@ -7594,6 +7605,9 @@ impl<'a> Lower<'a> {
                 }
                 let one = self.s.m.f32(1.0f32.to_bits());
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
+                if lean_math() & 64 != 0 {
+                    self.s.m.tag(r, Tag::Fast);
+                }
                 float(self, r)
             }
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"

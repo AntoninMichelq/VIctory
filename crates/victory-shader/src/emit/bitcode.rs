@@ -23,6 +23,9 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A float operation written with LLVM's fast-math flags (the host may
+    /// compute it approximately: a reciprocal as the hardware's).
+    Fast,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -852,6 +855,10 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    Op::Bin(op, a, b) if self.tags.get(&i) == Some(&Tag::Fast) => {
+                        // flags 1: unsafe algebra (`fast`), as DXC writes them
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, 1]);
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
