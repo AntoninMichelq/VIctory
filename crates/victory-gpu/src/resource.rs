@@ -1390,6 +1390,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if filled < floor {
         return true;
     }
+    // The PC itself is short of memory: what more is made now is what
+    // tips it over (`crate::host::memory_short`).
+    if crate::host::memory_short() {
+        return false;
+    }
     match memory {
         Some([budget, used, ..]) => used < budget / 10 * 9,
         None => filled < WITHOUT_BUDGET,
@@ -1408,7 +1413,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for 5 s and 4 frames (2 s and 2 while the PC is short of memory).
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1422,8 +1427,10 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
+    // Sooner while the PC is short of memory.
+    let short = crate::host::memory_short();
+    let idle_ms: u64 = if short { 2_000 } else { 5_000 };
+    let idle_frames: u64 = if short { 2 } else { 4 };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1442,7 +1449,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });

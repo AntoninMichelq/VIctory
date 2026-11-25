@@ -506,11 +506,35 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
+/// Compiles tried again after the driver refused them for lack of memory.
+pub(crate) static RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl Fn() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // A compile the driver refuses for lack of memory is made again, up to
+    // three times, once the worker compiles alone and the PC has memory
+    // again: refused once, a pipeline was gone for the run (the screen
+    // probes' compute 39f0e9ae, whose compile takes gigabytes: the lighting
+    // came out pink and purple).
+    let create = || {
+        let mut tries = 0;
+        loop {
+            match create() {
+                Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY && tries < 3 => {
+                    if !super::make::wait_to_retry(std::time::Duration::from_secs(30)) {
+                        return Err(e);
+                    }
+                    tries += 1;
+                    RETRIED.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(name, tries, "a pipeline compile refused for lack of memory is tried again");
+                }
+                made => return made,
+            }
+        }
+    };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);

@@ -33,11 +33,15 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    /// The staging buffer itself, if it is there: let go once the host
+    /// texture holds what it holds and nothing changed for a while
+    /// ([`let_go_idle`]), and made again by the next detile.
+    side: Mutex<Option<Side>>,
+    /// When it was last detiled (`crate::host::moment`).
+    detiled: std::sync::atomic::AtomicU64,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -58,6 +62,33 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+}
+
+/// A staging buffer: system memory the size of its texture (counted in
+/// `STAGED` while it lives).
+struct Side {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    bytes: u64,
+}
+
+impl Drop for Side {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        STAGED[0].fetch_sub(1, Relaxed);
+        STAGED[1].fetch_sub(self.bytes, Relaxed);
+    }
+}
+
+impl Side {
+    /// A new staging buffer of `bytes`, named for `what`.
+    fn make(bytes: u64, what: impl FnOnce() -> String) -> Option<Side> {
+        let (buffer, data) = host()?.upload_buffer(bytes)?;
+        crate::host::name(&buffer, what);
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Some(Side { buffer, data, bytes })
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -446,13 +477,6 @@ pub(crate) static FILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-impl Drop for Staging {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        STAGED[0].fetch_sub(1, Relaxed);
-        STAGED[1].fetch_sub(self.bytes, Relaxed);
-    }
-}
 
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
@@ -465,6 +489,19 @@ pub(crate) fn memory() -> [u64; 3] {
         .as_ref()
         .map_or(0, |map| map.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// Staging buffers let go since the start because their texture held
+/// still (the texture's upload state stays), and their bytes.
+pub(crate) static QUIETED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Staging buffers made again after they were let go.
+pub(crate) static REMADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Staging buffers alive and their bytes, for the frame line.
+pub(crate) fn staged_now() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed)]
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
@@ -495,8 +532,34 @@ pub(crate) fn let_go_idle() {
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
+    // Of those kept: the staging buffers of textures the host copy holds
+    // already and that did not change for `QUIET_MS`, let go (the lists
+    // that copied from them keep them until they are reset). A staging
+    // buffer is the texture's size in system memory, and every texture
+    // sampled lately kept one: with the world streamed in that was
+    // gigabytes beside the textures themselves. The next change makes one
+    // again (`Staging::detile`). `VICTORY_TEXTURE_KEEP_STAGING=1` keeps
+    // them, as before.
+    const QUIET_MS: u64 = 3_000;
+    const QUIET_FRAMES: u64 = 8;
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let keep_staging = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP_STAGING").is_some_and(|v| v == "1"));
+    let quiet = if crate::host::memory_short() { 0 } else { QUIET_MS };
+    let (mut dropped, mut dropped_bytes) = (0u64, 0u64);
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
+        if !keep_staging
+            && s.uploaded.load(Relaxed)
+            && !s.dirty.load(Relaxed)
+            && crate::host::long_ago(s.detiled.load(Relaxed), quiet, QUIET_FRAMES.min(quiet))
+            && let Ok(mut side) = s.side.try_lock()
+            // Checked again under the lock: a detile sets it while it holds it.
+            && !s.dirty.load(Relaxed)
+            && let Some(gone) = side.take()
+        {
+            dropped += 1;
+            dropped_bytes += gone.bytes;
+        }
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
         if !keep {
@@ -509,6 +572,10 @@ pub(crate) fn let_go_idle() {
     });
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+    if dropped > 0 {
+        QUIETED[0].fetch_add(dropped, Relaxed);
+        QUIETED[1].fetch_add(dropped_bytes, Relaxed);
     }
 }
 
@@ -588,6 +655,21 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_texture(staging);
         return;
     }
+    // The buffer to copy from, which the list keeps until it is reset (so
+    // that letting the staging buffer go never frees what a recorded copy
+    // reads). Not there: let go after a submission took the last change,
+    // so the host texture holds it already.
+    let buffer = staging
+        .side
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|side| side.buffer.clone());
+    let Some(buffer) = buffer else {
+        list.defer_texture(staging);
+        return;
+    };
+    list.keep(&buffer);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
@@ -599,7 +681,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -632,7 +714,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -837,7 +919,18 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         let began = std::time::Instant::now();
+        // The staging buffer, made again if it was let go.
+        let mut side = self.side.lock().unwrap_or_else(|e| e.into_inner());
+        if side.is_none() {
+            *side = Side::make(self.bytes, || format!("staging of {:?} (made again)", self.memory));
+            REMADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(data) = side.as_ref().map(|s| s.data) else {
+            once!("no memory for a texture's staging buffer: the texture keeps what it had");
+            return;
+        };
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.detiled.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -856,7 +949,7 @@ impl Staging {
             let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
             };
             let depth_pitch = pitch * rows as usize;
             let result = if workers > 1 && len >= 4 * 1024 * 1024 {
@@ -881,7 +974,7 @@ impl Staging {
             );
         }
         DETILE_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.fill_missing_levels();
+        self.fill_missing_levels(data);
     }
 
     /// A texture still streaming in has its smaller levels first (they lie
@@ -893,7 +986,7 @@ impl Staging {
     /// smaller level that is not, each element repeated (the next detile,
     /// once its pages are there, writes its own texels).
     /// `VICTORY_TEXTURE_FILL_LEVELS=0` turns it off.
-    fn fill_missing_levels(&self) {
+    fn fill_missing_levels(&self, data: *mut u8) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL_LEVELS").is_none_or(|v| v != "0")) {
             return;
@@ -925,7 +1018,7 @@ impl Staging {
             // staging buffer (`footprints`, `rows`).
             let row = |k: usize, y: usize| unsafe {
                 let (offset, pitch, w, _) = levels[k];
-                std::slice::from_raw_parts_mut(self.data.add(offset + y * pitch), w * n)
+                std::slice::from_raw_parts_mut(data.add(offset + y * pitch), w * n)
             };
             let zero: Vec<bool> = (0..mips)
                 .map(|k| (0..levels[k].3).all(|y| row(k, y).iter().all(|&b| b == 0)))
@@ -1178,21 +1271,18 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
+    let side = Side::make(total, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
-    });
+    })?;
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
+        side: Mutex::new(Some(side)),
+        detiled: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         #[cfg(feature = "diagnostics")]
         size: total,
-        data,
         footprints,
         rows,
         layout,
