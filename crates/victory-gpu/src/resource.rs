@@ -1120,6 +1120,10 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Last host direct / compute queue fence value that used this texture
+    /// (for cross-queue GPU synchronization under `VICTORY_ASYNC_COMPUTE=1`).
+    pub(crate) last_direct: std::sync::atomic::AtomicU64,
+    pub(crate) last_compute: std::sync::atomic::AtomicU64,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1836,6 +1840,8 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            last_direct: std::sync::atomic::AtomicU64::new(0),
+            last_compute: std::sync::atomic::AtomicU64::new(0),
             bytes,
             filled: false,
         }
