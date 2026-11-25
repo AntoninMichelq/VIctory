@@ -2626,6 +2626,11 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
+                // Host copies made again at another size since
+                // (`crate::resource::loading_full_frame`): the table is
+                // made again, with the new copies.
+                #[cfg(windows)]
+                crate::resource::LOADING_FULL_CHANGES.load(Ordering::Relaxed).hash(&mut h);
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {

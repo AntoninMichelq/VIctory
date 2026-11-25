@@ -1098,7 +1098,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            if crate::resource::skipped_mips(dst) != crate::resource::skipped_mips(src) {
+            if crate::resource::skipped_mips_of(dst, to) != crate::resource::skipped_mips_of(src, from) {
                 // Host copies that leave different levels off
                 // (`crate::resource::mip_skip`): level by level, those both
                 // have (a host level has its title level's size).
@@ -1114,8 +1114,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 };
                 for sub in 0..crate::resource::subresources(dst) {
                     if let (Some(a), Some(b)) = (
-                        crate::resource::host_subresource(dst, sub),
-                        crate::resource::host_subresource(src, sub),
+                        crate::resource::host_subresource(dst, sub, to),
+                        crate::resource::host_subresource(src, sub, from),
                     ) {
                         // SAFETY: an open list; subresources of live textures.
                         unsafe { list.list.CopyTextureRegion(&part(to, a), 0, 0, 0, &part(from, b), None) };
@@ -1224,9 +1224,14 @@ extern "system" fn copy_texture_region(
         let mut dst = dst;
         let mut src = src;
         for (at, kind) in [(&mut dst, 0u32), (&mut src, 0)] {
-            if at.kind == kind && crate::resource::skipped_mips(at.resource) > 0 {
+            // By the host copy the copy uses (made again at another size
+            // for a loading screen: `crate::resource::loading_full_frame`).
+            let texture = if at.kind == kind { crate::resource::host_resource(at.resource) } else { None };
+            if let Some(texture) = texture
+                && crate::resource::skipped_mips_of(at.resource, texture) > 0
+            {
                 let sub = at.footprint.offset as u32;
-                let Some(host) = crate::resource::host_subresource(at.resource, sub) else {
+                let Some(host) = crate::resource::host_subresource(at.resource, sub, texture) else {
                     return;
                 };
                 at.footprint.offset = (at.footprint.offset & !0xffff_ffff) | u64::from(host);
@@ -1346,8 +1351,9 @@ fn read_back(
     // A host copy that leaves levels off (`crate::resource::mip_skip`):
     // its own index for the title's level, which is the same size.
     let mut src = src;
-    if crate::resource::skipped_mips(src.resource) > 0 {
-        let sub = crate::resource::host_subresource(src.resource, src.footprint.offset as u32)
+    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    if crate::resource::skipped_mips_of(src.resource, texture) > 0 {
+        let sub = crate::resource::host_subresource(src.resource, src.footprint.offset as u32, texture)
             .ok_or("a level the host copy left off (VICTORY_TEXTURE_HALF)")?;
         src.footprint.offset = (src.footprint.offset & !0xffff_ffff) | u64::from(sub);
     }
@@ -1356,7 +1362,6 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
