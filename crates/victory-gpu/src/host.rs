@@ -2466,7 +2466,9 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
                         alias_note(true, shadow.span(), (from, to), None);
-                        settle = true;
+                        // Copied on the card from the flights' own copies
+                        // instead ([`flight_alias_copies`]).
+                        settle |= !flight_copies();
                     }
                 }
                 _ => {}
@@ -2474,6 +2476,87 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
         }
     }
     settle && on
+}
+
+/// `VICTORY_ALIAS_FLIGHT_COPIES` (on with [`alias_copies`]; `=0` off): a
+/// refresh of a copy whose title memory a flight's shaders write in another
+/// copy takes those bytes on the card ([`flight_alias_copies`]), and the
+/// flights are not settled for it. The settle was ~100 ms a frame of
+/// waiting for the card (25-35 such refreshes a frame, tout-3, 2026-11-25).
+fn flight_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| alias_copies() && std::env::var_os("VICTORY_ALIAS_FLIGHT_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Bytes and copies made by [`flight_alias_copies`] since the start.
+static FLIGHT_COPIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Per list of `runs`, the card copies that bring what flights in the air
+/// wrote in other copies of the same title memory into the copies the list
+/// refreshes: recorded before the list (its prelude), after the flights on
+/// the same queue, so the bytes are the writers' as they left the flights,
+/// as a settle and copy-back would have made them. Later flights after
+/// earlier ones, so the last writer's bytes are the ones left.
+fn flight_alias_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
+    use std::sync::Arc;
+    if !flight_copies() {
+        return Vec::new();
+    }
+    let writers: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = {
+        let line = line();
+        line.line
+            .iter()
+            .filter_map(|item| match item {
+                Late::Run(flight) => Some(flight),
+                _ => None,
+            })
+            .flat_map(|flight| {
+                flight.back.iter().flat_map(|(shadow, ranges)| ranges.iter().map(|&(a, b)| (shadow.clone(), a, b)))
+            })
+            .collect()
+    };
+    if writers.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(runs.len());
+    for list in runs {
+        let mut copies: Vec<CrossCopy> = Vec::new();
+        let mut seen: std::collections::HashSet<(usize, usize, usize, usize)> = std::collections::HashSet::new();
+        for step in &list.deferred().copies {
+            let Step::Refresh(reader, address, len) = step else {
+                continue;
+            };
+            if reader.writes_pending() {
+                continue;
+            }
+            let me = Arc::as_ptr(reader) as usize;
+            let (rs, rl) = reader.span();
+            let (lo, hi) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
+            for (writer, a, b) in &writers {
+                let them = Arc::as_ptr(writer) as usize;
+                let (ws, wl) = writer.span();
+                let (from, to) = ((*a).max(lo).max(ws as usize), (*b).min(hi).min((ws + wl) as usize));
+                if them == me || from >= to || !seen.insert((me, them, from, to)) {
+                    continue;
+                }
+                FLIGHT_COPIED[0].fetch_add(1, Ordering::Relaxed);
+                FLIGHT_COPIED[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+                copies.push((reader.clone(), writer.clone(), from, to));
+            }
+        }
+        out.push(copies);
+    }
+    let n = FLIGHT_COPIED[0].load(Ordering::Relaxed);
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if n >= LOGGED.load(Ordering::Relaxed) + 10_000 || (n > 0 && LOGGED.load(Ordering::Relaxed) == 0) {
+        LOGGED.store(n.max(1), Ordering::Relaxed);
+        tracing::info!(
+            copies = n,
+            mb = FLIGHT_COPIED[1].load(Ordering::Relaxed) >> 20,
+            "card copies from flights' copies into copies of the same title memory, in place of a settle (VICTORY_ALIAS_FLIGHT_COPIES=0 settles)"
+        );
+    }
+    out
 }
 
 /// Counts and logs (the first ones, then every 1,000th) a refresh of a copy
@@ -4698,6 +4781,15 @@ impl Host {
             aliased_under_flights(runs, false);
         }
         let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
+        // Flights' writes first: they are older than this submission's.
+        let flown = if behind { flight_alias_copies(runs) } else { Vec::new() };
+        if !flown.is_empty() {
+            crossed.resize_with(runs.len(), Vec::new);
+            for (mine, mut theirs) in crossed.iter_mut().zip(flown) {
+                theirs.append(mine);
+                *mine = theirs;
+            }
+        }
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
