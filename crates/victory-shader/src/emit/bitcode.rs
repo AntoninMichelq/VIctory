@@ -397,7 +397,7 @@ impl Module {
     /// are counted.
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (census::enabled() || tag == Tag::Fast)
         {
             self.tags.insert(i, tag);
         }
