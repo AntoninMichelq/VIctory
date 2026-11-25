@@ -70,6 +70,9 @@ struct Side {
     buffer: ID3D12Resource,
     data: *mut u8,
     bytes: u64,
+    /// The buffer's own size: `bytes` rounded up to a pool class while the
+    /// pool is on ([`staging_pool_mb`]), else `bytes`.
+    class: u64,
 }
 
 impl Drop for Side {
@@ -77,18 +80,105 @@ impl Drop for Side {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        pool_keep(&self.buffer, self.data, self.class);
     }
 }
 
 impl Side {
-    /// A new staging buffer of `bytes`, named for `what`.
+    /// A new staging buffer of `bytes`, named for `what`: one the pool
+    /// kept if it has one of the size class that nothing uses any more.
     fn make(bytes: u64, what: impl FnOnce() -> String) -> Option<Side> {
-        let (buffer, data) = host()?.upload_buffer(bytes)?;
-        crate::host::name(&buffer, what);
+        let pooled = staging_pool_mb() > 0;
+        let class = if pooled { pool_class(bytes) } else { bytes };
+        let (buffer, data) = match pooled.then(|| pool_take(class)).flatten() {
+            Some(kept) => kept,
+            None => {
+                let made = host()?.upload_buffer(class)?;
+                crate::host::name(&made.0, what);
+                STAGING_POOL[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                made
+            }
+        };
         STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        Some(Side { buffer, data, bytes })
+        Some(Side { buffer, data, bytes, class })
     }
+}
+
+/// Staging buffers: made (since the last frame-rate line), taken from the
+/// pool instead (the same), and the bytes the pool holds now.
+pub(crate) static STAGING_POOL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `VICTORY_STAGING_POOL_MB`: the most bytes of staging buffers let go that
+/// are kept to be used again (0, the default: none, every texture's
+/// staging buffer is a new upload buffer). Every texture picked by index
+/// made one (60,488 of them, 27.5 GB, in the first minutes of the 720p
+/// run of 2026-11-25), each a committed resource the driver makes and
+/// the system zeroes, on the thread that records the frame.
+pub(crate) fn staging_pool_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// A kept staging buffer: the buffer, its mapping and its size.
+struct Kept(ID3D12Resource, *mut u8, u64);
+
+// SAFETY: the mapping is only written by whoever takes the buffer out.
+unsafe impl Send for Kept {}
+
+static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+
+/// `bytes` rounded up to a pool class: 64 KiB at least, then in quarters
+/// of a power of two (at most a quarter more than asked for).
+fn pool_class(bytes: u64) -> u64 {
+    let b = bytes.max(0x1_0000);
+    let base = 1u64 << (63 - b.leading_zeros());
+    if base == b {
+        return b;
+    }
+    let step = base / 4;
+    b.div_ceil(step) * step
+}
+
+/// Whether the caller's reference is the only one to `r`: no list holds it
+/// any more (a list keeps what its copies read until it is reset, after
+/// the card has run it).
+fn only_reference(r: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    let raw = r.as_raw();
+    // SAFETY: a live COM object; one reference added and given back.
+    unsafe {
+        let vtable = *(raw as *const *const windows::core::IUnknown_Vtbl);
+        ((*vtable).AddRef)(raw);
+        ((*vtable).Release)(raw) == 1
+    }
+}
+
+/// A staging buffer let go: kept for the next of its class, within the
+/// pool's bytes.
+fn pool_keep(buffer: &ID3D12Resource, data: *mut u8, class: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let most = staging_pool_mb() << 20;
+    if most == 0 || class != pool_class(class) {
+        return;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_POOL[2].load(Relaxed) + class > most {
+        return;
+    }
+    STAGING_POOL[2].fetch_add(class, Relaxed);
+    kept.push(Kept(buffer.clone(), data, class));
+}
+
+/// A kept buffer of `class` that nothing else holds, if there is one.
+fn pool_take(class: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let at = kept.iter().position(|k| k.2 == class && only_reference(&k.0))?;
+    let Kept(buffer, data, class) = kept.swap_remove(at);
+    STAGING_POOL[2].fetch_sub(class, Relaxed);
+    STAGING_POOL[1].fetch_add(1, Relaxed);
+    Some((buffer, data))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1297,6 +1387,27 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool_class;
+
+    /// Classes: 64 KiB at least, powers of two kept, others rounded up to
+    /// the next quarter step, never more than a quarter over.
+    #[test]
+    fn classes_round_up_by_quarters() {
+        assert_eq!(pool_class(1), 0x1_0000);
+        assert_eq!(pool_class(0x1_0000), 0x1_0000);
+        assert_eq!(pool_class(0x1_0001), 0x1_4000);
+        assert_eq!(pool_class(0x40_0000), 0x40_0000);
+        assert_eq!(pool_class(0x50_0001), 0x60_0000);
+        for b in [0x1_2345u64, 0x77_7777, 0x123_4567, 0xfff_ffff] {
+            let c = pool_class(b);
+            assert!(c >= b && c - b <= b / 4 + 1, "{b:#x} -> {c:#x}");
+            assert_eq!(pool_class(c), c);
+        }
+    }
 }
 
 #[cfg(test)]

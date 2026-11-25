@@ -1392,6 +1392,8 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        let slots_done = std::time::Instant::now();
+        HEAP_SPLIT_US[0].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -1436,7 +1438,10 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let textures_began = std::time::Instant::now();
+        HEAP_SPLIT_US[1].fetch_add((textures_began - slots_done).as_micros() as u64, Ordering::Relaxed);
         self.heap_textures(list, heap, host);
+        HEAP_SPLIT_US[2].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1627,7 +1632,9 @@ impl State {
                 }
                 continue;
             }
+            let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1647,7 +1654,9 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
+                let staging = std::time::Instant::now();
                 readable(list, sampled.kind, view);
+                HEAP_SPLIT_US[4].fetch_add(staging.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2862,6 +2871,12 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 /// Passes over textures picked by index that took the loading budget
 /// ([`loading_frame`]).
 pub(crate) static HEAP_TEXTURES_PRELOAD: AtomicU64 = AtomicU64::new(0);
+/// Of the heap passes' microseconds, since the last frame-rate line: the
+/// slots looked at, the buffer views' refreshes, the textures picked by
+/// index; and of those, making the slots' host views (`mirror`: host
+/// textures made) and making them readable (staging buffers made, uploads
+/// recorded).
+pub(crate) static HEAP_SPLIT_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Whether the frame before `frame` drew under `VICTORY_PRELOAD_DRAWS`
 /// (400) draws: a loading screen or a frame with little on it, whose time
