@@ -16,8 +16,9 @@
 //!               first); 0x184 or 0x18c (graphics)
 //! info          0x14 bytes (compute: u32 hash, u32 3, zeros); 0x50-0xbc
 //!               (graphics: u32 hash, u32 0x1000, ...)
-//! code          GFX10 machine code: the native program of one of the
-//!               title's shader containers, followed by s_code_end
+//! code          GFX10 machine code: made from the native program of one
+//!               of the title's shader containers (its hashed prologue
+//!               words kept, see [`program_key`]), followed by s_code_end
 //!               (0xbf9f0000) padding (0x40 bytes more for compute
 //!               programs, 0x80 for vertex programs, none for pixel
 //!               programs in the samples)
@@ -42,11 +43,11 @@
 //! kinds  0 registers, 1 info, 6 compute code, 7 compute map
 //! ```
 //!
-//! The programs are the same native programs (FSSM) the title's containers
-//! in its shader pack hold, byte for byte apart from the padding; the
-//! title never hands those containers to the known creation methods. So a
-//! description's program is matched to its container by its first bytes,
-//! among the containers of the pack ([`PackIndex`]), and the container is
+//! The programs are made from the native programs (FSSM) the title's
+//! containers in its shader pack hold, and keep their hash; the title
+//! never hands those containers to the known creation methods. So a
+//! description's program is matched to its container by that hash, among
+//! the containers of the pack ([`PackIndex`]), and the container is
 //! translated as any other. Of a graphics description's registers section
 //! the depth, stencil, blend, write mask and rasterizer registers are read
 //! ([`GraphicsRegisters`]); its host pipelines are made per set of targets
@@ -62,7 +63,8 @@ pub const GRAPHICS_SLOT: usize = 0x1c8;
 pub const COMPUTE_SLOT: usize = 0x218;
 /// `s_code_end`, which pads programs.
 const CODE_END: u32 = 0xbf9f_0000;
-/// Programs are matched by this many first bytes (whole if shorter).
+/// Programs without the hashed prologue are matched by this many first
+/// bytes (whole if shorter).
 pub const HEAD: usize = 256;
 /// Sections larger than this are not believed.
 const MAX_SECTION: u64 = 8 << 20;
@@ -182,10 +184,28 @@ pub fn trim_padding(code: &[u8]) -> &[u8] {
     &code[..end]
 }
 
-/// The key a program is matched by: a hash of its first [`HEAD`] bytes,
-/// or of the whole if it is shorter, padding trimmed first (programs in
-/// containers are padded too, by other amounts).
+/// Bytes of a program's prologue that carry its hash: two `v_nop` words.
+const HASH_WORDS: usize = 24;
+
+/// The key a program is matched by: its hash, carried in the first two
+/// words of its prologue ([`is_program`]); else a hash of its first
+/// [`HEAD`] bytes, or of the whole if it is shorter, padding trimmed first
+/// (programs in containers are padded too, by other amounts).
+///
+/// The code a description holds is not the container's program byte for
+/// byte: the title puts a third `v_nop` (`d5800000 03fe0100 xxxxxxxx`)
+/// after the two hashed ones and changes the code after it, so in the
+/// title's run no graphics program (and offline none of 64 compute ones)
+/// was found by its first bytes. The hashed words are the same, and name
+/// one program in the pack (195 hashes name two: an `Es` and a `Gs`
+/// program, of one container).
 pub fn program_key(code: &[u8]) -> [u8; 32] {
+    if is_program(code) && code.len() >= HASH_WORDS {
+        let mut h = blake3::Hasher::new();
+        h.update(b"prologue hash");
+        h.update(&code[..HASH_WORDS]);
+        return *h.finalize().as_bytes();
+    }
     let code = trim_padding(code);
     *blake3::hash(&code[..code.len().min(HEAD)]).as_bytes()
 }
@@ -890,6 +910,48 @@ mod tests {
         more.merge(index);
         assert_eq!(more.find(&program(4, 100)), Some(0x2000));
         assert_eq!(more.find(&padded), Some(0x100));
+    }
+
+    /// What the title hands a method of a container's program: a third
+    /// `v_nop` after the two hashed ones, the code after it changed, and
+    /// padding (as in every description dumped, compute ones included).
+    fn as_described(program: &[u8]) -> Vec<u8> {
+        let mut code = program[..HASH_WORDS].to_vec();
+        code.extend(le(&[0xd580_0000, 0x03fe_0100, 0x0000_0ac0]));
+        code.extend(program[HASH_WORDS..].iter().map(|b| b ^ 0x5a));
+        code.extend(le(&[CODE_END; 32]));
+        code
+    }
+
+    #[test]
+    fn finds_containers_of_described_programs_by_their_hash() {
+        // Vertex and pixel programs of a material, each in a container of
+        // its own, and a compute one; the pack holds them as they are.
+        let (vs, ps, cs) = (
+            program(0x1111, 60),
+            program(0x2222, 90),
+            program(0x3333, 40),
+        );
+        let pack = vec![
+            (0x100, vs.clone()),
+            (0x900, ps.clone()),
+            (0x1400, cs.clone()),
+        ];
+        let index = PackIndex::build(pack, |b: &[u8]| vec![b.to_vec()]);
+        assert_eq!(index.find(&as_described(&vs)), Some(0x100));
+        assert_eq!(index.find(&as_described(&ps)), Some(0x900));
+        assert_eq!(index.find(&as_described(&cs)), Some(0x1400));
+        // The program as it is (and padded) is found as before.
+        assert_eq!(index.find(&ps), Some(0x900));
+        // Another program's hash is another program, whatever follows.
+        let mut other = as_described(&ps);
+        other[8] ^= 1;
+        assert_eq!(index.find(&other), None);
+        // Code without the prologue is still matched by its first bytes.
+        let plain = le(&(0..80u32).collect::<Vec<_>>());
+        let index = PackIndex::build([(0x40, plain.clone())], |b: &[u8]| vec![b.to_vec()]);
+        assert!(!is_program(&plain));
+        assert_eq!(index.find(&plain), Some(0x40));
     }
 
     /// A graphics registers section of 97 dwords as most descriptions

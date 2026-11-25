@@ -52,20 +52,28 @@ closing 0x43 entry holding the program's 128-bit hash.
 ## The code
 
 The code sections are not DXBC containers, nor a different encoding: they
-are the GFX10 native programs (`FSSM`, see `crates/victory-shader/src/native.rs`)
-of the title's own shader containers in `shaders.rpf`, byte for byte, with
-`s_code_end` (0xbf9f0000) padding after them (0x40 bytes more than the
-container's program for compute programs, 0x80 for vertex programs, none
-for pixel programs in the samples). Of 196 distinct program heads logged in
-runs, 194 were found in containers of `shaders.rpf` (for example a compute
-program of a texture-array mip generator, and a pixel/vertex pair of a VFX
-material whose containers are named after the same material hash).
+are GFX10 machine code made from the native programs (`FSSM`, see
+`crates/victory-shader/src/native.rs`) of the title's own shader containers
+in `shaders.rpf`, with `s_code_end` (0xbf9f0000) padding after them. They
+are not those programs byte for byte (first believed, from 16-byte heads
+in logs; the dumped sections showed otherwise):
 
-Every console program begins with three 12-byte words: `v_nop` in its VOP3
-form (`xx xx 80 d5 xx xx fe/ff 03`, the fields the instruction ignores
-carrying the program's hash) and a dword more; then `s_inst_prefetch` and
-the program proper. That is where the `80 d5` at bytes 2-3 and 14-15 come
-from.
+- A program in a container begins with two 12-byte words, `v_nop` in its
+  VOP3 form (`xx xx 80 d5 xx xx fe/ff 03`) and a dword more, whose fields
+  the instruction ignores carry the program's 128-bit hash (the hash of
+  the map's closing 0x43 entry); then `s_inst_prefetch` and the program.
+  That is where the `80 d5` at bytes 2-3 and 14-15 come from.
+- In a description the same two words come first, then a third
+  (`d5800000 03fe0100 00000ac0` in all 192 dumped) and code that differs
+  from the container's from its first instructions on (the title's
+  run-time form of the program).
+
+So a description's program is found by its two hashed words. Offline, all
+192 programs of the 64 graphics and 64 compute descriptions dumped are
+found that way, each in a container of its own stage (pixel, vertex,
+compute); none of them by its first bytes past the hash. Of the pack's
+26,698 programs the hashed words name 25,321: 195 of them name two
+programs, an `Es` and a `Gs` one.
 
 The title never hands these containers to the known creation methods, which
 is why they did not match any container the device had seen.
@@ -87,8 +95,8 @@ title assembles the descriptions at run time from its containers.
 ## What the device does with them
 
 `VICTORY_SHADER_PACK=<path of shaders.rpf>` (off by default) has the device
-index the pack's containers by their programs' first 256 bytes on the first
-such call (the 411 MB pack is read whole and its 26,503 containers
+index the pack's containers by their programs' hashed words
+(`precompiled::program_key`) on the first such call (the 411 MB pack is read whole and its 26,503 containers
 unpacked in parallel: about 0.45 s offline on the test machine, logged with
 its time), and find each description's
 program there when the title has not given us its container. A compute
@@ -162,4 +170,5 @@ formats bound then (above).
 - Dwords 63 and 92-96 of the graphics registers.
 - Host pipelines of precompiled pipelines are not started early in later
   runs (their variants appear only at draws).
-- Two of the logged program heads were not found in `shaders.rpf`.
+- Whether the run-time code differs from the container's program in more
+  than its form (the container's program is what is translated).

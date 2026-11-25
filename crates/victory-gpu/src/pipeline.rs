@@ -889,12 +889,12 @@ fn by_code(code: &[u8]) -> Option<Arc<Shader>> {
     struct Index {
         /// Shaders looked at (by container hash).
         seen: std::collections::HashSet<[u8; 32]>,
-        /// A program's whole code, and its first 256 bytes, by hash.
+        /// A program's whole code by hash, and by its key
+        /// ([`crate::precompiled::program_key`]: the hash in its prologue).
         whole: HashMap<[u8; 32], Arc<Shader>>,
         head: HashMap<[u8; 32], Arc<Shader>>,
     }
     static INDEX: Mutex<Option<Index>> = Mutex::new(None);
-    const HEAD: usize = 256;
     let all: Vec<([u8; 32], Arc<Shader>)> = SHADERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -916,15 +916,16 @@ fn by_code(code: &[u8]) -> Option<Arc<Shader>> {
         let Ok(programs) = victory_shader::native_programs(part.data) else { continue };
         for p in programs {
             index.whole.insert(*blake3::hash(&p.code).as_bytes(), s.clone());
-            if p.code.len() >= HEAD {
-                index.head.entry(*blake3::hash(&p.code[..HEAD]).as_bytes()).or_insert_with(|| s.clone());
-            }
+            index
+                .head
+                .entry(crate::precompiled::program_key(&p.code))
+                .or_insert_with(|| s.clone());
         }
     }
     let found = index
         .whole
         .get(blake3::hash(code).as_bytes())
-        .or_else(|| (code.len() >= HEAD).then(|| index.head.get(blake3::hash(&code[..HEAD]).as_bytes())).flatten())
+        .or_else(|| index.head.get(&crate::precompiled::program_key(code)))
         .cloned();
     drop(guard);
     // Else the container in the shader pack, if one is named.
@@ -1424,5 +1425,58 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+/// Diagnostics, run by hand: the containers of the programs of dumped
+/// descriptions (`VICTORY_PRECOMPILED_DUMP`), looked up in the shader pack
+/// as the device does: `VICTORY_SHADER_PACK=<shaders.rpf>
+/// VICTORY_PRECOMPILED_DIR=<dumps> cargo test -p victory-gpu --lib
+/// precompiled_dumps_find_their_containers -- --ignored --nocapture`.
+#[cfg(all(test, windows))]
+mod pack_diag {
+    #[test]
+    #[ignore = "reads the title's shader pack and dumped descriptions"]
+    fn precompiled_dumps_find_their_containers() {
+        use victory_shader::{Container, FourCC};
+        let (Some(pack), Some(dir)) = (
+            std::env::var_os("VICTORY_SHADER_PACK"),
+            std::env::var_os("VICTORY_PRECOMPILED_DIR"),
+        ) else {
+            return;
+        };
+        let file = std::fs::read(&pack).unwrap();
+        let records: Vec<_> = victory_game::sgd5::records(&file).collect();
+        let index = crate::precompiled::PackIndex::build(
+            records.iter().map(|r| (r.offset, r.unpack().unwrap_or_default())),
+            |c: &[u8]| {
+                let Ok(c) = Container::parse(c) else { return Vec::new() };
+                let Some(part) = c.part(FourCC::DXIL) else { return Vec::new() };
+                victory_shader::native_programs(part.data)
+                    .map(|ps| ps.into_iter().map(|p| p.code).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            },
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        names.sort();
+        let (mut looked, mut missing) = (0, Vec::new());
+        for path in names {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.contains("-Code(") {
+                continue;
+            }
+            looked += 1;
+            let code = std::fs::read(&path).unwrap();
+            let stage = index
+                .find(&code)
+                .and_then(|at| records.iter().find(|r| r.offset == at)?.unpack())
+                .and_then(|c| super::container_stage(&c));
+            println!("{name}: {stage:?}");
+            if stage.is_none() {
+                missing.push(name);
+            }
+        }
+        println!("programs {looked}, not found {missing:?}");
+        assert!(missing.is_empty());
     }
 }
