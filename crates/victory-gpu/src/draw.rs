@@ -2478,7 +2478,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -3619,6 +3619,19 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    #[cfg(feature = "diagnostics")]
+    crate::capture::op(std::ptr::from_ref(list) as usize, || {
+        format!("DEPTH BOUNDS {min}..{max}")
+    });
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a device that supports depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
@@ -3638,18 +3651,5 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
-    }
-}
-
-pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
-    #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || {
-        format!("DEPTH BOUNDS {min}..{max}")
-    });
-    if crate::host::host().is_some_and(|h| h.depth_bounds())
-        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
-    {
-        // SAFETY: an open list on a device that supports depth bounds.
-        unsafe { l1.OMSetDepthBounds(min, max) };
     }
 }

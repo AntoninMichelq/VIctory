@@ -6219,58 +6219,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn unused_descriptor_kind(
-        &self,
-        inst: &Inst,
-        site: Site,
-        code: u8,
-        count: u32,
-    ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
-        // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
-        // `descriptor_data` handles on their own.
-        if self.x.res.lane_copied.contains(&site)
-            || self.x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            })
-        {
-            return None;
-        }
-        let used = self.used_kind(&Source::Loaded {
-            load: site,
-            first: 0,
-        });
-        if used.is_some_and(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
-            return None;
-        }
-        let read = |k: u32| {
-            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
-                self.x
-                    .p
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.insts)
-                    .any(|i| i.reads.iter().any(|r| r.1 == v))
-            })
-        };
-        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        match count {
-            // width (dwords 1-2), height (2), levels (3), depth (4)
-            8 if (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
-                Some((0, (2 | u, 0x409), Some(2), uav, used))
-            }
-            // the record count
-            4 if read(2) && used.is_none_or(|u| u.dwords == 4) => {
-                Some((0, (11 | u, 0), None, uav, used))
-            }
-            _ => None,
-        }
-    }
-
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
         let Fields::Smem {
