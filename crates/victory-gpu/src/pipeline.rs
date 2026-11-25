@@ -242,6 +242,9 @@ pub(crate) fn merged_halves(vs: &Arc<Shader>, gs: &Arc<Shader>) -> Option<(Arc<S
                 translated: OnceLock::from(Some(Translated {
                     host,
                     stores: program.as_ref().is_none_or(stores),
+                    // The ES half's jump into the GS half is the merged
+                    // stage's own; only its flat and global stores count.
+                    raw_stores: program.as_ref().is_none_or(|p| flat_stores(p)),
                     used: program.map(|p| p.used).unwrap_or_default(),
                 })),
             })
@@ -413,6 +416,18 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
 /// flat or global store or atomic, or code that is not all known. Buffer
 /// stores go through descriptors and root views, which the host copies
 /// back on their own; only these reach title memory by address.
+#[cfg(windows)]
+fn flat_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name().is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
+}
+
 #[cfg(windows)]
 fn raw_stores(program: &victory_shader::NativeProgram) -> bool {
     use victory_shader::gfx10::{Encoding, decode};
