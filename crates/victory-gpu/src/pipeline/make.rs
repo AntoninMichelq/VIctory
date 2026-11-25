@@ -72,6 +72,22 @@ impl Pending {
     }
 }
 
+/// Why a pipeline has no host pipeline, for the dropped draws' report:
+/// still being made, a shader that does not translate, or refused (on
+/// `VICTORY_NO_COMPILE`, a stage we do not run, or the host's creation
+/// failed); `None` if it has one.
+#[cfg(windows)]
+pub(crate) fn lacks(p: &Pending) -> Option<&'static str> {
+    match p.made.get() {
+        Some(Some(_)) => None,
+        None => Some("waiting: its host pipeline is being made"),
+        Some(None) if p.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))) => {
+            Some("a shader that does not translate")
+        }
+        Some(None) => Some("refused (VICTORY_NO_COMPILE, a stage not run, or the host's creation failed)"),
+    }
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]

@@ -437,6 +437,26 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Why the draw or dispatch being prepared on this thread cannot run,
+    /// for the dropped draws' report ([`crate::pipeline::tally_drop`]);
+    /// empty when the pipeline itself is missing.
+    static DROP_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Notes why the draw being prepared is dropped; always `false`.
+fn drop_why(why: &'static str) -> bool {
+    DROP_WHY.with(|w| w.set(why));
+    false
+}
+
+/// Counts a dropped draw or dispatch of `pipeline` by its reason, the one
+/// [`drop_why`] noted, else the pipeline's own state.
+fn tally_drop(pipeline: usize) {
+    let why = DROP_WHY.with(|w| w.replace(""));
+    crate::pipeline::tally_drop(pipeline as This, why);
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -884,7 +904,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return drop_why("a draw or mesh dispatch with another kind of pipeline");
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -897,15 +917,21 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
+        // A vertex buffer the input layout reads that is not set or has no
+        // host copy: the draw still runs, reading zeros there (reported
+        // with the dropped draws, `crate::pipeline::tally_drop`).
+        let mut unbound = false;
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
             }
             count = slot + 1;
             if v.address == 0 || v.size == 0 {
+                unbound = true;
                 continue;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                unbound = true;
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -924,7 +950,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return drop_why("an index buffer without a host copy");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -934,6 +960,9 @@ impl State {
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
+        }
+        if unbound {
+            crate::pipeline::tally_drop(self.pipeline as This, crate::pipeline::DRAWN_UNBOUND);
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1027,7 +1056,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return drop_why("a descriptor table without free slots");
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1037,7 +1066,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return drop_why("title memory by address without a view heap");
                 };
                 Some(ready)
             } else {
@@ -1234,7 +1263,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return drop_why("a root UAV with nothing to bind");
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -1257,7 +1286,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return drop_why("a root UAV without a view heap");
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
@@ -1265,7 +1294,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return drop_why("a root UAV without a free slot");
                 };
                 self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
@@ -1323,7 +1352,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return drop_why("a root SRV without a view heap");
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -1336,7 +1365,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return drop_why("a root SRV without a free slot");
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
@@ -2007,12 +2036,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::tally_drop(self.pipeline as This, "skipped (VICTORY_SKIP_PIPELINES)");
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::tally_drop(self.pipeline as This, crate::pipeline::BUILDER_OFF);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -2026,6 +2057,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -2039,6 +2071,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally_drop(self.pipeline);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2482,6 +2515,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2855,6 +2889,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -2977,6 +3012,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
