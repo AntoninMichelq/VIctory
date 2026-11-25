@@ -818,6 +818,10 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // Whether the card offers GPU upload heaps (its memory written by
+        // the CPU through a resizable BAR): what host copies there would
+        // need (upstream PRs #2120/#2130, fxceless VICTORY_WINDOW_UPLOAD).
+        tracing::info!(supported = gpu_upload_heaps(&device), "GPU upload heaps (resizable BAR)");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -7031,7 +7035,9 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per copy, the ranges to bring up to date: one, their envelope, or
+    /// with [`refresh_ranges`] the disjoint ranges asked for.
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -7049,13 +7055,24 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let ranges = &mut self.refreshes[at].1;
+                if refresh_ranges() {
+                    add_range(ranges, address, end);
+                } else if let Some(r) = ranges.first_mut() {
+                    (r.0, r.1) = (r.0.min(address), r.1.max(end));
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
+        }
+    }
+
+    /// Brings every range of a copy's entry up to date.
+    fn update_all(shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]) {
+        for &(from, to) in ranges {
+            Self::update(shadow, from, to);
         }
     }
 
@@ -7065,12 +7082,12 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        Self::update_all(&shadow, &ranges);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -7124,7 +7141,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7138,19 +7155,88 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| Box::new(move || Self::update_all(&shadow, &ranges)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                Self::update_all(&shadow, &ranges);
             }
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
+    }
+}
+
+/// `VICTORY_REFRESH_RANGES=1` (off by default): a submission's refreshes of
+/// a host copy are the ranges its lists asked for, joined only where they
+/// touch or lie within 64 KiB of each other, not the one range from the
+/// lowest to the highest. After upstream PRs #2349 (dcb4ac34, 7cfd3912) and
+/// #2428 (3a2279fd). The envelope of the title's big heap (174 MB) was
+/// asked of the write watch at every flush, some 45 a frame: 8.5 GB of
+/// ranges a frame, 33 ms (run cpuframe, 2026-11-26 00:19), for some 130 MB
+/// actually copied. A page between two ranges is left as it is: no list of
+/// the submission reads it, and it is still stale for the next that does.
+fn refresh_ranges() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_RANGES").is_some_and(|v| v == "1"))
+}
+
+/// Adds `[from, to)` to `ranges` (disjoint, in order): joined with those it
+/// overlaps, touches or comes within 64 KiB of. Past 256 ranges they become
+/// their envelope (one range).
+fn add_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    const NEAR: usize = 64 << 10;
+    let (mut from, mut to) = (from, to);
+    // The first range that may join: ends within NEAR of `from` or after.
+    let first = ranges.partition_point(|r| r.1.saturating_add(NEAR) < from);
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= to.saturating_add(NEAR) {
+        from = from.min(ranges[last].0);
+        to = to.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(from, to)]);
+    if ranges.len() > 256 {
+        let envelope = (ranges[0].0, ranges[ranges.len() - 1].1);
+        ranges.clear();
+        ranges.push(envelope);
+    }
+}
+
+#[cfg(test)]
+mod refresh_range_tests {
+    use super::add_range;
+
+    #[test]
+    fn ranges_stay_apart_and_join_when_near() {
+        let mut r = vec![(1 << 20, (1 << 20) + 100)];
+        add_range(&mut r, 100 << 20, (100 << 20) + 4096);
+        assert_eq!(r, vec![(1 << 20, (1 << 20) + 100), (100 << 20, (100 << 20) + 4096)]);
+        // Within 64 KiB of the first: joined with it.
+        add_range(&mut r, (1 << 20) + 60_000, (1 << 20) + 70_000);
+        assert_eq!(r[0], (1 << 20, (1 << 20) + 70_000));
+        // Before all, far: its own, first.
+        add_range(&mut r, 0, 10);
+        assert_eq!(r[0], (0, 10));
+        assert_eq!(r.len(), 3);
+        // Bridging the last two.
+        add_range(&mut r, (1 << 20) + 70_000, 100 << 20);
+        assert_eq!(r, vec![(0, 10), (1 << 20, (100 << 20) + 4096)]);
+    }
+
+    #[test]
+    fn many_ranges_become_their_envelope() {
+        let mut r = Vec::new();
+        for i in 0..300usize {
+            add_range(&mut r, i << 20, (i << 20) + 16);
+        }
+        assert!(r.len() <= 256);
+        assert_eq!(r.first().map(|x| x.0), Some(0));
+        assert_eq!(r.last().map(|x| x.1), Some((299 << 20) + 16));
     }
 }
 
@@ -7196,7 +7282,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into our own memory: with `VICTORY_FAST_TITLE_COPY=1`, without the
+    // kernel. Into title memory, always the kernel's (our guards of title
+    // memory take writes there as the title's).
+    let whole = if title_dst { read(src, dst, len) } else { read_ours(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -7276,7 +7365,170 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_ours(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// `VICTORY_FAST_TITLE_COPY=1` (off by default): title memory is read into
+/// our own memory by a plain `rep movsb` in this process ([`fast_copy`]),
+/// not through the kernel (`ReadProcessMemory`): a fault in it (a page not
+/// there, a guard page) makes it fail as the kernel's copy fails. After
+/// upstream PR #2349 (dcb4ac34, 78dced06): the refreshes of host copies
+/// read 110-160 MB a frame through the kernel, 36-46 ms a frame (runs of
+/// 2026-11-25), the frame line's "copies".
+fn fast_title_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_COPY").is_some_and(|v| v == "1");
+        if on {
+            install_copy_recovery();
+            tracing::info!("VICTORY_FAST_TITLE_COPY=1: title memory read into host copies without the kernel");
+        }
+        on
+    })
+}
+
+/// [`read`] into memory of ours (`dst` is never title memory): with
+/// [`fast_title_copy`], without the kernel when the ranges do not overlap.
+fn read_ours(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if len > 0 && fast_title_copy() {
+        let (s, d) = (src as usize, dst as usize);
+        let apart = s.checked_add(len).is_some_and(|e| e <= d) || d.checked_add(len).is_some_and(|e| e <= s);
+        if apart {
+            // SAFETY: `dst` is `len` bytes of our writable memory (the
+            // callers' contract); a fault reading `src` is taken by
+            // `install_copy_recovery`'s handler, which makes the copy
+            // return 0.
+            return unsafe { fast_copy(dst, src, len) } != 0;
+        }
+    }
+    read(src, dst, len)
+}
+
+// A leaf that uses no stack, so it needs no unwind information (a stack
+// walker takes the return address at `rsp`): the callee-saved rdi and rsi
+// wait in the volatile r10 and r11. Windows x64: rcx = dst, rdx = src,
+// r8 = len. Returns 1, or 0 through `victory_fast_copy_fault` when a fault
+// inside `rep movsb` was redirected there.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl victory_fast_copy",
+    ".globl victory_fast_copy_start",
+    ".globl victory_fast_copy_end",
+    ".globl victory_fast_copy_fault",
+    "victory_fast_copy:",
+    "mov r10, rdi",
+    "mov r11, rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_fast_copy_start:",
+    "rep movsb",
+    "victory_fast_copy_end:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "mov eax, 1",
+    "ret",
+    "victory_fast_copy_fault:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    #[link_name = "victory_fast_copy"]
+    fn fast_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+    static victory_fast_copy_start: u8;
+    static victory_fast_copy_end: u8;
+    static victory_fast_copy_fault: u8;
+}
+
+/// Registers, once and ahead of every other handler, the handler that makes
+/// a fault inside [`fast_copy`]'s `rep movsb` fail the copy (whatever the
+/// fault, but for a breakpoint or a single step): its `Rip` goes to the
+/// return of 0. Any other exception goes on to the other handlers.
+#[cfg(target_arch = "x86_64")]
+fn install_copy_recovery() {
+    use windows_sys::Win32::Foundation::{EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched and its
+        // context, ours to change.
+        let (r, ctx) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        if r.ExceptionCode == EXCEPTION_BREAKPOINT as NTSTATUS || r.ExceptionCode == EXCEPTION_SINGLE_STEP as NTSTATUS {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rip = ctx.Rip as usize;
+        let start = (&raw const victory_fast_copy_start) as usize;
+        let end = (&raw const victory_fast_copy_end) as usize;
+        if rip >= start && rip < end {
+            ctx.Rip = (&raw const victory_fast_copy_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the handler changes only the context of faults inside our copy.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(on_fault));
+    });
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_copy_recovery() {}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fast_copy_tests {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        VirtualProtect,
+    };
+
+    fn copy(dst: &mut [u8], src: *const u8) -> bool {
+        super::install_copy_recovery();
+        // SAFETY: `dst` is ours; a fault reading `src` fails the copy.
+        unsafe { super::fast_copy(dst.as_mut_ptr(), src, dst.len()) != 0 }
+    }
+
+    /// Copies what is there; a page not readable (no access, a guard page)
+    /// fails the copy instead of ending the process.
+    #[test]
+    fn the_fast_copy_fails_where_the_kernel_copy_would() {
+        // SAFETY: a fresh allocation of three pages, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: the first page is ours.
+        unsafe { std::ptr::write_bytes(base, 0x5a, 4096) };
+        let mut old = 0;
+        // SAFETY: pages of our allocation.
+        unsafe {
+            assert_ne!(VirtualProtect(base.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+            assert_ne!(VirtualProtect(base.add(8192).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+        }
+        let mut buf = vec![0u8; 4096];
+        assert!(copy(&mut buf, base));
+        assert!(buf.iter().all(|&b| b == 0x5a));
+        // SAFETY: pointers into our allocation.
+        assert!(!copy(&mut buf, unsafe { base.add(4096) }), "a page with no access fails the copy");
+        assert!(!copy(&mut buf[..16], unsafe { base.add(8192) }), "a guard page fails the copy");
+        assert!(!copy(&mut buf, unsafe { base.add(2048) }), "a copy running into a page with no access fails");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// The copy is a leaf that touches no stack (no unwind information).
+    #[test]
+    fn the_fast_copy_uses_no_stack() {
+        // SAFETY: the function's own code, read up to its second `ret`.
+        let code = unsafe { std::slice::from_raw_parts(super::fast_copy as *const u8, 64) };
+        let end = code.iter().enumerate().filter(|&(_, &b)| b == 0xc3).nth(1).map(|(i, _)| i).expect("two rets");
+        // push rdi, push rsi, pop rsi, pop rdi
+        assert!(code[..end].iter().all(|b| ![0x57, 0x56, 0x5e, 0x5f].contains(b)), "{:02x?}", &code[..=end]);
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -7314,6 +7566,67 @@ unsafe extern "system" {
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Whether `device` offers GPU upload heaps (`D3D12_HEAP_TYPE_GPU_UPLOAD`:
+/// the card's memory, written by the CPU through a resizable BAR).
+pub(crate) fn gpu_upload_heaps(device: &ID3D12Device) -> bool {
+    let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    // SAFETY: a plain query into a structure of the size given.
+    unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool()
+    }
+}
+
+#[cfg(test)]
+mod gpu_upload_check {
+    /// Says whether this PC's card offers GPU upload heaps (run by hand:
+    /// `cargo test -p victory-gpu gpu_upload -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "asks the PC's own card"]
+    fn this_card_offers_gpu_upload_heaps() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: the default adapter, an out pointer of ours.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("a device");
+        let device = device.expect("a device");
+        println!("GPU upload heaps: {}", super::gpu_upload_heaps(&device));
+    }
+}
+
+/// [`write_mapped`] of what shaders wrote, back into title memory: with
+/// `VICTORY_FAST_TITLE_WRITE=1` (off by default) first by the same
+/// `rep movsb` as [`read_ours`] (the caller opened our guards there:
+/// `crate::watch::writing`), and through the kernel only if a fault failed
+/// it (a page not there or not writable; the bytes before it are written,
+/// and written again). Hundreds of pieces a frame each cost a kernel call
+/// (copy 162 of run cumul2: 206 pieces a frame).
+pub(crate) fn write_title(dst: *mut u8, src: *const u8, len: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let fast = *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_WRITE").is_some_and(|v| v == "1");
+        if on {
+            install_copy_recovery();
+            tracing::info!("VICTORY_FAST_TITLE_WRITE=1: what shaders wrote goes back into title memory without the kernel");
+        }
+        on
+    });
+    #[cfg(target_arch = "x86_64")]
+    if fast && len > 0 {
+        let (s, d) = (src as usize, dst as usize);
+        let apart = s.checked_add(len).is_some_and(|e| e <= d) || d.checked_add(len).is_some_and(|e| e <= s);
+        // SAFETY: `src` is `len` bytes of ours; a fault writing `dst` is
+        // taken by `install_copy_recovery`'s handler (the copy returns 0).
+        if apart && unsafe { fast_copy(dst, src, len) } != 0 {
+            return;
+        }
+    }
+    let _ = fast;
+    write_mapped(dst, src, len);
 }
 
 /// Copies host memory into title memory after a submission (what shaders
