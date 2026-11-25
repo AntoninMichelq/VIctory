@@ -11403,6 +11403,22 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+/// Whether every descriptor a choice of descriptors joins is built from constants.
+fn constant_leaves(src: &Source) -> bool {
+    src.leaves().iter().all(|l| matches!(l, Source::Constant(_)))
+}
+
+/// The different constant descriptors a choice joins, in order.
+fn sampler_choices(src: &Source) -> Vec<Source> {
+    let mut out: Vec<Source> = Vec::new();
+    for l in src.leaves() {
+        if !out.contains(l) {
+            out.push(l.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
@@ -12038,20 +12054,4 @@ mod tests {
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
-}
-
-/// Whether every descriptor a choice of descriptors joins is built from constants.
-fn constant_leaves(src: &Source) -> bool {
-    src.leaves().iter().all(|l| matches!(l, Source::Constant(_)))
-}
-
-/// The different constant descriptors a choice joins, in order.
-fn sampler_choices(src: &Source) -> Vec<Source> {
-    let mut out: Vec<Source> = Vec::new();
-    for l in src.leaves() {
-        if !out.contains(l) {
-            out.push(l.clone());
-        }
-    }
-    out
 }
