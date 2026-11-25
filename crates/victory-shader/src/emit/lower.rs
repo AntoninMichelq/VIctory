@@ -3308,6 +3308,11 @@ impl<'a> Lower<'a> {
             // The id of the last wave out of primitive order: zero (see
             // `inputs`).
             Operand::Const(POPS_EXITING_WAVE_ID) => Ok(self.s.m.i32(0)),
+            // `src_scc`: SCC as 0 or 1.
+            Operand::Const(253) => {
+                let bit = self.scc_in(inst)?;
+                Ok(self.s.m.cast(self.cur, Cast::ZExt, bit, self.s.t.i32))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -6898,6 +6903,37 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" | "v_dot4c_i32_i8" => {
+                // The four byte products of the first two operands, added
+                // to the third (`v_dot4c`: to the destination). The
+                // operands' byte selects do not apply to these.
+                // shortcut: without clamp (the sum wraps, as unclamped).
+                if v.clamp {
+                    return Err("a clamped byte dot product");
+                }
+                let signed = name.contains("_i8");
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let mut sum = if name == "v_dot4c_i32_i8" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+                } else {
+                    s(self, 2)?
+                };
+                for k in 0..4u32 {
+                    let byte = |l: &mut Self, x: V| {
+                        let up = l.s.m.i32(24 - 8 * k);
+                        let t = l.s.m.bin(c, Bin::Shl, x, up);
+                        let down = l.s.m.i32(24);
+                        l.s.m.bin(c, if signed { Bin::AShr } else { Bin::LShr }, t, down)
+                    };
+                    let (x, y) = (byte(self, a), byte(self, b));
+                    let m = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, m);
+                }
+                int(self, sum)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -8365,8 +8401,11 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let float = op.ends_with("_f16");
+        // `v_pk_fmac_f16`: the accumulator is the destination, half by half.
+        let fmac = op == "fmac_f16";
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fmac_f16" => 2,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -8395,6 +8434,24 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if fmac {
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    x
+                };
+                let m = self.s.m.i32(0xFFFF);
+                let x = self.s.m.bin(c, Bin::And, x, m);
+                xs.push(
+                    self.s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]),
+                );
             }
             let r = if float {
                 let mut f = match op {
