@@ -182,6 +182,12 @@ impl GraphicsState {
     /// logic operation only into one of an unsigned integer format, never
     /// beside blending.
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        // `VICTORY_HOST_BLEND=0`: the title's blend state as it is (before
+        // integer targets had their blending turned off here), to compare.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("VICTORY_HOST_BLEND").is_some_and(|v| v == "0")) {
+            return self.blend;
+        }
         const UINT: [i32; 11] = [3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62];
         const SINT: [i32; 9] = [4, 8, 14, 18, 32, 38, 43, 52, 64];
         let mut b = self.blend;
