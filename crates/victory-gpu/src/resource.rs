@@ -1882,6 +1882,26 @@ pub(crate) fn skipped_mips(this: This) -> u32 {
     mip_skip(&r.desc) + r.host.shrunk.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Of title texture `this`: its dimension (2 1D, 3 2D, 4 3D), slices,
+/// format and samples; `None` for buffers.
+#[cfg(windows)]
+pub(crate) fn texture_shape(this: This) -> Option<(u32, u16, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    (d.dimension != BUFFER).then_some((d.dimension, d.depth_or_array_size, d.format, d.sample_count))
+}
+
+/// [`texture_shape`] of a texture placed with the resource description
+/// `desc` (as words).
+#[cfg(windows)]
+pub(crate) fn placed_shape(desc: &[u32; 14]) -> Option<(u32, u16, u32, u32)> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.dimension != BUFFER).then_some((d.dimension, d.depth_or_array_size, d.format, d.sample_count))
+}
+
 /// Levels the host copy of title texture `this` leaves off for being small
 /// (`shrinking`), beyond [`mip_skip`]'s.
 #[cfg(windows)]
