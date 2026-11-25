@@ -617,6 +617,99 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     drops
 }
 
+/// The reason a dispatch of the ray-tracing structure builder is dropped
+/// with: on purpose, the builder is off (`VICTORY_BVH_BUILDER`).
+#[cfg(windows)]
+pub(crate) const BUILDER_OFF: &str = "the ray-tracing structure builder, off on purpose (VICTORY_BVH_BUILDER)";
+
+/// Not a drop, counted with them: a draw run with a vertex buffer its
+/// input layout reads unset or without a host copy (it reads zeros there).
+#[cfg(windows)]
+pub(crate) const DRAWN_UNBOUND: &str = "DRAWN all the same, a vertex buffer unset or without a host copy (reads zeros)";
+
+/// Draws and dispatches dropped since the last [`drop_report`], by title
+/// pipeline and reason: its shaders as named in the log, and the count.
+#[cfg(windows)]
+type Tally = HashMap<(usize, &'static str), (String, u64)>;
+#[cfg(windows)]
+static TALLY: Mutex<Option<Tally>> = Mutex::new(None);
+
+/// Whether dropped draws are counted by pipeline and reported
+/// (`VICTORY_DROP_REPORT=0`: not).
+#[cfg(windows)]
+fn drop_report_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DROP_REPORT").as_deref() != Ok("0"))
+}
+
+/// Counts a draw or dispatch of `this` dropped for `why`; an empty `why`
+/// is the pipeline's own: none set, not made yet, a shader that does not
+/// translate, refused, or (with a host pipeline) something else the draw
+/// needs.
+#[cfg(windows)]
+pub(crate) fn tally_drop(this: This, why: &'static str) {
+    if !drop_report_on() {
+        return;
+    }
+    let why = match why {
+        "" if this.is_null() => "no pipeline set",
+        "" => make::lacks(&pipeline(this).host).unwrap_or("it could not be prepared (no reason noted)"),
+        why => why,
+    };
+    let mut tally = TALLY.lock().unwrap_or_else(|e| e.into_inner());
+    tally
+        .get_or_insert_with(HashMap::new)
+        .entry((this as usize, why))
+        .or_insert_with(|| {
+            let shaders = if this.is_null() { String::new() } else { format!("{:?}", pipeline(this).shaders) };
+            (shaders, 0)
+        })
+        .1 += 1;
+}
+
+/// Counts `frames` more frames for the dropped draws' report; with `log`,
+/// logs the draws and dispatches dropped since the last report, per frame
+/// by reason, then the 20 pipelines that dropped most.
+#[cfg(windows)]
+pub(crate) fn drop_report(frames: f64, log: bool) {
+    static FRAMES: Mutex<f64> = Mutex::new(0.0);
+    let frames = {
+        let mut kept = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+        *kept += frames;
+        if !log {
+            return;
+        }
+        std::mem::take(&mut *kept)
+    };
+    let Some(tally) = TALLY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if tally.is_empty() || frames <= 0.0 {
+        return;
+    }
+    let mut reasons: HashMap<&'static str, u64> = HashMap::new();
+    for (&(_, why), &(_, n)) in &tally {
+        *reasons.entry(why).or_default() += n;
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut top: Vec<_> = tally.into_iter().map(|((_, why), (shaders, n))| (n, why, shaders)).collect();
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    let pipelines = top.len();
+    let by_reason: Vec<String> =
+        reasons.iter().map(|(why, n)| format!("{:.1} {why}", *n as f64 / frames)).collect();
+    let by_pipeline: Vec<String> = top
+        .iter()
+        .take(20)
+        .map(|(n, why, shaders)| format!("{:.1} {shaders} ({why})", *n as f64 / frames))
+        .collect();
+    tracing::info!(
+        "dropped draws and dispatches per frame, by reason: {}; {pipelines} pipelines, the most: {}",
+        by_reason.join("; "),
+        by_pipeline.join("; ")
+    );
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
