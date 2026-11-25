@@ -956,11 +956,14 @@ impl State {
             // and shading program) does not have every numbered copy
             // declared written and compared on the CPU (up to 4 s a frame
             // with the builder on).
-            let writes = (t.raw_stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // What it stores through root views is copied back as before: the title
+            // reads those results (left out, it crashed while loading the world).
+            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = (t.stores || !write_skip()) && !quarantined;
+            let raw_writes = (t.raw_stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
