@@ -74,6 +74,13 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    // Read by the translator too, and missing here until
+                    // now: a cache warmed with one setting served its
+                    // translations to a run with the other.
+                    "VICTORY_NO_HOST_HALVES",
+                    "VICTORY_MESH_OUTPUT_STRICT",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_WAVE_LOCAL",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
