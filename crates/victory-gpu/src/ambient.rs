@@ -49,12 +49,12 @@ pub(crate) fn level() -> Option<f32> {
         if set.trim() == "off" {
             return -1.0;
         }
-        match set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0) {
-            Some(level) => level,
-            // Not set: only while no rays can run.
-            None if crate::pipeline::builder_runs() => -1.0,
-            None => DEFAULT,
-        }
+        // Off unless a level is set: on the RX 7600 the image at the
+        // resolve's (1, 176) is not only the indirect light here, and
+        // writing it made cell walls vanish, glass and mesh go, hair turn
+        // blonde (runs R1, R4a, R4b, 2026-11-25).
+        let _ = DEFAULT;
+        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(-1.0)
     });
     (level >= 0.0).then_some(level)
 }
