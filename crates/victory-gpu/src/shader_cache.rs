@@ -103,7 +103,17 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            // The host's wave width and view heap limit are set at run time
+            // (they may come after the first translation), so they join the
+            // key here: a cache moved to another PC, or warmed by a run that
+            // set them otherwise, serves none of the wrong forms.
+            let mut key = blake3::Hasher::new();
+            key.update(build());
+            key.update(&victory_shader::emit::host_max_wave().to_le_bytes());
+            key.update(&victory_shader::emit::view_heap_limit().to_le_bytes());
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
         None => translate(container),
     }
 }
