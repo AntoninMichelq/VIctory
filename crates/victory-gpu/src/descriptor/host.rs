@@ -917,6 +917,19 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .evict(before, n);
         let gone: Vec<u32> = out.into_iter().filter(|&i| self.texture_slot_gone(i)).collect();
+        if !gone.is_empty() {
+            static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = gone.len() as u64;
+            let n = TOTAL.fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+            // At 1, 2, 4, ... slots given up since the start.
+            if (n + k).ilog2() != n.max(1).ilog2() || n == 0 {
+                tracing::info!(
+                    given_up = n + k,
+                    requeued_after_frames = later,
+                    "texture slots given up for room on the card (VICTORY_EVICT_REQUEUE_FRAMES=0: not queued again)"
+                );
+            }
+        }
         if later > 0 && !gone.is_empty() {
             let frame = crate::frame::current();
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
