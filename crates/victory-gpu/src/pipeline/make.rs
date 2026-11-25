@@ -297,7 +297,11 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
+            .clamp(1, 16);
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -309,7 +313,9 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        let _making = room_to_make();
+                        p.make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -327,6 +333,63 @@ fn workers() -> bool {
     })
 }
 
+/// Pipelines being compiled by the workers now.
+static MAKING_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// Held while a worker compiles: counts it in [`MAKING_NOW`].
+struct Making;
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING_NOW.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Waits, before a worker compiles, while the PC is short of memory and
+/// another worker is compiling: the driver's compiles take hundreds of MB
+/// each, and eight at once with the PC's memory nearly full (29-30 of 33
+/// GB) failed with E_OUTOFMEMORY and then crashed inside the driver's
+/// CreatePipelineState (runs of 2026-11-25 01:49 and 02:13). One worker
+/// always goes on, so pipelines are still made, one at a time.
+/// `VICTORY_PIPELINE_MIN_FREE_MB` (3072): the free physical memory, and
+/// the free commit, below which only one compiles.
+fn room_to_make() -> Making {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static MIN_FREE: OnceLock<u64> = OnceLock::new();
+    let min_free = *MIN_FREE.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_MIN_FREE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(3072)
+            << 20
+    });
+    let short = || {
+        // SAFETY: a zeroed structure with its size set.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: as above.
+        (unsafe { GlobalMemoryStatusEx(&mut m) }) != 0 && (m.ullAvailPhys < min_free || m.ullAvailPageFile < min_free)
+    };
+    let mut waited = false;
+    loop {
+        let making = MAKING_NOW.load(Ordering::Relaxed);
+        if making == 0 || !short() {
+            if MAKING_NOW.compare_exchange(making, making + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                if waited {
+                    THROTTLED.fetch_add(1, Ordering::Relaxed);
+                }
+                return Making;
+            }
+            continue;
+        }
+        waited = true;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Compiles that waited for memory (logged when the workers run out).
+static THROTTLED: AtomicU64 = AtomicU64::new(0);
+
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
@@ -339,6 +402,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            waited_for_memory = THROTTLED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
