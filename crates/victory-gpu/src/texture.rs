@@ -1221,6 +1221,58 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     Some((size as u64, committed(s.memory, size)))
 }
 
+/// For a title texture staged for upload whose memory is mapped in part (a
+/// texture streaming in: its smaller levels lie first in its memory and
+/// arrive first): the most detailed level from which every level down is
+/// all there, in every slice; `u32::MAX` when no level is. `None` when
+/// level 0 is there too, or for thick (3D) layouts. The levels above it were uploaded
+/// from unmapped memory, which reads as zeros: black colour and normals of
+/// (-1, -1), drawn as dark, chrome-streaked characters and black posters.
+pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
+    let s = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    let layout = &s.layout;
+    let n = layout.mips.len();
+    if layout.thick {
+        return None;
+    }
+    // Where each level's blocks start; a level ends where the next starts.
+    let mut starts: Vec<u64> = layout.mips.iter().filter(|m| m.tail.is_none()).map(|m| m.offset).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let end_of = |at: u64| starts.iter().copied().find(|&x| x > at).unwrap_or(layout.slice_size);
+    let there = |i: usize| {
+        let mip = &layout.mips[i];
+        // The tail's levels share one block at the start of the slice.
+        let (from, to) = if mip.tail.is_some() {
+            (0, starts.first().copied().unwrap_or(layout.slice_size))
+        } else {
+            (mip.offset, end_of(mip.offset))
+        };
+        let len = to.saturating_sub(from);
+        // Its last page too: blocks are asked of by their first page
+        // ([`mapped_bytes`]).
+        (0..u64::from(layout.slices.max(1))).all(|slice| {
+            let at = s.memory.wrapping_add((slice * layout.slice_size + from) as usize);
+            len == 0 || (mapped_bytes(at, len as usize) == len && committed(at.wrapping_add(len as usize - 1), 1))
+        })
+    };
+    let mut first = n;
+    for i in (0..n).rev() {
+        if !there(i) {
+            break;
+        }
+        first = i;
+    }
+    match first {
+        0 => None,
+        f if f == n => Some(u32::MAX),
+        f => Some(f as u32),
+    }
+}
+
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
@@ -1434,7 +1486,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         // By the host copy itself: one made at full size for a loading
-        // screen keeps every level (`crate::resource::loading_full_frame`).
+        // screen keeps every level (`crate::resource::loading_full_frame`),
+        // a small one leaves more off (`crate::resource::shrinking`).
         skip: crate::resource::skip_for(&desc, d.Width),
         bytes: total,
         memory,

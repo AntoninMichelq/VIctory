@@ -106,6 +106,39 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// `VICTORY_RESIDENCY_PRIORITY=1` (off by default): what the card renders
+/// to or writes (render targets, depth, unordered access) and the copies of
+/// buffers on the card (`VICTORY_CARD_BUFFERS`) get the high residency
+/// priority (`ID3D12Device1::SetResidencyPriority`), the rest keeps the
+/// normal one: past the budget the system moves textures to the PC's
+/// memory before those, which every frame writes or reads.
+pub(crate) fn residency_high(resource: &ID3D12Resource) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RESIDENCY_PRIORITY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_RESIDENCY_PRIORITY=1: targets, depth, unordered access and card buffers kept on the card first");
+        }
+        on
+    }) {
+        return;
+    }
+    let Some(host) = host() else { return };
+    let Ok(device) = windows::core::Interface::cast::<ID3D12Device1>(&host.device) else {
+        return;
+    };
+    let Ok(pageable) = windows::core::Interface::cast::<ID3D12Pageable>(resource) else {
+        return;
+    };
+    let objects = [Some(pageable)];
+    let priorities = [D3D12_RESIDENCY_PRIORITY_HIGH];
+    // SAFETY: one live object and its priority.
+    if let Err(e) = unsafe { device.SetResidencyPriority(1, objects.as_ptr(), priorities.as_ptr()) } {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(error = %e, "a residency priority was refused"));
+    }
+}
+
 /// How many references are held on a host object (its COM count): ours
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it

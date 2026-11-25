@@ -226,8 +226,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match &buffer {
+        Some(b) => crate::host::residency_high(b),
+        None => {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        }
     }
     buffer
 }

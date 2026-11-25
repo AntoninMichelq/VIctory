@@ -376,6 +376,50 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Slots given up for lack of room, since the start.
 pub(crate) static HEAP_TEXTURES_EVICTED: AtomicU64 = AtomicU64::new(0);
+/// Slots the pass made with a small host copy while the card was full
+/// (`VICTORY_EVICT_LESS=1`), since the start.
+pub(crate) static HEAP_TEXTURES_SMALL: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_EVICT_LESS` (`=1` on; off by default, as before): while the card
+/// is full, the texture pass gives up slots by the bytes it must free, at
+/// most once every `VICTORY_EVICT_LESS_MS` (6000) ms, only where that frees a
+/// host copy, least lately used first
+/// (`crate::descriptor::host::HostHeap::texture_slots_evict_less`); and the
+/// slots it would have left waiting get a small host copy of the texture
+/// (its levels from `VICTORY_EVICT_LESS_SIZE`, 256, texels down:
+/// `crate::resource::shrinking`) while the card is under
+/// `VICTORY_EVICT_LESS_MAX` (95) percent of its budget. Before, every pass
+/// that found the card full gave up the 256 oldest made slots, whether that
+/// freed anything or not, while their copies took 5 s idle to go: 33,000
+/// to 65,000 slots grey or black in five minutes of the common room.
+fn evict_less() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        if std::env::var_os("VICTORY_EVICT_LESS").is_none_or(|v| v != "1") {
+            return None;
+        }
+        let ms = std::env::var("VICTORY_EVICT_LESS_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(6000u64)
+            .max(500);
+        tracing::info!(every_ms = ms, "VICTORY_EVICT_LESS=1: slots given up by bytes, least used first; small copies while the card is full");
+        Some(ms)
+    })
+}
+/// Slots made again with a lowest level of detail (a texture uploaded in
+/// part) or without it again, since the start ([`partly_clamp`]).
+pub(crate) static HEAP_TEXTURES_CLAMPED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_PARTLY_CLAMP` (on; `=0` off): a texture streaming in that was
+/// uploaded in part is sampled only from its first level all there
+/// (`crate::texture::first_whole_level`), not from levels uploaded from
+/// unmapped memory (zeros). About 1,700 slots stayed uploaded in part in
+/// the common room, where characters and posters drew black and chrome.
+fn partly_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTLY_CLAMP").is_none_or(|v| v != "0"))
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1644,6 +1688,14 @@ impl State {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
+        // `VICTORY_EVICT_LESS=1`: what to free, and whether small copies
+        // may still be made, while the card is full.
+        let less = evict_less();
+        let (need, small_room) = match less {
+            Some(_) if !room => crate::resource::room_need(memory),
+            _ => (0, false),
+        };
+        let mut evicted = false;
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
@@ -1691,7 +1743,17 @@ impl State {
         // The barriers leaving uploaded textures readable: together at the
         // end (`VICTORY_UPLOAD_BARRIERS`).
         let _held = crate::list::HoldReads::new(list);
+        // Host copies are made small only where the loop says so, and
+        // never past it (`resource::shrinking`).
+        struct Unshrink;
+        impl Drop for Unshrink {
+            fn drop(&mut self) {
+                crate::resource::shrinking(false);
+            }
+        }
+        let _unshrink = Unshrink;
         for (index, write) in due {
+            crate::resource::shrinking(false);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
@@ -1744,22 +1806,49 @@ impl State {
             // From here on a host texture is made: not without room. The
             // slot stays due.
             if !room {
-                if refused == 0 {
+                if !evicted {
+                    evicted = true;
                     // Slots keep the copies of what they showed, so the
                     // card stayed full for the rest of the run (uploads
                     // stopped at 14 GB with 4,500 slots due): the oldest
                     // made give theirs up, but not the last seconds'.
-                    HEAP_TEXTURES_EVICTED.fetch_add(
-                        host.texture_slots_evict(now.saturating_sub(4000), 256) as u64,
-                        Ordering::Relaxed,
-                    );
+                    match less {
+                        None => {
+                            HEAP_TEXTURES_EVICTED.fetch_add(
+                                host.texture_slots_evict(now.saturating_sub(4000), 256) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        // By bytes, at most once in `every` ms: what is
+                        // given up is let go some seconds later
+                        // (`resource::let_go_idle`), and the card shows it
+                        // later still.
+                        Some(every) => {
+                            static LAST: AtomicU64 = AtomicU64::new(0);
+                            let last = LAST.load(Ordering::Relaxed);
+                            if (last == 0 || now.saturating_sub(last) >= every)
+                                && LAST.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                            {
+                                // Queued again by when their copies went.
+                                let frame_ms = FRAME_MS.load(Ordering::Relaxed).max(16);
+                                let later = ((every + 1500) / frame_ms).clamp(30, 1000);
+                                let (n, _) = host.texture_slots_evict_less(now.saturating_sub(4000), need, 4096, later);
+                                HEAP_TEXTURES_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
-                refused += 1;
-                if refused > 256 {
-                    break;
+                if !small_room {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
             }
+            // A small copy while the card is full (`VICTORY_EVICT_LESS=1`).
+            let small = !room;
+            crate::resource::shrinking(small);
             let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1771,6 +1860,15 @@ impl State {
                     continue;
                 }
             };
+            if small && crate::resource::shrunk_levels(resource) > 0 {
+                let n = HEAP_TEXTURES_SMALL.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        small = n,
+                        "texture slots made with a small host copy while the card is full (VICTORY_EVICT_LESS=1)"
+                    );
+                }
+            }
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
@@ -1784,6 +1882,7 @@ impl State {
             if let Some(view) = &view {
                 let staging = std::time::Instant::now();
                 readable(list, sampled.kind, view, false);
+                crate::resource::shrinking(false);
                 HEAP_SPLIT_US[4].fetch_add(staging.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // A texture view the host refuses removes the device: name it.
@@ -1809,6 +1908,30 @@ impl State {
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
             }
+            // Uploaded in part: the levels not there yet are not sampled
+            // (they read zeros), none at all if no level is all there (the
+            // grey stand-in); all of them again once it is whole. Before
+            // the tabled case below, which the clamp concerns as much (it
+            // stayed on for good there once the texture was whole). The
+            // level is kept with the slot and its record
+            // (`HostHeap::remake_from_level`): a slot given up and made
+            // again keeps it, one written since drops it.
+            if partly_clamp()
+                && let Some(handle) = heap.handle(index)
+            {
+                let least = if partly.is_some() { crate::texture::first_whole_level(resource).unwrap_or(0) } else { 0 };
+                if least != host.slot_least(index, handle) {
+                    host.remake_from_level(index, handle, least);
+                    let n = HEAP_TEXTURES_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!(
+                            remade = n,
+                            level = least,
+                            "texture slots uploaded in part remade to sample only the levels there (VICTORY_PARTLY_CLAMP=0 turns this off)"
+                        );
+                    }
+                }
+            }
             if tabled {
                 // Nothing was staged here, so nothing is counted or spent,
                 // and the staging buffer stays: taking it away made the
@@ -1827,7 +1950,7 @@ impl State {
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-            host.texture_slot_made(index, now);
+            host.texture_slot_made(index, now, resource as usize);
             host.texture_slot_done(index, write, again);
         }
     }

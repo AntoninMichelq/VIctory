@@ -1158,6 +1158,10 @@ struct Hosted {
     /// A loading screen showed it ([`loading_full_frame`]): its host copy
     /// keeps every level whatever [`mip_skip`] says, for as long as it lives.
     full: std::sync::atomic::AtomicBool,
+    /// Levels the host copy leaves off beyond [`mip_skip`]'s: made small
+    /// while the card was full ([`shrink_levels`]). Set under `made`'s lock
+    /// when the copy is made, as it stays for that copy's life.
+    shrunk: std::sync::atomic::AtomicU32,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1307,6 +1311,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
         let full = r.host.full.load(Relaxed);
+        // A small copy while the card is full ([`shrinking`]); never one a
+        // loading screen made full size.
+        let extra = if full {
+            EXTRA.set(0);
+            0
+        } else {
+            small_extra(&r.desc)
+        };
+        r.host.shrunk.store(extra, Relaxed);
         let Some(texture) = host_texture(&r.desc, r.host.state, clear, full) else {
             r.host.refused.store(true, Relaxed);
             return None;
@@ -1433,6 +1446,149 @@ fn hysteresis() -> Option<(u64, u64)> {
         let (high, low) = (high.trim().parse::<u64>().ok()?, low.trim().parse::<u64>().ok()?);
         (low < high && high <= 100).then_some((high, low))
     })
+}
+
+#[cfg(windows)]
+std::thread_local! {
+    /// Host copies made on this thread now are made small ([`shrinking`]).
+    static SHRINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+std::thread_local! {
+    /// Levels the host copy [`hosted`] makes on this thread now leaves off
+    /// for being small ([`small_extra`]), read by [`host_texture`].
+    static EXTRA: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// For [`hosted`], about to make a host copy of a texture described by
+/// `desc`: the levels it leaves off for being small ([`shrinking`]), also
+/// set for [`host_texture`] on this thread (0 when not making it small).
+#[cfg(windows)]
+fn small_extra(desc: &ResourceDesc) -> u32 {
+    let extra = if SHRINK.get() { shrink_levels(desc, mip_skip(desc)) } else { 0 };
+    EXTRA.set(extra);
+    if extra > 0 {
+        SHRUNK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    extra
+}
+
+/// Host copies made small while the card was full ([`shrinking`]), since
+/// the start.
+#[cfg(windows)]
+pub(crate) static SHRUNK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host copies of title textures made on this thread from now on (until
+/// called again with `false`) leave their larger levels off
+/// ([`shrink_levels`]): the texture pass makes them so while the card is
+/// full (`VICTORY_EVICT_LESS=1`), so that a slot shows the texture's
+/// smaller levels instead of waiting with nothing.
+#[cfg(windows)]
+pub(crate) fn shrinking(on: bool) {
+    SHRINK.set(on);
+}
+
+/// `VICTORY_EVICT_LESS_SIZE` (texels, default 256): the longest side of a
+/// small host copy's first level ([`shrinking`]).
+#[cfg(windows)]
+fn small_side() -> u64 {
+    static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIDE.get_or_init(|| {
+        std::env::var("VICTORY_EVICT_LESS_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(256u64)
+            .clamp(16, 4096)
+    })
+}
+
+/// Levels a small host copy of a texture described by `desc` leaves off on
+/// top of the `skip` it leaves off anyway ([`mip_skip`]): enough that its
+/// first level is at most [`small_side`] texels on its longer side, with one
+/// level at least left and whole blocks at the new first level. 0 for
+/// textures that are not 2D, not filled by the title, multisampled, or
+/// small already. As [`mip_skip`]'s: a shader reading texels by
+/// coordinates reads the smaller level; copies to or from it are dropped.
+#[cfg(windows)]
+fn shrink_levels(desc: &ResourceDesc, skip: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if desc.dimension != TEXTURE_2D || !fills(desc) || desc.sample_count > 1 {
+        return 0;
+    }
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let full = 64 - w.max(h).leading_zeros();
+    let levels = if desc.mip_levels == 0 { full } else { u32::from(desc.mip_levels) };
+    let Some((_, texels)) = element(desc.format) else {
+        return 0;
+    };
+    let mut extra = 0;
+    while (w.max(h) >> (skip + extra)) > small_side() && skip + extra + 1 < levels {
+        extra += 1;
+    }
+    // Whole blocks at the new first level.
+    while extra > 0 && {
+        let unit = texels << (skip + extra);
+        w % unit != 0 || h % unit != 0
+    } {
+        extra -= 1;
+    }
+    extra
+}
+
+/// For the texture pass while the card is full (`VICTORY_EVICT_LESS=1`):
+/// the bytes of the card to free to be back under the low mark (the low
+/// of `VICTORY_VRAM_HYSTERESIS`, else 85 % of the budget), at least 64 MiB
+/// while the PC is short of memory; and whether small host copies may
+/// still be made: under `VICTORY_EVICT_LESS_MAX` percent (default 95) of
+/// the budget and the PC not short of memory.
+#[cfg(windows)]
+pub(crate) fn room_need(memory: Option<[u64; 4]>) -> (u64, bool) {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("VICTORY_EVICT_LESS_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(95u64)
+            .clamp(50, 99)
+    });
+    let short = crate::host::memory_short();
+    let floor = if short { 64 << 20 } else { 0 };
+    match memory {
+        Some([budget, used, ..]) => {
+            let low = hysteresis().map_or(85, |(_, low)| low);
+            let need = used.saturating_sub(budget / 100 * low).max(floor);
+            (need, !short && used < budget / 100 * max)
+        }
+        None => (256 << 20, false),
+    }
+}
+
+/// Of each title texture of `these` that still is one and has a host copy
+/// (without counting this as a use of it): when that copy was last asked
+/// for (`crate::host::moment`), its bytes, the levels it leaves off for
+/// being small ([`shrinking`]), and the host texture (its address, to
+/// tell it is the copy a slot holds).
+#[cfg(windows)]
+pub(crate) fn host_copy_info(these: &[usize]) -> Vec<Option<(u64, u64, u32, usize)>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let all = textures();
+    these
+        .iter()
+        .map(|&at| {
+            if !all.contains(&at) {
+                return None;
+            }
+            // SAFETY: a texture leaves the table before it is freed, under
+            // the lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            made.as_ref().map(|(host, _)| {
+                (r.host.used.load(Relaxed), host.bytes, r.host.shrunk.load(Relaxed), host.texture.as_raw() as usize)
+            })
+        })
+        .collect()
 }
 
 /// Lets go of the host copies of textures the title fills that nothing
@@ -1747,7 +1903,7 @@ pub(crate) fn skipped_mips(this: This) -> u32 {
     if r.host.full.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
-    mip_skip(&r.desc)
+    mip_skip(&r.desc) + r.host.shrunk.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Levels left off the top of a host texture `host_width` wide made for a
@@ -1756,11 +1912,13 @@ pub(crate) fn skipped_mips(this: This) -> u32 {
 /// size ([`loading_full_frame`]) still matches that copy.
 #[cfg(windows)]
 pub(crate) fn skip_for(desc: &ResourceDesc, host_width: u64) -> u32 {
-    if host_width >= desc.width {
-        0
-    } else {
-        mip_skip(desc)
+    // Full size, cut by [`mip_skip`], or also made small ([`shrinking`]):
+    // the levels between the title's width and the copy's.
+    let mut n = 0;
+    while n < 16 && (desc.width >> n) > host_width.max(1) {
+        n += 1;
     }
+    n
 }
 
 /// `VICTORY_LOADING_FULL`: how many host copies cut by [`mip_skip`] may be
@@ -1907,6 +2065,36 @@ pub(crate) fn loading_full_frame(ended: u64, loading: bool) {
     );
 }
 
+/// Of title texture `this`: its dimension (2 1D, 3 2D, 4 3D), slices,
+/// format and samples; `None` for buffers.
+#[cfg(windows)]
+pub(crate) fn texture_shape(this: This) -> Option<(u32, u16, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    (d.dimension != BUFFER).then_some((d.dimension, d.depth_or_array_size, d.format, d.sample_count))
+}
+
+/// [`texture_shape`] of a texture placed with the resource description
+/// `desc` (as words).
+#[cfg(windows)]
+pub(crate) fn placed_shape(desc: &[u32; 14]) -> Option<(u32, u16, u32, u32)> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.dimension != BUFFER).then_some((d.dimension, d.depth_or_array_size, d.format, d.sample_count))
+}
+
+/// Levels the host copy of title texture `this` leaves off for being small
+/// (`shrinking`), beyond [`mip_skip`]'s.
+#[cfg(windows)]
+pub(crate) fn shrunk_levels(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this).host.shrunk.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The host subresource of title texture `this`'s subresource `sub`
 /// (level plus levels times layer, as the title counts them), for a host
 /// copy that leaves levels off ([`mip_skip`]): `None` for a level it left
@@ -1959,8 +2147,9 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
-    // A loading screen's picture keeps every level ([`loading_full_frame`]).
-    let skip = if full { 0 } else { mip_skip(desc) };
+    // A loading screen's picture keeps every level ([`loading_full_frame`]);
+    // otherwise also the levels a small copy leaves off ([`small_extra`]).
+    let skip = if full { 0 } else { mip_skip(desc) + EXTRA.get() };
     if skip > 0 {
         d.width >>= skip;
         d.height >>= skip;
@@ -2050,6 +2239,10 @@ fn host_texture(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // What the card renders to or writes stays on it first.
+        if d.flags & (TARGET | DEPTH | UNORDERED) != 0 {
+            crate::host::residency_high(t);
+        }
     }
     texture
 }
@@ -2126,6 +2319,7 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             full: std::sync::atomic::AtomicBool::new(false),
+            shrunk: std::sync::atomic::AtomicU32::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2633,6 +2827,25 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// Small copies (`VICTORY_EVICT_LESS`): the first level at most 256
+    /// texels on its longer side, one level left at least, whole blocks.
+    #[test]
+    fn small_copies_keep_their_smaller_levels() {
+        // R8G8B8A8_UNORM (28), BC1 (71: 4x4 blocks).
+        assert_eq!(shrink_levels(&texture(2048, 2048, 28, 12), 0), 3);
+        assert_eq!(shrink_levels(&texture(2048, 2048, 28, 12), 2), 1);
+        assert_eq!(shrink_levels(&texture(256, 256, 28, 9), 0), 0);
+        assert_eq!(shrink_levels(&texture(4096, 1024, 71, 13), 0), 4);
+        // Two levels only: one stays.
+        assert_eq!(shrink_levels(&texture(2048, 2048, 28, 2), 0), 1);
+        // Whole blocks: 500 texels are, 250 are not.
+        assert_eq!(shrink_levels(&texture(1000, 1000, 71, 10), 0), 1);
+        assert_eq!(shrink_levels(&texture(1004, 1004, 71, 10), 0), 0);
+        let mut target = texture(2048, 2048, 28, 12);
+        target.flags = 1;
+        assert_eq!(shrink_levels(&target, 0), 0);
     }
 
     fn heap(size: u64) -> This {
