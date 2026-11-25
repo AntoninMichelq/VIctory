@@ -1385,6 +1385,20 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// Makes title slot `index` (handle `handle`) again with views that
+    /// sample no level more detailed than `level` (0: all levels), for a
+    /// texture streaming in that was uploaded in part
+    /// (`crate::texture::first_whole_level`).
+    pub(crate) fn remake_from_level(&self, index: u32, handle: u64, level: u32) -> Option<View> {
+        if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *key = 0;
+        }
+        LEAST_LEVEL.set(level);
+        let view = self.mirror(index, handle, true);
+        LEAST_LEVEL.set(0);
+        view
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1501,6 +1515,27 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+std::thread_local! {
+    /// The most detailed level views made on this thread may sample
+    /// ([`HostHeap::remake_from_level`]); 0: any.
+    static LEAST_LEVEL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Raises a texture view's lowest level of detail to at least `level`.
+fn least_level(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, level: f32) {
+    // SAFETY: the union member the view's dimension names.
+    unsafe {
+        let clamp = match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => &mut desc.Anonymous.Texture2D.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => &mut desc.Anonymous.Texture2DArray.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBE => &mut desc.Anonymous.TextureCube.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => &mut desc.Anonymous.TextureCubeArray.ResourceMinLODClamp,
+            _ => return,
+        };
+        *clamp = clamp.max(level);
+    }
 }
 
 /// Moves the levels a texture view names up by `skip`, for a host copy
@@ -2077,6 +2112,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     && let Some(d) = desc.as_mut()
                 {
                     skip_levels(d, skip);
+                }
+                // A texture streaming in, uploaded in part: no level above
+                // the first one all there ([`HostHeap::remake_from_level`]).
+                let least = LEAST_LEVEL.get();
+                if least > skip
+                    && let Some(d) = desc.as_mut()
+                {
+                    least_level(d, (least - skip) as f32);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;

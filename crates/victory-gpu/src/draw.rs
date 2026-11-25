@@ -374,6 +374,23 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Slots given up for lack of room, since the start.
 pub(crate) static HEAP_TEXTURES_EVICTED: AtomicU64 = AtomicU64::new(0);
+/// Slots made again with a lowest level of detail (a texture uploaded in
+/// part) or without it again, since the start ([`partly_clamp`]).
+pub(crate) static HEAP_TEXTURES_CLAMPED: AtomicU64 = AtomicU64::new(0);
+/// Title slots whose views sample no level above the first one all there,
+/// by slot: that level.
+static PARTLY_CLAMPED: std::sync::Mutex<std::collections::BTreeMap<u32, u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `VICTORY_PARTLY_CLAMP` (on; `=0` off): a texture streaming in that was
+/// uploaded in part is sampled only from its first level all there
+/// (`crate::texture::first_whole_level`), not from levels uploaded from
+/// unmapped memory (zeros). About 1,700 slots stayed uploaded in part in
+/// the common room, where characters and posters drew black and chrome.
+fn partly_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTLY_CLAMP").is_none_or(|v| v != "0"))
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1809,6 +1826,32 @@ impl State {
             // yet, makes it anew. (Kept for those until now: every partly
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
+            // Uploaded in part: the levels not there yet are not sampled
+            // (they read zeros); all of them again once it is whole.
+            if partly_clamp() {
+                let least = if partly.is_some() { crate::texture::first_whole_level(resource).unwrap_or(0) } else { 0 };
+                let mut clamped = PARTLY_CLAMPED.lock().unwrap_or_else(|e| e.into_inner());
+                let before = clamped.get(&index).copied().unwrap_or(0);
+                if least != before {
+                    if least == 0 {
+                        clamped.remove(&index);
+                    } else {
+                        clamped.insert(index, least);
+                    }
+                    drop(clamped);
+                    if let Some(handle) = heap.handle(index) {
+                        host.remake_from_level(index, handle, least);
+                        let n = HEAP_TEXTURES_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::info!(
+                                remade = n,
+                                level = least,
+                                "texture slots uploaded in part remade to sample only the levels there (VICTORY_PARTLY_CLAMP=0 turns this off)"
+                            );
+                        }
+                    }
+                }
+            }
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
