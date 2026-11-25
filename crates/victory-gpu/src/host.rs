@@ -6594,7 +6594,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into our own memory: with `VICTORY_FAST_TITLE_COPY=1`, without the
+    // kernel. Into title memory, always the kernel's (our guards of title
+    // memory take writes there as the title's).
+    let whole = if title_dst { read(src, dst, len) } else { read_ours(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6674,7 +6677,170 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_ours(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// `VICTORY_FAST_TITLE_COPY=1` (off by default): title memory is read into
+/// our own memory by a plain `rep movsb` in this process ([`fast_copy`]),
+/// not through the kernel (`ReadProcessMemory`): a fault in it (a page not
+/// there, a guard page) makes it fail as the kernel's copy fails. After
+/// upstream PR #2349 (dcb4ac34, 78dced06): the refreshes of host copies
+/// read 110-160 MB a frame through the kernel, 36-46 ms a frame (runs of
+/// 2026-11-25), the frame line's "copies".
+fn fast_title_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_COPY").is_some_and(|v| v == "1");
+        if on {
+            install_copy_recovery();
+            tracing::info!("VICTORY_FAST_TITLE_COPY=1: title memory read into host copies without the kernel");
+        }
+        on
+    })
+}
+
+/// [`read`] into memory of ours (`dst` is never title memory): with
+/// [`fast_title_copy`], without the kernel when the ranges do not overlap.
+fn read_ours(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if len > 0 && fast_title_copy() {
+        let (s, d) = (src as usize, dst as usize);
+        let apart = s.checked_add(len).is_some_and(|e| e <= d) || d.checked_add(len).is_some_and(|e| e <= s);
+        if apart {
+            // SAFETY: `dst` is `len` bytes of our writable memory (the
+            // callers' contract); a fault reading `src` is taken by
+            // `install_copy_recovery`'s handler, which makes the copy
+            // return 0.
+            return unsafe { fast_copy(dst, src, len) } != 0;
+        }
+    }
+    read(src, dst, len)
+}
+
+// A leaf that uses no stack, so it needs no unwind information (a stack
+// walker takes the return address at `rsp`): the callee-saved rdi and rsi
+// wait in the volatile r10 and r11. Windows x64: rcx = dst, rdx = src,
+// r8 = len. Returns 1, or 0 through `victory_fast_copy_fault` when a fault
+// inside `rep movsb` was redirected there.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl victory_fast_copy",
+    ".globl victory_fast_copy_start",
+    ".globl victory_fast_copy_end",
+    ".globl victory_fast_copy_fault",
+    "victory_fast_copy:",
+    "mov r10, rdi",
+    "mov r11, rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_fast_copy_start:",
+    "rep movsb",
+    "victory_fast_copy_end:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "mov eax, 1",
+    "ret",
+    "victory_fast_copy_fault:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    #[link_name = "victory_fast_copy"]
+    fn fast_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+    static victory_fast_copy_start: u8;
+    static victory_fast_copy_end: u8;
+    static victory_fast_copy_fault: u8;
+}
+
+/// Registers, once and ahead of every other handler, the handler that makes
+/// a fault inside [`fast_copy`]'s `rep movsb` fail the copy (whatever the
+/// fault, but for a breakpoint or a single step): its `Rip` goes to the
+/// return of 0. Any other exception goes on to the other handlers.
+#[cfg(target_arch = "x86_64")]
+fn install_copy_recovery() {
+    use windows_sys::Win32::Foundation::{EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched and its
+        // context, ours to change.
+        let (r, ctx) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        if r.ExceptionCode == EXCEPTION_BREAKPOINT as NTSTATUS || r.ExceptionCode == EXCEPTION_SINGLE_STEP as NTSTATUS {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rip = ctx.Rip as usize;
+        let start = (&raw const victory_fast_copy_start) as usize;
+        let end = (&raw const victory_fast_copy_end) as usize;
+        if rip >= start && rip < end {
+            ctx.Rip = (&raw const victory_fast_copy_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the handler changes only the context of faults inside our copy.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(on_fault));
+    });
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_copy_recovery() {}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fast_copy_tests {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        VirtualProtect,
+    };
+
+    fn copy(dst: &mut [u8], src: *const u8) -> bool {
+        super::install_copy_recovery();
+        // SAFETY: `dst` is ours; a fault reading `src` fails the copy.
+        unsafe { super::fast_copy(dst.as_mut_ptr(), src, dst.len()) != 0 }
+    }
+
+    /// Copies what is there; a page not readable (no access, a guard page)
+    /// fails the copy instead of ending the process.
+    #[test]
+    fn the_fast_copy_fails_where_the_kernel_copy_would() {
+        // SAFETY: a fresh allocation of three pages, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: the first page is ours.
+        unsafe { std::ptr::write_bytes(base, 0x5a, 4096) };
+        let mut old = 0;
+        // SAFETY: pages of our allocation.
+        unsafe {
+            assert_ne!(VirtualProtect(base.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+            assert_ne!(VirtualProtect(base.add(8192).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+        }
+        let mut buf = vec![0u8; 4096];
+        assert!(copy(&mut buf, base));
+        assert!(buf.iter().all(|&b| b == 0x5a));
+        // SAFETY: pointers into our allocation.
+        assert!(!copy(&mut buf, unsafe { base.add(4096) }), "a page with no access fails the copy");
+        assert!(!copy(&mut buf[..16], unsafe { base.add(8192) }), "a guard page fails the copy");
+        assert!(!copy(&mut buf, unsafe { base.add(2048) }), "a copy running into a page with no access fails");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// The copy is a leaf that touches no stack (no unwind information).
+    #[test]
+    fn the_fast_copy_uses_no_stack() {
+        // SAFETY: the function's own code, read up to its second `ret`.
+        let code = unsafe { std::slice::from_raw_parts(super::fast_copy as *const u8, 64) };
+        let end = code.iter().enumerate().filter(|&(_, &b)| b == 0xc3).nth(1).map(|(i, _)| i).expect("two rets");
+        // push rdi, push rsi, pop rsi, pop rdi
+        assert!(code[..end].iter().all(|b| ![0x57, 0x56, 0x5e, 0x5f].contains(b)), "{:02x?}", &code[..=end]);
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
