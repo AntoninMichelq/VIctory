@@ -2584,6 +2584,9 @@ fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
             let Step::Refresh(reader, address, len) = step else {
                 continue;
             };
+            if !reader.plain() {
+                continue;
+            }
             let me = Arc::as_ptr(reader) as usize;
             let (rs, rl) = reader.span();
             let (lo, hi) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
@@ -2602,7 +2605,7 @@ fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
                 }
                 if them == me {
                     wanted.retain(|w| w.2 <= from || w.1 >= to);
-                } else {
+                } else if writer.plain() {
                     wanted.push((writer.clone(), from, to));
                 }
             }
@@ -5808,6 +5811,9 @@ impl HostList {
     /// ([`aliased_under_flights`] counts what is left).
     fn copy_aliased(&self, deferred: &mut Deferred, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         use std::sync::Arc;
+        if !shadow.plain() {
+            return;
+        }
         let me = Arc::as_ptr(shadow) as usize;
         let (start, size) = shadow.span();
         let (lo, hi) = (address.max(start as usize), (address + len).min((start + size) as usize));
@@ -5822,7 +5828,7 @@ impl HostList {
             let them = Arc::as_ptr(writer) as usize;
             let (ws, wl) = writer.span();
             let (from, to) = ((*a).max(lo).max(ws as usize), (*a + *l).min(hi).min((ws + wl) as usize));
-            if them == me || from >= to {
+            if them == me || from >= to || !writer.plain() {
                 continue;
             }
             // Once per write step and reader range.

@@ -2144,6 +2144,15 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the copy is a buffer of ours in the PC's memory: neither
+    /// title memory in place nor a copy with a side in the card's memory
+    /// (whose buffer's state our lists move). Only those take card copies
+    /// between host copies of the same memory (`host::copy_aliased`,
+    /// `host::cross_list_copies`).
+    pub(crate) fn plain(&self) -> bool {
+        self.place.is_none() && self.card.is_none()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
