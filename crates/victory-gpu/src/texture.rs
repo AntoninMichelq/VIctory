@@ -382,6 +382,10 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
+/// Levels filled from a smaller one while a texture streams in
+/// (`Staging::fill_missing_levels`).
+pub(crate) static FILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 impl Drop for Staging {
@@ -799,6 +803,76 @@ impl Staging {
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
+            }
+        }
+        self.fill_missing_levels();
+    }
+
+    /// A texture still streaming in has its smaller levels first (they lie
+    /// at the start of its memory): the larger ones read as zeros until
+    /// their pages arrive. Sampled, the zeros came out black, and only
+    /// triangle edges (whose wide derivatives pick a smaller level) showed
+    /// the texture: a white wire net over black clothes and props. A level
+    /// that is all zeros under a level that is not takes the nearest
+    /// smaller level that is not, each element repeated (the next detile,
+    /// once its pages are there, writes its own texels).
+    /// `VICTORY_TEXTURE_FILL_LEVELS=0` turns it off.
+    fn fill_missing_levels(&self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL_LEVELS").is_none_or(|v| v != "0")) {
+            return;
+        }
+        let mips = self.mips as usize;
+        if mips < 2 || self.footprints.len() % mips != 0 {
+            return;
+        }
+        let n = self.layout.desc.element_bytes as usize;
+        for slice in 0..self.footprints.len() / mips {
+            // (offset, row pitch, width and height in elements) of each level.
+            let levels: Vec<(usize, usize, usize, usize)> = (0..mips)
+                .filter_map(|k| {
+                    let i = slice * mips + k;
+                    let f = self.footprints[i].Footprint;
+                    let m = self.layout.mips.get(k + self.skip as usize)?;
+                    (f.Depth == 1).then_some((
+                        self.footprints[i].Offset as usize,
+                        f.RowPitch as usize,
+                        m.width as usize,
+                        m.height as usize,
+                    ))
+                })
+                .collect();
+            if levels.len() != mips {
+                return;
+            }
+            // SAFETY: each level's rows lie in its part of the mapped
+            // staging buffer (`footprints`, `rows`).
+            let row = |k: usize, y: usize| unsafe {
+                let (offset, pitch, w, _) = levels[k];
+                std::slice::from_raw_parts_mut(self.data.add(offset + y * pitch), w * n)
+            };
+            let zero: Vec<bool> = (0..mips)
+                .map(|k| (0..levels[k].3).all(|y| row(k, y).iter().all(|&b| b == 0)))
+                .collect();
+            for k in 0..mips {
+                if !zero[k] {
+                    continue;
+                }
+                let Some(d) = (k + 1..mips).find(|&j| !zero[j]).map(|j| j - k) else {
+                    break;
+                };
+                let (_, _, w, h) = levels[k];
+                let (_, _, sw, sh) = levels[k + d];
+                for y in 0..h {
+                    let sy = (y >> d).min(sh - 1);
+                    let from = row(k + d, sy).to_vec();
+                    let to = row(k, y);
+                    for x in 0..w {
+                        let sx = (x >> d).min(sw - 1);
+                        to[x * n..][..n].copy_from_slice(&from[sx * n..][..n]);
+                    }
+                }
+                FILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
