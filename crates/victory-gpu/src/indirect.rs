@@ -36,7 +36,10 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: settled later
+    // (`VICTORY_CLAMP_BATCH`): nothing is charged here; a 16-byte head
+    // (active records, kind, stride, records) precedes the records, and
+    // [`SETTLE`] charges the list's clamps in their order once.
     uint has_count;
     uint count_offset;
 };
@@ -54,12 +57,16 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool later = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+    if (later && id.x == 0) {
+        dst_args.Store4(0, uint4(eff_count, kind, stride, records));
+    }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = (later ? 16u : 0u) + id.x * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -92,15 +99,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        budget.InterlockedMax(4, g.x);
+        budget.InterlockedAdd(8, min(g.x, 1u << 24));
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
     bool over = false;
-    if (cost > 0) {
+    if (cost > 0 && !later) {
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
@@ -133,6 +139,93 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// The budget of a list's clamps recorded without waits between them
+/// (`VICTORY_CLAMP_BATCH`), charged once after all of them ran: in the
+/// order of the draws, record after record, as when each clamp waited for
+/// the one before (`VICTORY_HOIST_CLAMPS=7`), so the records past the
+/// budget are the same from frame to frame. `heads` holds the offset in
+/// `chunk` of each clamp's head ([`SOURCE`], bit 2), in the draws' order.
+/// The cost of a record is read back from its clamped words.
+const SETTLE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0)"
+cbuffer Settle : register(b0) {
+    uint clamps;
+};
+ByteAddressBuffer heads : register(t0);
+RWByteAddressBuffer chunk : register(u0);
+static const uint BUDGET = 1u << 27;
+static const uint WIDE = 1024;
+groupshared uint scan[WIDE];
+groupshared uint carry;
+// Both at most BUDGET: their sum, at most BUDGET.
+uint plus(uint a, uint b) {
+    return (b >= BUDGET - a) ? BUDGET : (a + b);
+}
+uint cost_at(uint at, uint kind) {
+    if (kind <= 1) {
+        uint2 d = chunk.Load2(at);
+        return min(d.x * d.y, BUDGET);
+    }
+    uint3 g = chunk.Load3(at);
+    return min(g.x * g.y * g.z * (kind == 2 ? 64u : 128u), BUDGET);
+}
+[RootSignature(RS)]
+[numthreads(1024, 1, 1)]
+void main(uint tid : SV_GroupIndex) {
+    if (tid == 0) carry = 0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint base = 0; base < clamps; base += WIDE) {
+        uint i = base + tid;
+        uint head = 0;
+        uint active = 0;
+        uint kind = 0;
+        uint stride = 0;
+        uint total = 0;
+        if (i < clamps) {
+            head = heads.Load(i * 4);
+            uint4 h = chunk.Load4(head);
+            active = min(h.x, h.w);
+            kind = h.y;
+            stride = h.z;
+            for (uint r = 0; r < active && total < BUDGET; r++) {
+                total = plus(total, cost_at(head + 16 + r * stride, kind));
+            }
+        }
+        scan[tid] = total;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint d = 1; d < WIDE; d <<= 1) {
+            uint add = tid >= d ? scan[tid - d] : 0;
+            GroupMemoryBarrierWithGroupSync();
+            scan[tid] = plus(scan[tid], add);
+            GroupMemoryBarrierWithGroupSync();
+        }
+        uint before = plus(carry, tid > 0 ? scan[tid - 1] : 0);
+        if (i < clamps && total > 0 && (before >= BUDGET || BUDGET - before < total)) {
+            // Past the budget, record after record, as the clamps charged it.
+            uint run = before;
+            for (uint r = 0; r < active; r++) {
+                uint at = head + 16 + r * stride;
+                uint c = cost_at(at, kind);
+                if (c == 0) continue;
+                if (run >= BUDGET || BUDGET - run < c) {
+                    run = BUDGET;
+                    if (kind <= 1) {
+                        chunk.Store2(at, uint2(0, 0));
+                    } else {
+                        chunk.Store3(at, uint3(0, 0, 0));
+                    }
+                } else {
+                    run += c;
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == WIDE - 1) carry = plus(carry, scan[WIDE - 1]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+"#;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -161,14 +254,36 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// The pass that charges the budget of clamps recorded without waits
+/// ([`SETTLE`]).
+fn settler() -> Option<&'static Clamp> {
+    static SETTLER: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    SETTLER
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match compile(device, SETTLE) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no clamp settling pass: clamps wait for each other");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    compile(device, SOURCE)
+}
+
+fn compile(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -418,6 +533,61 @@ pub(crate) fn hoist_mode() -> u8 {
     })
 }
 
+/// `VICTORY_CLAMP_BATCH=1` (with hoisted clamps): the clamps of a list
+/// wait for nothing between them and charge nothing; one pass after them
+/// ([`SETTLE`]) charges the list's budget in the draws' order, as mode 7
+/// does with a wait after each clamp. A frame has hundreds of clamps, each
+/// with its wait (the card drained between two of them) and a lock-step
+/// charge of the budget in host memory per record. Off (the default): as
+/// before.
+pub(crate) fn batching() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_CLAMP_BATCH").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "clamps of a list settled in one pass (VICTORY_CLAMP_BATCH)");
+        on && hoisting()
+    })
+}
+
+/// How many of a list's clamps one settling pass takes; the ones after
+/// wait for each other as before.
+pub(crate) const BATCH_MOST: usize = 4096;
+
+/// Records, in `l`, the pass that charges the budget of the `clamps` clamps
+/// recorded without waits into `chunk` (heads at the offsets `heads` holds),
+/// after a wait for them. False if the pass is not available.
+pub(crate) fn settle(l: &ID3D12GraphicsCommandList, chunk: &ID3D12Resource, heads: u64, clamps: u32) -> bool {
+    let Some(c) = settler() else {
+        return false;
+    };
+    settle_with(c, l, chunk, heads, clamps);
+    true
+}
+
+fn settle_with(c: &Clamp, l: &ID3D12GraphicsCommandList, chunk: &ID3D12Resource, heads: u64, clamps: u32) {
+    // SAFETY: an open list; our root signature and pipeline; live buffers
+    // (`chunk` writable, `heads` mapped host memory).
+    unsafe {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // A borrowed pointer; the barrier never releases it.
+                    pResource: std::mem::transmute_copy(chunk),
+                }),
+            },
+        };
+        l.ResourceBarrier(std::slice::from_ref(&barrier));
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstant(0, clamps, 0);
+        l.SetComputeRootShaderResourceView(1, heads);
+        l.SetComputeRootUnorderedAccessView(2, chunk.GetGPUVirtualAddress());
+        l.Dispatch(1, 1, 1);
+    }
+}
+
 /// Whether clamps of indirect draws go to a list before the one that draws.
 pub(crate) fn hoisting() -> bool {
     hoist_mode() != 0
@@ -455,9 +625,15 @@ pub(crate) fn bound_before(
     if !src_base.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
-    let (dst, at) = clamps.clamp_room(bytes)?;
+    // Settled later: a head before the records, no wait after.
+    let later = if batching() && settler().is_some() { clamps.clamp_room_later(bytes) } else { None };
+    let (dst, at) = match &later {
+        Some((dst, head)) => (dst.clone(), *head),
+        None => clamps.clamp_room(bytes)?,
+    };
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let has_count = has_count | if later.is_some() { 4 } else { 0 };
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
@@ -474,11 +650,11 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        if hoist_mode() == 7 {
+        if hoist_mode() == 7 && later.is_none() {
             l.ResourceBarrier(&[uav_barrier()]);
         }
     }
-    Some((dst, at))
+    Some((dst, if later.is_some() { at + 16 } else { at }))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
@@ -1272,6 +1448,138 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Clamps recorded without waits and settled in one pass
+    /// (`VICTORY_CLAMP_BATCH`) empty the same records as clamps that each
+    /// wait for the one before (`VICTORY_HOIST_CLAMPS=7`): in the draws'
+    /// order, record after record, the one that crosses the budget and all
+    /// after it; the other words untouched.
+    #[test]
+    fn warp_settled_clamps_charge_the_budget_in_order() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let settler = compile(&warp.device, SETTLE).expect("settle shader must compile on WARP");
+        const INDEXED: u32 = 1;
+        const MESH: u32 = 10;
+        // (kind, stride, records (index count or groups, instances), active)
+        type Spec = (u32, u32, &'static [(u32, u32)], u32);
+        let clamps: [Spec; 5] = [
+            (INDEXED, 20, &[(1 << 24, 4)], 1),
+            (MESH, 12, &[(3, 1)], 1),
+            (INDEXED, 24, &[(1 << 23, 4), (1 << 23, 4), (7, 1)], 3),
+            (INDEXED, 20, &[(9, 9), (1, 1)], 0),
+            (INDEXED, 20, &[(0, 5), (2, 2)], 2),
+        ];
+        let tag = |n: usize, r: usize, w: u32| 0xC0DE_0000 | (n as u32) << 8 | (r as u32) << 4 | w;
+        let src_size = 4096u64;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(src_size);
+        let (count_buf, count_ptr, _) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_heads_buf, heads_ptr, heads_gpu) = warp.shared_buffer(256);
+        let chunk = warp.default_uav(64 << 10);
+        let (readback, readback_ptr, _) = warp.shared_buffer(64 << 10);
+        // SAFETY: mapped buffers have sufficient capacity.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, src_size as usize);
+            (budget_ptr as *mut u32).write_volatile(0);
+            std::ptr::write_bytes(readback_ptr, 0xEE, 64 << 10);
+        }
+        let mut layout = Vec::new();
+        let (mut src_at, mut head) = (0u64, 0u64);
+        // SAFETY: an open list and live buffers.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &chunk,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        for (n, (kind, stride, records, active)) in clamps.iter().enumerate() {
+            let words = stride / 4;
+            for (r, (a, b)) in records.iter().enumerate() {
+                let at = src_at as usize + r * *stride as usize;
+                for w in 0..words {
+                    let value = match w {
+                        0 => *a,
+                        1 => *b,
+                        2 if *kind == MESH => 1,
+                        _ => tag(n, r, w),
+                    };
+                    // SAFETY: inside the mapped source.
+                    unsafe { (src_ptr.add(at + 4 * w as usize) as *mut u32).write_volatile(value) };
+                }
+            }
+            let len = u64::from(*stride) * records.len() as u64;
+            // SAFETY: the mapped count and heads words.
+            unsafe {
+                (count_ptr as *mut u32).add(n).write_volatile(*active);
+                (heads_ptr as *mut u32).add(n).write_volatile(head as u32);
+            }
+            let constants = [*kind, *stride, records.len() as u32, src_at as u32, 1 | 4, 4 * n as u32];
+            // SAFETY: an open list; our clamp; live buffers.
+            unsafe {
+                let l = &warp.list;
+                l.SetComputeRootSignature(&warp.clamp.root);
+                l.SetPipelineState(&warp.clamp.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_buf.GetGPUVirtualAddress());
+                l.SetComputeRootShaderResourceView(2, count_buf.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(3, chunk.GetGPUVirtualAddress() + head);
+                l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+                l.Dispatch((records.len() as u32).div_ceil(64), 1, 1);
+            }
+            layout.push(head + 16);
+            src_at += len.next_multiple_of(16);
+            head += len.next_multiple_of(16) + 16;
+        }
+        settle_with(&settler, &warp.list, &chunk, heads_gpu, clamps.len() as u32);
+        // SAFETY: an open list and live buffers.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &chunk,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback, 0, &chunk, 0, head);
+            warp.list.ResourceBarrier(&[transition(
+                &chunk,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        let word = |at: u64| -> u32 {
+            // SAFETY: GPU work completed; inside the readback.
+            unsafe { (readback_ptr.add(at as usize) as *const u32).read_volatile() }
+        };
+        // What survives: the first clamp (2^26); the mesh (384); the
+        // third's first record (2^25), its second crosses the budget; the
+        // fourth runs nothing; the last only its first record, which costs
+        // nothing.
+        let kept: [&[bool]; 5] = [&[true], &[true], &[true, false, false], &[], &[true, false]];
+        for (n, (kind, stride, records, active)) in clamps.iter().enumerate() {
+            let at = layout[n];
+            let head_words: Vec<u32> = (0..4).map(|w| word(at - 16 + 4 * w)).collect();
+            assert_eq!(head_words, vec![*active, *kind, *stride, records.len() as u32], "head of clamp {n}");
+            for (r, (a, b)) in records.iter().enumerate().take(*active as usize) {
+                let base = at + (r as u64) * u64::from(*stride);
+                let want = if kept[n][r] { (*a, *b) } else { (0, 0) };
+                assert_eq!((word(base), word(base + 4)), want, "clamp {n} record {r}");
+                for w in 2..stride / 4 {
+                    let got = word(base + 4 * u64::from(w));
+                    if *kind == MESH && w == 2 {
+                        assert_eq!(got, u32::from(kept[n][r]), "mesh z");
+                    } else {
+                        assert_eq!(got, tag(n, r, w), "clamp {n} record {r} word {w}");
+                    }
+                }
+            }
+        }
+        // SAFETY: GPU work completed.
+        let charged = unsafe { (budget_ptr as *const u32).read_volatile() };
+        assert_eq!(charged, 0, "settled clamps charge nothing as they clamp");
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
