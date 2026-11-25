@@ -365,8 +365,10 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// frames and avoids periodic 80k-slot full rescans while no buffer resource
 /// was released (`VICTORY_PLAN_REUSE=1`, off by default; read per frame so it
 /// can be toggled live).
+/// Live (`crate::live`).
 pub(crate) fn plan_reuse() -> bool {
-    std::env::var_os("VICTORY_PLAN_REUSE").is_some_and(|v| v == "1")
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_PLAN_REUSE", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Since the last frame-rate line (with `VICTORY_PLAN_REUSE=1`):

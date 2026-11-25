@@ -6923,7 +6923,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    let timed = crate::cpuframe::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6934,7 +6936,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    let timed = crate::cpuframe::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -7087,7 +7091,30 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update_all(&shadow, &ranges);
+        let timed = crate::cpuframe::start();
+        let total: usize = ranges.iter().map(|r| r.1 - r.0).sum();
+        match crate::cpuframe::refresh_split().filter(|&n| total > n) {
+            // In pieces, at once ([`crate::cpuframe::refresh_split`]): the
+            // ranges asked for (all of them, or their envelope without
+            // [`refresh_ranges`]) cut, not the envelope of the ranges.
+            Some(n) => {
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = ranges
+                    .iter()
+                    .flat_map(|&(from, to)| crate::cpuframe::cut(from, to, n))
+                    .map(|(a, b)| {
+                        let shadow = shadow.clone();
+                        Box::new(move || Self::update(&shadow, a, b)) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                let before = PREPARING[0].load(Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            }
+            None => Self::update_all(&shadow, &ranges),
+        }
+        crate::cpuframe::done(crate::cpuframe::Work::OneRefresh, timed, total);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -7144,9 +7171,28 @@ impl Batch {
                 .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
+            crate::cpuframe::done(crate::cpuframe::Work::AskAhead, crate::cpuframe::stats().then_some(started), 0);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let split = crate::cpuframe::refresh_split();
+        if let Some(n) = split.filter(|_| wide_refresh()) {
+            // Each range asked for cut into pieces, one piece a job.
+            self.refreshes = self
+                .refreshes
+                .drain(..)
+                .flat_map(|(shadow, ranges)| {
+                    ranges
+                        .into_iter()
+                        .flat_map(|(from, to)| crate::cpuframe::cut(from, to, n))
+                        .map(|piece| (shadow.clone(), vec![piece]))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
+        let timed = crate::cpuframe::start();
+        let refreshed: usize = self.refreshes.iter().flat_map(|r| r.1.iter()).map(|r| r.1 - r.0).sum();
+        let wide = wide_refresh() && (self.refreshes.len() >= 4 || split.is_some() && self.refreshes.len() >= 2);
+        if wide {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -7165,6 +7211,8 @@ impl Batch {
                 Self::update_all(&shadow, &ranges);
             }
         }
+        let work = if wide { crate::cpuframe::Work::WideRefresh } else { crate::cpuframe::Work::OneRefresh };
+        crate::cpuframe::done(work, timed, refreshed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -7180,9 +7228,11 @@ impl Batch {
 /// ranges a frame, 33 ms (run cpuframe, 2026-11-26 00:19), for some 130 MB
 /// actually copied. A page between two ranges is left as it is: no list of
 /// the submission reads it, and it is still stale for the next that does.
+/// Live (`crate::live`): a copy's ranges kept apart are all brought up
+/// to date either way.
 fn refresh_ranges() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_RANGES").is_some_and(|v| v == "1"))
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_REFRESH_RANGES", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Adds `[from, to)` to `ranges` (disjoint, in order): joined with those it
@@ -7375,16 +7425,24 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// upstream PR #2349 (dcb4ac34, 78dced06): the refreshes of host copies
 /// read 110-160 MB a frame through the kernel, 36-46 ms a frame (runs of
 /// 2026-11-25), the frame line's "copies".
+/// Live (`crate::live`): the fault recovery is installed the first time
+/// it is on.
 fn fast_title_copy() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_COPY").is_some_and(|v| v == "1");
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FAST_TITLE_COPY", |v, _| {
+        let on = cfg!(target_arch = "x86_64") && v.is_some_and(|v| v.trim() == "1");
         if on {
-            install_copy_recovery();
+            copy_recovery();
             tracing::info!("VICTORY_FAST_TITLE_COPY=1: title memory read into host copies without the kernel");
         }
-        on
-    })
+        u64::from(on)
+    }) == 1
+}
+
+/// [`install_copy_recovery`], once.
+fn copy_recovery() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(install_copy_recovery);
 }
 
 /// [`read`] into memory of ours (`dst` is never title memory): with
@@ -7606,15 +7664,16 @@ mod gpu_upload_check {
 /// and written again). Hundreds of pieces a frame each cost a kernel call
 /// (copy 162 of run cumul2: 206 pieces a frame).
 pub(crate) fn write_title(dst: *mut u8, src: *const u8, len: usize) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    let fast = *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_FAST_TITLE_WRITE").is_some_and(|v| v == "1");
+    // Live (`crate::live`).
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    let fast = ON.get("VICTORY_FAST_TITLE_WRITE", |v, _| {
+        let on = cfg!(target_arch = "x86_64") && v.is_some_and(|v| v.trim() == "1");
         if on {
-            install_copy_recovery();
+            copy_recovery();
             tracing::info!("VICTORY_FAST_TITLE_WRITE=1: what shaders wrote goes back into title memory without the kernel");
         }
-        on
-    });
+        u64::from(on)
+    }) == 1;
     #[cfg(target_arch = "x86_64")]
     if fast && len > 0 {
         let (s, d) = (src as usize, dst as usize);
@@ -7918,6 +7977,8 @@ impl Meter {
                 );
             }
         }
+        // Where the CPU's work around submissions goes (`VICTORY_CPU_STATS`).
+        crate::cpuframe::log(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
