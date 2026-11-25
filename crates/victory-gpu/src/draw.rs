@@ -288,6 +288,8 @@ fn mesh_kept(pipeline: usize) -> bool {
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
+/// Draws the title asked for, run or dropped (a pipeline not made yet).
+static ASKED: AtomicU64 = AtomicU64::new(0);
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
@@ -1875,6 +1877,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         let before = DRAWN.load(Ordering::Relaxed);
+        ASKED.fetch_add(1, Ordering::Relaxed);
         self.dispatch_mesh_inner(list, x);
         #[cfg(feature = "diagnostics")]
         self.trace_op("mesh", &[x.into()], DRAWN.load(Ordering::Relaxed) != before);
@@ -2231,6 +2234,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         let before = DRAWN.load(Ordering::Relaxed);
+        ASKED.fetch_add(1, Ordering::Relaxed);
         self.draw_inner(list, vertices, instances, first, first_instance);
         #[cfg(feature = "diagnostics")]
         self.trace_op(
@@ -2355,6 +2359,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         let before = DRAWN.load(Ordering::Relaxed);
+        ASKED.fetch_add(1, Ordering::Relaxed);
         self.draw_indexed_inner(list, indices, instances, first, base, first_instance);
         #[cfg(feature = "diagnostics")]
         self.trace_op(
@@ -2878,7 +2883,10 @@ fn loading_frame(frame: u64) -> bool {
             .unwrap_or(400)
     });
     if SEEN.swap(frame, Ordering::Relaxed) != frame {
-        let now = drawn();
+        // Draws asked for, not run: a world frame whose pipelines are
+        // still being made drops most of its draws and is no loading one
+        // (cold run bd5b339 A kept starting every pipeline in the world).
+        let now = ASKED.load(Ordering::Relaxed);
         let before = AT_START.swap(now, Ordering::Relaxed);
         LAST.store(now.saturating_sub(before), Ordering::Relaxed);
     }
