@@ -48,10 +48,11 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bit 2: `budget` is this clamp's
-    // entry in a ledger (`LEDGER`): the cost is added to the entry's first
-    // word (saturating), the active records counted in its second, and no
-    // record is emptied here; `SETTLE` decides afterwards which clamps run.
+    // run is left empty and costs nothing. Bits 2 and 3: a flat draw (see
+    // below). Bit 4: `budget` is this clamp's entry in a ledger (`LEDGER`):
+    // the cost is added to the entry's first word (saturating), the active
+    // records counted in its second, and no record is emptied here;
+    // `SETTLE` decides afterwards which clamps run.
     uint has_count;
     uint count_offset;
 };
@@ -87,7 +88,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
-    bool ledger = (has_count & 4u) != 0;
+    bool ledger = (has_count & 16u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -533,6 +534,13 @@ fn record_clamp_as(
     record_clamp_flags(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), u32::from(ahead) << 1)
 }
 
+/// The clamp shader's flag for a clamp charged to a ledger entry (modes 8
+/// and 9). Its own bit: the merge of the ledger (7068acc) with the flat
+/// draws (142aa83) gave both bit 2, so every ledger clamp of a draw ran as
+/// a flat draw (six indices per instance, from index, vertex and instance
+/// 0): characters' bodies went missing under a floating head.
+const LEDGER_BIT: u32 = 16;
+
 /// The instances a flat draw ([`bound_flat`]) holds at most.
 pub(crate) const FLAT_MOST: u32 = 32768;
 
@@ -550,7 +558,7 @@ pub(crate) fn bound_flat(list: &HostList, src: (&ID3D12Resource, u64), stride: u
 }
 
 /// [`record_clamp_as`] with the shader's flag bits: 2 ahead, 4 flat, 8
-/// flat with three indices per instance.
+/// flat with three indices per instance ([`LEDGER_BIT`] is the ledger's).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_flags(
     c: &Clamp,
@@ -749,8 +757,8 @@ pub(crate) fn bound_before(
         // SAFETY: live buffers.
         let (dst_base, ledger_base) = unsafe { (dst.GetGPUVirtualAddress(), ledger.GetGPUVirtualAddress()) };
         let key = (src_gpu, if has_count == 0 { 0 } else { count_gpu }, kind, stride, dst_base, ledger_base);
-        // Bit 2: charged to the ledger entry, its active records noted there.
-        let job = [args_offset, records, has_count | 4, count_offset, at as u32, i * 16, 0, 0];
+        // Charged to the ledger entry, its active records noted there.
+        let job = [args_offset, records, has_count | LEDGER_BIT, count_offset, at as u32, i * 16, 0, 0];
         let mut pending = clamps.clamp_batch();
         if pending.as_ref().is_some_and(|b| b.key != key || b.jobs.len() >= BATCH_MOST) {
             flush(clamps, pso, pending.take());
@@ -773,7 +781,7 @@ pub(crate) fn bound_before(
         // SAFETY: a live buffer.
         Some((ledger, i)) => (
             unsafe { ledger.GetGPUVirtualAddress() } + u64::from(*i) * 16,
-            has_count | 4,
+            has_count | LEDGER_BIT,
             Some((ledger.clone(), u64::from(*i) * 16 + 8)),
         ),
         None => (budget, has_count, None),
