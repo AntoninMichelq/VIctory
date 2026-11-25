@@ -21,13 +21,25 @@
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
+#ifdef BATCH
+// Clamps of one source, count buffer, kind and stride batched (mode 9):
+// one dispatch, a job per row of groups (`jobs`, 32 bytes each: arguments'
+// offset, records, has_count, count's offset, destination offset, ledger
+// entry offset), into one destination buffer and one ledger.
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0), UAV(u1)"
+cbuffer Run : register(b0) {
+    uint kind;
+    uint stride;
+};
+ByteAddressBuffer jobs : register(t2);
+#else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
@@ -43,6 +55,7 @@ cbuffer Record : register(b0) {
     uint has_count;
     uint count_offset;
 };
+#endif
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
@@ -57,6 +70,19 @@ static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
+#ifdef BATCH
+    uint4 job = jobs.Load4(id.y * 32);
+    uint2 job_at = jobs.Load2(id.y * 32 + 16);
+    uint args_offset = job.x;
+    uint records = job.y;
+    uint has_count = job.z;
+    uint count_offset = job.w;
+    uint dst_base = job_at.x;
+    uint entry = job_at.y;
+#else
+    uint dst_base = 0;
+    uint entry = 0;
+#endif
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool ledger = (has_count & 4u) != 0;
@@ -64,11 +90,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
     if (ledger && id.x == 0) {
-        budget.Store(4, eff_count);
+        budget.Store(entry + 4, eff_count);
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = dst_base + id.x * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -103,8 +129,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
         if (!ledger) {
-            budget.InterlockedMax(4, g.x, was);
-            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+            budget.InterlockedMax(entry + 4, g.x, was);
+            budget.InterlockedAdd(entry + 8, min(g.x, 1u << 24), was);
         }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
@@ -115,12 +141,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         // In a ledger, the clamp's whole cost, saturating past the budget.
         uint cap = ledger ? LEDGER_CAP : BUDGET;
         uint before;
-        budget.InterlockedOr(0, 0, before);
+        budget.InterlockedOr(entry, 0, before);
         [allow_uav_condition]
         while (before < cap) {
             uint next = (cap - before <= cost) ? cap : (before + cost);
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            budget.InterlockedCompareExchange(entry, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -160,12 +186,14 @@ cbuffer Entries : register(b0) {
 RWByteAddressBuffer ledger : register(u0);
 static const uint BUDGET = 1u << 27;
 static const uint CAP = 1u << 30;
-groupshared uint sums[1024];
+// One wave's worth: most runs hold a few clamps, and a large group is
+// slow to start and to walk for them.
+groupshared uint sums[64];
 [RootSignature(RS)]
-[numthreads(1024, 1, 1)]
+[numthreads(64, 1, 1)]
 void main(uint t : SV_GroupIndex) {
     uint carry = 0;
-    for (uint base = 0; base < entries; base += 1024) {
+    for (uint base = 0; base < entries; base += 64) {
         uint j = base + t;
         // (HLSL's ?: reads both sides: no load past the entries.)
         uint cost = 0;
@@ -174,7 +202,7 @@ void main(uint t : SV_GroupIndex) {
         }
         sums[t] = cost;
         GroupMemoryBarrierWithGroupSync();
-        for (uint d = 1; d < 1024; d <<= 1) {
+        for (uint d = 1; d < 64; d <<= 1) {
             uint v = 0;
             if (t >= d) {
                 v = sums[t - d];
@@ -189,7 +217,7 @@ void main(uint t : SV_GroupIndex) {
             ledger.Store(j * 16 + 8, (cost == 0 || upto <= BUDGET) ? active : 0);
             ledger.Store(j * 16, 0);
         }
-        uint whole = sums[1023];
+        uint whole = sums[63];
         GroupMemoryBarrierWithGroupSync();
         carry = min(carry + whole, CAP);
     }
@@ -199,6 +227,78 @@ void main(uint t : SV_GroupIndex) {
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+}
+
+/// Jobs a batch holds at most (rows of groups of one dispatch).
+const BATCH_MOST: usize = 4096;
+
+/// Hoisted clamps waiting to be recorded as one dispatch (mode 9): what
+/// they share (source, count buffer or 0, kind, stride, destination and
+/// ledger addresses), a row per clamp, and the most records of one.
+pub(crate) struct Batch {
+    key: (u64, u64, u32, u32, u64, u64),
+    jobs: Vec<[u32; 8]>,
+    most: u32,
+}
+
+fn batch_pipeline() -> Option<&'static Clamp> {
+    static BATCH_PSO: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    BATCH_PSO
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match compile_with(device, SOURCE, true) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched clamp: one dispatch per hoisted clamp");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Records `batch`, if any, in `clamps` as one dispatch.
+fn flush(clamps: &HostList, c: &Clamp, batch: Option<Batch>) {
+    let Some(b) = batch else {
+        return;
+    };
+    let bytes = b.jobs.len() * 32;
+    let Some((jobs_gpu, data)) = clamps.scratch(bytes as u64) else {
+        tracing::warn!(jobs = b.jobs.len(), "no room for a batch of clamps: their draws run nothing");
+        return;
+    };
+    // SAFETY: `bytes` of the list's mapped upload memory, ours until it runs.
+    unsafe { std::ptr::copy_nonoverlapping(b.jobs.as_ptr().cast::<u8>(), data, bytes) };
+    let (src, count, kind, stride, dst, ledger) = b.key;
+    let constants = [kind, stride];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; the source,
+    // count, destination and ledger buffers the clamps named (live while
+    // the list is), and the jobs just written.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src);
+        l.SetComputeRootShaderResourceView(2, if count == 0 { src } else { count });
+        l.SetComputeRootShaderResourceView(3, jobs_gpu);
+        l.SetComputeRootUnorderedAccessView(4, dst);
+        l.SetComputeRootUnorderedAccessView(5, ledger);
+        l.Dispatch(b.most.div_ceil(64), b.jobs.len() as u32, 1);
+    }
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(jobs = b.jobs.len(), most = b.most, "hoisted clamps batched into one dispatch");
+    }
+}
+
+/// Records the clamps still batched in `clamps` (before the list's clamps
+/// end).
+pub(crate) fn flush_batch(clamps: &HostList) {
+    let pending = clamps.clamp_batch().take();
+    if let Some(c) = batch_pipeline() {
+        flush(clamps, c, pending);
+    }
 }
 
 fn settle_pipeline() -> Option<&'static Clamp> {
@@ -218,7 +318,10 @@ fn settle_pipeline() -> Option<&'static Clamp> {
 }
 
 /// Entries a list's ledger holds (`LEDGER_BYTES` / 16).
-pub(crate) const LEDGER_ENTRIES: u32 = 1 << 16;
+/// Each list that ever held clamps keeps its ledger: 65,536 entries (1 MiB)
+/// cost 755 MB over the title's lists; a run with more clamps than this
+/// charges the budget in turn past them.
+pub(crate) const LEDGER_ENTRIES: u32 = 1 << 11;
 /// A list's ledger's size.
 pub(crate) const LEDGER_BYTES: u64 = LEDGER_ENTRIES as u64 * 16;
 
@@ -270,6 +373,14 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 }
 
 fn compile_for(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    compile_with(device, source, false)
+}
+
+fn compile_with(device: &ID3D12Device, source: &str, batch: bool) -> windows::core::Result<Clamp> {
+    let defines = [
+        D3D_SHADER_MACRO { Name: s!("BATCH"), Definition: s!("1") },
+        D3D_SHADER_MACRO::default(),
+    ];
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -278,7 +389,7 @@ fn compile_for(device: &ID3D12Device, source: &str) -> windows::core::Result<Cla
             source.as_ptr().cast(),
             source.len(),
             s!("clamp"),
-            None,
+            batch.then_some(defines.as_ptr()),
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -518,16 +629,20 @@ fn record_clamp_as(
 /// afterwards ([`settle`]) walks the entries in order and gives each run of
 /// draws its count (all its active records, or none past the budget). The
 /// default: a barrier between every two clamps cost 7.9 of 110.7 ms of
-/// card time a frame (3,756 clamps).
+/// card time a frame (3,756 clamps), and 8 only gained 1.3%. 9, the
+/// default: as 8, with the clamps of a run that read one source buffer
+/// (and one count buffer) with one kind and stride batched into one
+/// dispatch ([`Batch`]), as each dispatch of ours costs the card more than
+/// the few records it clamps.
 pub(crate) fn hoist_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let set = std::env::var("VICTORY_HOIST_CLAMPS")
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())
-            .filter(|n| matches!(n, 0 | 1 | 7 | 8))
-            .unwrap_or(8);
-        tracing::info!(mode = set, "clamps of indirect draws (VICTORY_HOIST_CLAMPS): 0 before each draw, 1/7/8 hoisted");
+            .filter(|n| matches!(n, 0 | 1 | 7 | 8 | 9))
+            .unwrap_or(9);
+        tracing::info!(mode = set, "clamps of indirect draws (VICTORY_HOIST_CLAMPS): 0 before each draw, 1/7/8/9 hoisted");
         set
     })
 }
@@ -574,13 +689,40 @@ pub(crate) fn bound_before(
     if !src_base.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
-    // Mode 8: the clamp's ledger entry, in place of the list's budget.
-    let entry = if hoist_mode() == 8 && settle_pipeline().is_some() {
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // Modes 8 and 9: the clamp's ledger entry, in place of the list's budget.
+    let entry = if hoist_mode() >= 8 && settle_pipeline().is_some() {
         clamps.clamp_entry()
     } else {
         None
     };
-    let (dst, at) = clamps.clamp_room(bytes)?;
+    // Mode 9: batched with the clamps before it, when the offsets fit.
+    if hoist_mode() == 9
+        && let Some((ledger, i)) = &entry
+        && src_gpu == src_base
+        && (has_count == 0 || count_gpu == count_base.unwrap_or(0))
+        && let Some(pso) = batch_pipeline()
+    {
+        // SAFETY: live buffers.
+        let (dst_base, ledger_base) = unsafe { (dst.GetGPUVirtualAddress(), ledger.GetGPUVirtualAddress()) };
+        let key = (src_gpu, if has_count == 0 { 0 } else { count_gpu }, kind, stride, dst_base, ledger_base);
+        let job = [args_offset, records, has_count, count_offset, at as u32, i * 16, 0, 0];
+        let mut pending = clamps.clamp_batch();
+        if pending.as_ref().is_some_and(|b| b.key != key || b.jobs.len() >= BATCH_MOST) {
+            flush(clamps, pso, pending.take());
+        }
+        let b = pending.get_or_insert_with(|| Batch { key, jobs: Vec::new(), most: 0 });
+        b.jobs.push(job);
+        b.most = b.most.max(records);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+        return Some((dst.clone(), at, Some((ledger.clone(), u64::from(*i) * 16 + 8))));
+    }
+    // Anything batched goes first: the clamps charge in order.
+    if let Some(pso) = batch_pipeline() {
+        let pending = clamps.clamp_batch().take();
+        flush(clamps, pso, pending);
+    }
     // SAFETY: live buffers.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let (budget, has_count, ran) = match &entry {
@@ -608,7 +750,7 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        if hoist_mode() == 7 || (hoist_mode() == 8 && ran.is_none()) {
+        if hoist_mode() == 7 || (hoist_mode() >= 8 && ran.is_none()) {
             l.ResourceBarrier(&[uav_barrier()]);
         }
     }

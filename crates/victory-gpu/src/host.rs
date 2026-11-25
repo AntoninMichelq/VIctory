@@ -886,6 +886,8 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it ([`HostList::clamp_room`]).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Hoisted clamps not yet recorded (`crate::indirect::Batch`).
+    clamp_batch: Mutex<Option<crate::indirect::Batch>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3455,6 +3457,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 clamp_chunks: Mutex::default(),
+                clamp_batch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5280,6 +5283,7 @@ impl HostList {
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             (chunks.used, chunks.at, chunks.barrier, chunks.entries) = (0, 0, false, 0);
+            *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6036,6 +6040,11 @@ impl HostList {
         Some((buffer, 0))
     }
 
+    /// The hoisted clamps of this list waiting to be recorded together.
+    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Batch>> {
+        self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A ledger entry for the next hoisted clamp, writable by shaders from
     /// here on in the list: the ledger and the entry. None once the ledger
     /// is full (that clamp then charges the list's budget in turn).
@@ -6067,6 +6076,7 @@ impl HostList {
     /// arguments by the lists after this one (which then closes); with
     /// ledger entries, which clamps' draws run is settled first.
     pub(crate) fn clamp_end(&self) {
+        crate::indirect::flush_batch(self);
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
         let entries = std::mem::take(&mut chunks.entries);
