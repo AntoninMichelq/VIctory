@@ -999,7 +999,7 @@ impl HostHeap {
         let grey = made
             .get(index as usize)
             .and_then(|&key| view_at(key as u32, (key >> 32) as u32))
-            .is_some_and(|view| grey_for(&view, self.cpu(index)));
+            .is_some_and(|view| evict_grey() && grey_for(&view, self.cpu(index)));
         if grey {
             if let Some(key) = made.get_mut(index as usize) {
                 *key = 0;
@@ -1458,7 +1458,7 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
-            if kept.is_none() && !self.sampler {
+            if kept.is_none() && !self.sampler && !(later && wait_grey() && grey_for(&view, self.cpu(index))) {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
@@ -2378,6 +2378,24 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Whether DXGI format `format` is read as integers (`_UINT`, `_SINT`).
+fn integer_format(format: u32) -> bool {
+    const UINT: [u32; 11] = [3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62];
+    const SINT: [u32; 9] = [4, 8, 14, 18, 32, 38, 43, 52, 64];
+    UINT.contains(&format) || SINT.contains(&format)
+}
+
+/// `VICTORY_WAIT_GREY` (on; `=0` off): a texture slot that waits for its host
+/// copy (the card had no room for it yet, or nothing used it yet) shows the
+/// grey stand-in ([`grey_for`]) rather than zeros. Every launch some textures
+/// wait ("the card has no room for more; they wait"), and which ones differs
+/// from run to run: zeros there drew mirror-like clothes, skin and floor
+/// (a roughness or colour of 0) on some launches and not on others.
+fn wait_grey() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_GREY").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_EVICT_GREY` (on; `=0` off): [`grey_for`].
 fn evict_grey() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2457,16 +2475,22 @@ fn grey_texture() -> Option<&'static ID3D12Resource> {
 /// cube, cube array) instead of a null view. Zeros drew characters as dark
 /// silhouettes with chrome streaks (black colour, normals of (-1, -1));
 /// mid-grey reads as a plain colour and a flat normal, alpha stays 0 as a
-/// null view's. False (nothing made) for other views or with
-/// `VICTORY_EVICT_GREY=0`.
+/// null view's. False (nothing made) for other views (buffers, integer
+/// textures, other dimensions). Callers ask `VICTORY_EVICT_GREY` (slots given
+/// up) or `VICTORY_WAIT_GREY` (slots waiting) first.
 fn grey_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    if !evict_grey() {
-        return false;
-    }
-    let View::Shader(r, Some(words)) = view else {
-        return false;
+    let words: [u32; 10] = match view {
+        View::Shader(r, Some(words)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => *words,
+        // A texture the title placed in its memory (streamed textures are).
+        View::Placed(false, resource, desc) if resource[0] != 1 => match desc[..10].try_into() {
+            Ok(words) => words,
+            Err(_) => return false,
+        },
+        _ => return false,
     };
-    if crate::resource::buffer_bytes(*r as crate::object::This).is_some() {
+    // An integer texture is read as numbers (indices, masks): those keep the
+    // null view's zeros.
+    if integer_format(crate::resource::pc_format(words[0])) {
         return false;
     }
     let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
