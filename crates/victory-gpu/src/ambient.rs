@@ -59,6 +59,14 @@ pub(crate) fn level() -> Option<f32> {
     (level >= 0.0).then_some(level)
 }
 
+/// `VICTORY_AMBIENT_MODE=floor`: what the resolve wrote is raised to the
+/// constant where it is darker, not replaced (Belobug's first form,
+/// 0603123). Default: replaced.
+fn floor_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_MODE").is_ok_and(|v| v.trim() == "floor"))
+}
+
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
 /// gives. With `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds) the file's
 /// `level r g b` is read again twice a second, to tune both by eye in a
@@ -150,10 +158,11 @@ fn live_level() -> Option<f32> {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(UAV(u0), SRV(t0))"
+#define RS "RootConstants(num32BitConstants=9, b0), DescriptorTable(UAV(u0), SRV(t0))"
 cbuffer Floor : register(b0) {
     float level; float3 tint;
     float strength; float radius; float near; float tan_y;
+    uint floor_only;
 };
 RWTexture2D<uint> light : register(u0);
 Texture2D<float> depth : register(t0);
@@ -212,7 +221,18 @@ void main(uint3 at : SV_DispatchThreadID) {
     // written and it holds whatever their memory did (bright magenta on
     // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
     float open = strength > 0.0 ? open_to_light(int2(at.xy), float2(w, h)) : 1.0;
-    light[at.xy] = pack(tint * level * open);
+    float3 least = tint * level * open;
+    if (floor_only != 0u) {
+        // Raised to the constant, not replaced: what the resolve left above
+        // it stays (garbage included).
+        float3 c = unpack(light[at.xy]);
+        if (!all(isfinite(c))) c = 0.0;
+        const float3 weights = float3(0.2126, 0.7152, 0.0722);
+        float missing = saturate(1.0 - dot(c, weights) / max(dot(least, weights), 1e-6));
+        light[at.xy] = pack(c + least * missing);
+    } else {
+        light[at.xy] = pack(least);
+    }
 }
 "#;
 
@@ -377,8 +397,9 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         let level = live_level().unwrap_or(level);
         let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
-        let constants = [level, r, g, b, strength, radius, near, tan_y];
-        l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+        let floor_only = f32::from_bits(u32::from(floor_only()));
+        let constants = [level, r, g, b, strength, radius, near, tan_y, floor_only];
+        l.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
             D3D12_GPU_DESCRIPTOR_HANDLE {
