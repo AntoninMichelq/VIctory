@@ -1396,9 +1396,39 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return false;
     }
     match memory {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        Some([budget, used, ..]) => match hysteresis() {
+            // Full from `high` percent of the budget until below `low`:
+            // the textures let go while full (`texture_slots_evict`) are
+            // not made again at once at the edge.
+            Some((high, low)) => {
+                static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                let full = if used >= budget / 100 * high {
+                    true
+                } else if used < budget / 100 * low {
+                    false
+                } else {
+                    FULL.load(Relaxed)
+                };
+                FULL.store(full, Relaxed);
+                !full
+            }
+            None => used < budget / 10 * 9,
+        },
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// `VICTORY_VRAM_HYSTERESIS=<high>,<low>` (percents of the card's budget,
+/// e.g. `85,75`): the card counts as full for new textures from `high`
+/// until it is back under `low`. Unset: full at 90 %, room again under it.
+fn hysteresis() -> Option<(u64, u64)> {
+    static PAIR: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *PAIR.get_or_init(|| {
+        let v = std::env::var("VICTORY_VRAM_HYSTERESIS").ok()?;
+        let (high, low) = v.split_once(',')?;
+        let (high, low) = (high.trim().parse::<u64>().ok()?, low.trim().parse::<u64>().ok()?);
+        (low < high && high <= 100).then_some((high, low))
+    })
 }
 
 /// Lets go of the host copies of textures the title fills that nothing
