@@ -536,6 +536,12 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Whether every page behind bytes `[offset, offset + len)` of `pages` is
+/// one the title allocated.
+pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    runs(pages, offset, len).is_some()
+}
+
 /// Bytes `[offset, offset + len)` of `pages` were just written through a
 /// view of our own (DirectStorage page destinations): tells the GPU side
 /// that every title address showing those pages was written, as if the
