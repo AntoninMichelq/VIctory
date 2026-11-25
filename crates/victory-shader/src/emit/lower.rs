@@ -362,6 +362,27 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// `VICTORY_LEAN_MATH`: a set of bits, each a cheaper host form of a
+/// console float operation that differs from it only at NaN operands or in
+/// the sign of a zero (0 when unset, every form exact):
+/// - 1: the D3D9 multiply (`v_mul_legacy_f32`, `v_mac_legacy_f32`,
+///   `v_mad_legacy_f32`), see `legacy_mul`.
+/// - 2: `v_max_f32`/`v_min_f32` and their three-operand forms, see `max_min`.
+/// - 4: `v_med3_f32`, see `med3`.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn lean_math() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_LEAN_MATH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            & 7
+    })
+}
+
 /// `VICTORY_LOOP_ABORT_KEEPS_DEPTH=1` (see `abort_block`). Part of the
 /// translation: the shader cache keys on it (`victory-gpu`'s does).
 fn abort_keeps_depth() -> bool {
@@ -3543,9 +3564,14 @@ impl<'a> Lower<'a> {
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
+    /// `VICTORY_LEAN_MATH` bit 2: DXIL's FMax/FMin alone (which zero of
+    /// two zeros comes out is the host's: six host instructions less).
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        if lean_math() & 2 != 0 {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3677,12 +3703,16 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    /// `VICTORY_LEAN_MATH` bit 4: the median alone, without the NaN tests.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
+        if lean_math() & 4 != 0 {
+            return median;
+        }
         let least = self.binary(36, lo, third);
         let nan_a = self.is_nan_f32(a);
         let nan_b = self.is_nan_f32(b);
@@ -3748,8 +3778,36 @@ impl<'a> Lower<'a> {
     }
 
     /// `0 × anything = 0`, as in D3D9.
+    ///
+    /// `VICTORY_LEAN_MATH` bit 1 (see [`lean_math`]): the same with fewer
+    /// host instructions. The console's compiler uses this multiply for
+    /// nearly every multiply of the title's (about 6 of every 100 host
+    /// instructions are one), and the exact form costs a multiply, two
+    /// compares, an or and a select. The lean form: a finite non-zero
+    /// literal times anything is the plain product, a zero literal gives 0,
+    /// and otherwise the product's NaN (which `0 × ∞` makes) becomes 0: a
+    /// multiply, a compare and a select. What differs from the console: a
+    /// NaN operand gives 0 instead of NaN (where the other is not 0), and
+    /// a zero product may be -0 where the console's is +0.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if lean_math() & 1 != 0 {
+            let finite = |bits: u32| bits & 0x7F80_0000 != 0x7F80_0000;
+            for k in [a, b] {
+                if let Some(bits) = self.s.m.const_bits(k) {
+                    if bits & 0x7FFF_FFFF == 0 {
+                        return self.s.m.f32(0);
+                    }
+                    if finite(bits) {
+                        return self.s.m.bin(c, Bin::Mul, a, b);
+                    }
+                }
+            }
+            let m = self.s.m.bin(c, Bin::Mul, a, b);
+            let zero = self.s.m.f32(0);
+            let nan = self.s.m.cmp(c, pred::UNO, m, m);
+            return self.s.m.select(c, nan, zero, m);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);

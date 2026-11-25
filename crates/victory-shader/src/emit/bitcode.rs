@@ -296,6 +296,24 @@ impl Module {
         let t = self.float();
         self.constant(t, Const::Float(bits))
     }
+    /// The bits of `v` when it is a 32-bit constant, seen through bitcasts
+    /// (a console literal reaches a float operation as a bitcast `i32`).
+    pub fn const_bits(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Float(bits) => Some(*bits),
+                Const::Int(x) if self.types[self.consts[i as usize].0.0 as usize] == TypeDef::Int(32) => {
+                    Some(*x as u32)
+                }
+                _ => None,
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, inner) => self.const_bits(*inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
     }
