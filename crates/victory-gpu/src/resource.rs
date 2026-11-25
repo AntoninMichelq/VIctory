@@ -1671,13 +1671,17 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// that keep a level after the cut. An 8 GB card filled with the title's
 /// textures left thousands of those that shaders pick by index without a
 /// host copy (drawn black: the skin and clothes of characters).
+/// Textures whose sides are not both powers of two (loading screen art,
+/// menu pictures, screen-sized images) keep every level: the world's
+/// textures are powers of two, and a quarter-size loading picture is drawn
+/// blurred full screen (`VICTORY_TEXTURE_HALF_NPOT=1` cuts them too).
 /// shortcut: a shader reading texels by coordinates (not sampling) reads
 /// the smaller level; copies to or from such a texture are dropped.
 #[cfg(windows)]
 pub(crate) fn mip_skip(desc: &ResourceDesc) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    static CUT: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
-    let (n, min) = *CUT.get_or_init(|| {
+    static CUT: std::sync::OnceLock<(u32, u64, bool)> = std::sync::OnceLock::new();
+    let (n, min, npot) = *CUT.get_or_init(|| {
         let n = std::env::var("VICTORY_TEXTURE_HALF")
             .ok()
             .and_then(|v| v.trim().parse().ok())
@@ -1688,13 +1692,17 @@ pub(crate) fn mip_skip(desc: &ResourceDesc) -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(512u64)
             .max(16);
-        (n, min)
+        let npot = std::env::var("VICTORY_TEXTURE_HALF_NPOT").is_ok_and(|v| v.trim() == "1");
+        (n, min, npot)
     });
     if n == 0 || desc.dimension != TEXTURE_2D || !fills(desc) || desc.sample_count > 1 {
         return 0;
     }
     let (w, h) = (desc.width, u64::from(desc.height));
     if w.min(h) < min {
+        return 0;
+    }
+    if !npot && !(w.is_power_of_two() && h.is_power_of_two()) {
         return 0;
     }
     // Levels: 0 is the whole chain.
@@ -1789,7 +1797,22 @@ fn host_texture(
         if d.mip_levels != 0 {
             d.mip_levels -= skip as u16;
         }
-        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let made = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The first big ones cut, to tell a picture drawn full screen
+        // (blurred by the cut) from the world's textures.
+        static BIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if desc.width.max(u64::from(desc.height)) >= 2048
+            && BIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48
+        {
+            tracing::info!(
+                width = desc.width,
+                height = desc.height,
+                levels = desc.mip_levels,
+                format = desc.format,
+                made,
+                "a big texture's host copy leaves {skip} levels off (VICTORY_TEXTURE_HALF)"
+            );
+        }
     }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
