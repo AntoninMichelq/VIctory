@@ -8436,7 +8436,13 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        // `v_pk_fmac_f16` is a VOP2 instruction without operand selects:
+        // each half reads the same half of its operands.
+        let sel = if inst.name() == "v_pk_fmac_f16" {
+            high
+        } else {
+            (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0
+        };
         let x = if float {
             self.f16_operand(inst, &op)?
         } else {
