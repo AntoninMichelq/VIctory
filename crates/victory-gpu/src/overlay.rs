@@ -61,7 +61,8 @@ fn settings() -> &'static [&'static str] {
             crate::console::Console::SeriesS => "Mode Series S (FSR, effets bas)",
             crate::console::Console::SeriesX => "Mode Series X (qualite)",
         }];
-        let switches: [(&[&str], &str); 9] = [
+        let switches: [(&[&str], &str); 10] = [
+            (&["VICTORY_FFX_SCALE", "VICTORY_UPSCALER"], "FSR AMD (rendu plus bas)"),
             (&["VICTORY_LATE_WAIT"], "CPU et GPU en parallele"),
             (&["VICTORY_RELAY"], "Recopies sur un coeur a part"),
             (&["VICTORY_WIDE_REFRESH", "VICTORY_WIDE_BACK", "VICTORY_WIDE_MERGE"], "Copies multi-coeurs"),
