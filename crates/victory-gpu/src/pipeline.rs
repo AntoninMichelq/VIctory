@@ -460,6 +460,55 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The host pipeline of a title pipeline with its vertex shader translated
+/// for instances drawn flat (`victory_shader::emit::with_flat_instances`,
+/// four vertices an instance), made on first use and kept; `None` if it
+/// cannot be made, or its root signature is not the pipeline's own (the
+/// draw binds the pipeline's roots, then this one's state).
+#[cfg(windows)]
+pub(crate) fn flat_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    type Made = HashMap<usize, (Arc<make::Pending>, Option<&'static host::HostPipeline>)>;
+    static MADE: Mutex<Option<Made>> = Mutex::new(None);
+    let base = host_pipeline(this)?;
+    let p = pipeline(this);
+    let key = Arc::as_ptr(&p.host) as usize;
+    if let Some((_, made)) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
+        return *made;
+    }
+    let made = (|| {
+        let vs = p.shaders.iter().find(|s| s.stage == "vertex")?;
+        crate::descriptor::host::probe_view_limit();
+        let host = victory_shader::emit::with_flat_instances(2, || victory_shader::emit::translate(&vs.container));
+        let host = match host {
+            Ok(host) => host,
+            Err(e) => {
+                tracing::warn!(hash = %vs.hash, error = %e, "vertex shader does not translate for flat instances");
+                return None;
+            }
+        };
+        let base_vs = vs.translated()?;
+        let flat = Arc::new(Shader {
+            stage: "vertex",
+            hash: format!("{}.flat", vs.hash),
+            container: vs.container.clone(),
+            resolves_light: false,
+            translated: OnceLock::from(Some(Translated { host, used: base_vs.used.clone(), stores: base_vs.stores })),
+        });
+        let shaders: Vec<Arc<Shader>> =
+            p.shaders.iter().map(|s| if s.stage == "vertex" { flat.clone() } else { s.clone() }).collect();
+        let made = host::HostPipeline::new(&shaders, p.host.graphics.as_deref())?;
+        if made.root != base.root {
+            tracing::warn!(?shaders, "flat-instance pipeline has another root signature; not used");
+            return None;
+        }
+        tracing::info!(?shaders, "flat-instance pipeline made");
+        let made: &'static host::HostPipeline = Box::leak(Box::new(made));
+        Some(made)
+    })();
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, (p.host.clone(), made));
+    made
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

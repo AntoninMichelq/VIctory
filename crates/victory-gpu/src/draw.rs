@@ -2108,6 +2108,113 @@ impl State {
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
+    /// An indexed indirect draw of small instances (four vertices each,
+    /// the title's index buffer starting with four indices below 4) drawn
+    /// as one instance: six indices of ours per instance into vertex
+    /// buffers of ours that repeat the title's four vertices, with the
+    /// pipeline's vertex shader translated to take the instance from the
+    /// vertex number (`crate::pipeline::flat_pipeline`). The title's
+    /// tile-grid composite (VS e732a8b4) draws ~8,000 instances of a quad
+    /// in one draw; the card ran them one at a time, ~9 ms a frame with
+    /// one pixel drawn as with all of them (2026-11-25). `None`: not such a
+    /// draw, the caller draws it as before.
+    fn draw_flat(
+        &mut self,
+        list: &HostList,
+        p: &crate::pipeline::host::HostPipeline,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        stride: u32,
+        signature: &ID3D12CommandSignature,
+    ) -> Option<bool> {
+        if p.inputs.iter().any(|e| e.per_instance) {
+            return None;
+        }
+        // The title's four indices, in title memory.
+        let IndexView { address, size, format } = self.index;
+        let wide = match format {
+            42 => true,
+            57 => false,
+            _ => return None,
+        };
+        let bytes = if wide { 16 } else { 8 };
+        if address == 0 || size < bytes || !crate::texture::committed(address as *const u8, bytes as usize) {
+            return None;
+        }
+        let mut first = [0u32; 4];
+        for (k, i) in first.iter_mut().enumerate() {
+            // SAFETY: committed title memory, checked above.
+            *i = unsafe {
+                if wide {
+                    (address as *const u32).add(k).read_unaligned()
+                } else {
+                    u32::from((address as *const u16).add(k).read_unaligned())
+                }
+            };
+        }
+        if first.iter().any(|&i| i >= 4) {
+            return None;
+        }
+        let [a, b, c, d] = first;
+        // Rectangles: the host draws each instance's first three indices as
+        // one triangle that the pipeline's geometry stage completes.
+        let pattern = match self.topology {
+            TRIANGLE_STRIP => vec![a, b, c, c, b, d],
+            QUADS => vec![a, b, c, a, c, d],
+            RECTANGLES => vec![a, b, c],
+            _ => return None,
+        };
+        // The four vertices of each buffer the layout reads.
+        let mut vertices = Vec::new();
+        for (slot, v) in self.vertex.iter().enumerate() {
+            if p.slots & 1 << slot == 0 {
+                continue;
+            }
+            let four = 4 * v.stride;
+            if v.address == 0 || v.stride == 0 || v.size < four || !crate::texture::committed(v.address as *const u8, four as usize) {
+                return None;
+            }
+            // SAFETY: committed title memory, checked above.
+            let bytes = unsafe { std::slice::from_raw_parts(v.address as *const u8, four as usize) }.to_vec();
+            vertices.push((slot as u32, v.stride, bytes));
+        }
+        let flat = crate::pipeline::flat_pipeline(self.pipeline as This)?;
+        let buffers = flat_buffers(&pattern, &vertices)?;
+        let len = u64::from(stride);
+        args.refresh(list, arguments, len);
+        let bounded = crate::indirect::bound_flat(list, (&args.buffer, args.offset(arguments)), stride, pattern.len() as u32)?;
+        if !self.prepare(list, true) {
+            crate::indirect::done(list, &bounded);
+            return Some(false);
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("indirect flat instances, stride {stride}"), false));
+        // SAFETY: an open list with the pipeline's roots bound; our buffers
+        // live for the run, the scratch buffer until the list is reset.
+        unsafe {
+            let l = &list.list;
+            l.SetPipelineState(&flat.pso);
+            l.IASetIndexBuffer(Some(&buffers.index));
+            for (slot, view) in &buffers.vertices {
+                l.IASetVertexBuffers(*slot, Some(&[*view]));
+            }
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            l.ExecuteIndirect(signature, 1, &bounded, 0, None, 0);
+            // The title's topology again (its buffers and pipeline are bound
+            // again by the next draw's preparation).
+            let host = match self.topology {
+                RECTANGLES | TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => 4,
+                t => t,
+            };
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32));
+        }
+        self.host_pipeline = 0;
+        crate::indirect::done(list, &bounded);
+        FLAT_DRAWS.fetch_add(1, Ordering::Relaxed);
+        self.drawn(list);
+        Some(true)
+    }
+
     /// `VICTORY_SCISSOR_PROBE=<hash prefix>,...`: the draws whose pipeline
     /// names one of those shaders rasterise one pixel (their vertices and
     /// instances all run). With the timing on, what is left of such a
@@ -2802,6 +2909,15 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Many small instances, drawn flat (`VICTORY_FLAT_INSTANCES`).
+        if kind == INDEXED
+            && max == 1
+            && count.is_none()
+            && flat_wanted(&p.name)
+            && let Some(ran) = self.draw_flat(list, p, &args, arguments, stride, &signature)
+        {
+            return ran;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -3150,7 +3266,113 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
-/// The console's own primitive topologies.
+/// Draws made flat since the start (`State::draw_flat`).
+pub(crate) static FLAT_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_FLAT_INSTANCES=<shader hash prefix>,...`: the indexed indirect
+/// draws of pipelines naming one of those shaders have their small
+/// instances drawn flat (`State::draw_flat`). Unset: none.
+fn flat_wanted(name: &str) -> bool {
+    static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let wanted = WANTED.get_or_init(|| {
+        std::env::var("VICTORY_FLAT_INSTANCES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !wanted.is_empty() && wanted.iter().any(|w| name.contains(w.as_str()))
+}
+
+/// Our index and vertex buffers for flat draws: the index buffer's views
+/// and each vertex slot's.
+struct FlatBuffers {
+    index: D3D12_INDEX_BUFFER_VIEW,
+    vertices: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>,
+    /// What the views point into.
+    _kept: Vec<ID3D12Resource>,
+}
+
+// SAFETY: views (addresses) and free-threaded D3D12 buffers.
+unsafe impl Send for FlatBuffers {}
+// SAFETY: as above.
+unsafe impl Sync for FlatBuffers {}
+
+/// The buffers for a flat draw of `pattern` (`per` of the title's indices:
+/// a quad's two triangles, or a rectangle's three corners) over `vertices`
+/// (slot, stride, the four vertices' bytes), made once per distinct set and
+/// kept for the run: index `per * instance + k` is
+/// `4 * instance + pattern[k]`, and each vertex
+/// buffer holds its four vertices once per instance.
+fn flat_buffers(pattern: &[u32], vertices: &[(u32, u32, Vec<u8>)]) -> Option<std::sync::Arc<FlatBuffers>> {
+    use std::collections::HashMap;
+    static MADE: std::sync::Mutex<Option<HashMap<[u8; 32], std::sync::Arc<FlatBuffers>>>> = std::sync::Mutex::new(None);
+    let mut key = blake3::Hasher::new();
+    for i in pattern {
+        key.update(&i.to_le_bytes());
+    }
+    for (slot, stride, bytes) in vertices {
+        key.update(&slot.to_le_bytes());
+        key.update(&stride.to_le_bytes());
+        key.update(bytes);
+    }
+    let key = *key.finalize().as_bytes();
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let made = made.get_or_insert_with(HashMap::new);
+    if let Some(found) = made.get(&key) {
+        return Some(found.clone());
+    }
+    // Up to a few distinct sets (a quad's vertices rarely change).
+    if made.len() >= 16 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let most = crate::indirect::FLAT_MOST as usize;
+    let per = pattern.len();
+    let index_bytes = (most * per * 4) as u64;
+    let (index, data) = host.upload_buffer(index_bytes)?;
+    crate::host::name(&index, || "flat instances: indices".to_owned());
+    // SAFETY: the mapping of `index_bytes` bytes, ours.
+    let indices = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), most * per) };
+    for (n, i) in indices.iter_mut().enumerate() {
+        *i = 4 * (n / per) as u32 + pattern[n % per];
+    }
+    // SAFETY: a live buffer.
+    let index_view = D3D12_INDEX_BUFFER_VIEW {
+        BufferLocation: unsafe { index.GetGPUVirtualAddress() },
+        SizeInBytes: index_bytes as u32,
+        Format: DXGI_FORMAT(42),
+    };
+    let mut kept = vec![index];
+    let mut views = Vec::new();
+    for (slot, stride, bytes) in vertices {
+        let total = (bytes.len() * most) as u64;
+        let (buffer, data) = host.upload_buffer(total)?;
+        crate::host::name(&buffer, || format!("flat instances: vertices of slot {slot}"));
+        for n in 0..most {
+            // SAFETY: inside the mapping of `total` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(n * bytes.len()), bytes.len()) };
+        }
+        views.push((
+            *slot,
+            D3D12_VERTEX_BUFFER_VIEW {
+                // SAFETY: a live buffer.
+                BufferLocation: unsafe { buffer.GetGPUVirtualAddress() },
+                SizeInBytes: total as u32,
+                StrideInBytes: *stride,
+            },
+        ));
+        kept.push(buffer);
+    }
+    tracing::info!(?pattern, slots = vertices.len(), "flat instances: buffers made");
+    let buffers = std::sync::Arc::new(FlatBuffers { index: index_view, vertices: views, _kept: kept });
+    made.insert(key, buffers.clone());
+    Some(buffers)
+}
+
+/// The console's own primitive topologies (and the strip both have).
+const TRIANGLE_STRIP: u32 = 5;
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;

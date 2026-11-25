@@ -1028,12 +1028,28 @@ pub fn set_host_max_wave(lanes: u32) {
 }
 
 thread_local! {
+    /// See [`with_flat_instances`].
+    static FLAT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with a vertex program translated for instances drawn flat: the
+/// host draws all of a draw's instances as one instance whose vertex
+/// number is `instance << shift | vertex` (the vertex buffers repeated per
+/// instance, the index buffer offset by it), and the program takes its
+/// vertex and instance numbers apart from that. The title's tile-grid
+/// composite draws ~8,000 instances of four vertices, which the host card
+/// runs one instance at a time (~9 ms a frame, whatever the pixels).
+pub fn with_flat_instances<R>(shift: u32, f: impl FnOnce() -> R) -> R {
+    let was = FLAT.replace(Some(shift));
+    let r = f();
+    FLAT.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -2386,6 +2402,24 @@ impl<'a> Lower<'a> {
     }
 
     fn input(&mut self, input: Input) -> Val {
+        if matches!(input, Input::VertexId | Input::InstanceId)
+            && let Some(shift) = FLAT.get()
+        {
+            FLAT.set(None);
+            let flat = self.input(Input::VertexId);
+            FLAT.set(Some(shift));
+            let Val::I32(flat) = flat else {
+                return flat;
+            };
+            let entry = self.s.entry;
+            return Val::I32(if matches!(input, Input::VertexId) {
+                let mask = self.s.m.i32((1 << shift) - 1);
+                self.s.m.bin(entry, Bin::And, flat, mask)
+            } else {
+                let k = self.s.m.i32(shift);
+                self.s.m.bin(entry, Bin::LShr, flat, k)
+            });
+        }
         let (kind, col) = match input {
             Input::VertexId => (1, 0),
             Input::InstanceId => (2, 0),
