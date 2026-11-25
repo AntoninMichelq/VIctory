@@ -361,6 +361,107 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 /// read stale.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// Whether [`State::heap_buffers`] reuses its per-shadow span plan across
+/// frames and avoids periodic 80k-slot full rescans while no buffer resource
+/// was released (`VICTORY_PLAN_REUSE=1`, off by default; read per frame so it
+/// can be toggled live).
+pub(crate) fn plan_reuse() -> bool {
+    std::env::var_os("VICTORY_PLAN_REUSE").is_some_and(|v| v == "1")
+}
+
+/// Since the last frame-rate line (with `VICTORY_PLAN_REUSE=1`):
+/// [0] passes reusing the plan, [1] span compactions from `ranges`,
+/// [2] full `buffer_slots` rescans, [3] slots walked,
+/// [4] unresolved slots pending a host copy (gauge),
+/// [5] merged shadow spans in the plan (gauge).
+pub(crate) static PLAN_REUSE_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Compaction interval (frames) when removed/changed slots touched a span
+/// boundary so the cached span may be slightly wider than active slots.
+const PLAN_LOOSE_FRAMES: u64 = 8;
+
+/// Minimum frames between full `buffer_slots()` rescans when buffer resources
+/// are released (`descriptor::buffer_forgotten_epoch`).
+const PLAN_FULL_RESCAN_MIN_FRAMES: u64 = 64;
+
+/// Per-heap cached bindless buffer plan for [`State::heap_buffers`].
+#[derive(Default)]
+struct HeapPlan {
+    passes: u64,
+    ranges: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    /// Buffer slots seen with no host copy yet: retried incrementally instead
+    /// of rescanning all ~80k slots every 16 frames.
+    unresolved: std::collections::HashSet<u32>,
+    /// Merged `(shadow, min_from, max_to)` per `Shadow` pointer, kept across
+    /// frames under `VICTORY_PLAN_REUSE=1`.
+    spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    /// Whether `spans` may cover slightly more than `ranges` due to a removed
+    /// or shrunk boundary slot.
+    loose: bool,
+    /// Whether `ranges`/`spans` have been seeded by an initial full scan.
+    initialized: bool,
+    last_compact: u64,
+    last_full: u64,
+    forgotten_seen: u64,
+}
+
+impl HeapPlan {
+    fn rebuild_spans(&mut self) {
+        self.spans.clear();
+        for (shadow, from, to) in self.ranges.values() {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let span = self
+                .spans
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), *from, *to));
+            span.1 = span.1.min(*from);
+            span.2 = span.2.max(*to);
+        }
+        self.loose = false;
+    }
+
+    fn note_removed_boundary(&mut self, old: &(std::sync::Arc<crate::shadow::Shadow>, u64, u64)) {
+        let key = std::sync::Arc::as_ptr(&old.0) as usize;
+        if let Some((_, cur_from, cur_to)) = self.spans.get(&key)
+            && (old.1 <= *cur_from || old.2 >= *cur_to)
+        {
+            self.loose = true;
+        }
+    }
+
+    fn update_slot(
+        &mut self,
+        index: u32,
+        new: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    ) {
+        let old = self.ranges.remove(&index);
+        match (old, new) {
+            (Some((os, of, ot)), Some((ns, nf, nt)))
+                if std::sync::Arc::ptr_eq(&os, &ns) && of == nf && ot == nt =>
+            {
+                self.ranges.insert(index, (ns, nf, nt));
+            }
+            (old, Some((ns, nf, nt))) => {
+                if let Some(old) = old {
+                    self.note_removed_boundary(&old);
+                }
+                let key = std::sync::Arc::as_ptr(&ns) as usize;
+                let span = self
+                    .spans
+                    .entry(key)
+                    .or_insert_with(|| (ns.clone(), nf, nt));
+                span.1 = span.1.min(nf);
+                span.2 = span.2.max(nt);
+                self.ranges.insert(index, (ns, nf, nt));
+            }
+            (Some(old), None) => {
+                self.note_removed_boundary(&old);
+            }
+            (None, None) => {}
+        }
+    }
+}
+
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -1455,38 +1556,71 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        let reuse = plan_reuse();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        // reads, kept from pass to pass. Without `VICTORY_PLAN_REUSE=1`, all
+        // slots are rescanned every 16 passes and `spans` is rebuilt from all
+        // `ranges` every pass. With `VICTORY_PLAN_REUSE=1`, `spans` is kept
+        // incrementally across frames, unresolved slots are retried on their
+        // own, and full rescans are gated by `descriptor::buffer_forgotten_epoch`.
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapPlan>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let plan = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
+        let forgotten = crate::descriptor::buffer_forgotten_epoch();
+        let full_rescan = if reuse {
+            !plan.initialized
+                || (forgotten != plan.forgotten_seen
+                    && frame >= plan.last_full.saturating_add(PLAN_FULL_RESCAN_MIN_FRAMES))
+        } else {
+            plan.initialized = false;
+            plan.passes.is_multiple_of(16)
+        };
+        let slots: Vec<u32> = if full_rescan {
+            plan.ranges.clear();
+            plan.unresolved.clear();
+            plan.spans.clear();
+            plan.loose = false;
+            plan.last_full = frame;
+            plan.forgotten_seen = forgotten;
             host.buffer_slots()
+        } else if reuse && !plan.unresolved.is_empty() {
+            let mut merged = changed;
+            for &idx in &plan.unresolved {
+                if !merged.contains(&idx) {
+                    merged.push(idx);
+                }
+            }
+            merged
         } else {
             changed
         };
-        *passes += 1;
+        plan.passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                plan.unresolved.remove(&index);
+                if reuse && !full_rescan {
+                    plan.update_slot(index, None);
+                } else {
+                    plan.ranges.remove(&index);
+                }
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
+                plan.unresolved.remove(&index);
+                if reuse && !full_rescan {
+                    plan.update_slot(index, None);
+                } else {
+                    plan.ranges.remove(&index);
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1507,28 +1641,61 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                if reuse {
+                    plan.unresolved.insert(index);
+                }
+                if reuse && !full_rescan {
+                    plan.update_slot(index, None);
+                } else {
+                    plan.ranges.remove(&index);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            plan.unresolved.remove(&index);
+            if reuse && !full_rescan {
+                plan.update_slot(index, Some((shadow, address, address + len)));
+            } else {
+                plan.ranges.insert(index, (shadow, address, address + len));
+            }
         }
         let slots_done = std::time::Instant::now();
         HEAP_SPLIT_US[0].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);
-        let views = ranges.len() as u32;
+        let views = plan.ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let spans_list: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = if reuse {
+            if full_rescan || !plan.initialized {
+                plan.rebuild_spans();
+                plan.initialized = true;
+                plan.last_compact = frame;
+                PLAN_REUSE_STATS[2].fetch_add(1, Ordering::Relaxed);
+            } else if plan.loose && frame >= plan.last_compact.saturating_add(PLAN_LOOSE_FRAMES) {
+                plan.rebuild_spans();
+                plan.last_compact = frame;
+                PLAN_REUSE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                PLAN_REUSE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            PLAN_REUSE_STATS[3].fetch_add(slots.len() as u64, Ordering::Relaxed);
+            PLAN_REUSE_STATS[4].store(plan.unresolved.len() as u64, Ordering::Relaxed);
+            PLAN_REUSE_STATS[5].store(plan.spans.len() as u64, Ordering::Relaxed);
+            plan.spans.values().cloned().collect()
+        } else {
+            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in plan.ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            spans.into_values().collect()
+        };
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans_list.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1539,7 +1706,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans_list {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1575,7 +1742,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies = spans_list.len(),
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
