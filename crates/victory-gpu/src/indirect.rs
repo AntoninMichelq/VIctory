@@ -36,7 +36,10 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: `budget` is this clamp's
+    // entry in a ledger (`LEDGER`): the cost is added to the entry's first
+    // word (saturating), the active records counted in its second, and no
+    // record is emptied here; `SETTLE` decides afterwards which clamps run.
     uint has_count;
     uint count_offset;
 };
@@ -47,6 +50,8 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// Where a ledger entry's cost stops (two of them still fit 32 bits).
+static const uint LEDGER_CAP = 1u << 30;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -54,8 +59,12 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool ledger = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+    if (ledger && id.x == 0) {
+        budget.Store(4, eff_count);
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
@@ -93,25 +102,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        if (!ledger) {
+            budget.InterlockedMax(4, g.x, was);
+            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
     bool over = false;
     if (cost > 0) {
+        // In a ledger, the clamp's whole cost, saturating past the budget.
+        uint cap = ledger ? LEDGER_CAP : BUDGET;
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+        while (before < cap) {
+            uint next = (cap - before <= cost) ? cap : (before + cost);
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
-        over = before >= BUDGET || BUDGET - before < cost;
+        over = !ledger && (before >= BUDGET || BUDGET - before < cost);
     }
     if (kind <= 1) {
         if (over) {
@@ -133,9 +146,100 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// After the clamps of a run went to a ledger (`VICTORY_HOIST_CLAMPS=8`):
+/// one group walks the entries in the order of the draws, and a clamp's
+/// draws run (the entry's third word, the draws' count) only if what came
+/// before it and its own cost fit the list's budget, as when each clamp
+/// charged the budget in turn; the costs are zeroed for the list's next use.
+/// Entries are 16 bytes: cost, active records, count to run, unused.
+const SETTLE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Entries : register(b0) {
+    uint entries;
+};
+RWByteAddressBuffer ledger : register(u0);
+static const uint BUDGET = 1u << 27;
+static const uint CAP = 1u << 30;
+groupshared uint sums[1024];
+[RootSignature(RS)]
+[numthreads(1024, 1, 1)]
+void main(uint t : SV_GroupIndex) {
+    uint carry = 0;
+    for (uint base = 0; base < entries; base += 1024) {
+        uint j = base + t;
+        // (HLSL's ?: reads both sides: no load past the entries.)
+        uint cost = 0;
+        if (j < entries) {
+            cost = ledger.Load(j * 16);
+        }
+        sums[t] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint d = 1; d < 1024; d <<= 1) {
+            uint v = 0;
+            if (t >= d) {
+                v = sums[t - d];
+            }
+            GroupMemoryBarrierWithGroupSync();
+            sums[t] = min(sums[t] + v, CAP);
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (j < entries) {
+            uint upto = min(carry + sums[t], CAP);
+            uint active = ledger.Load(j * 16 + 4);
+            ledger.Store(j * 16 + 8, (cost == 0 || upto <= BUDGET) ? active : 0);
+            ledger.Store(j * 16, 0);
+        }
+        uint whole = sums[1023];
+        GroupMemoryBarrierWithGroupSync();
+        carry = min(carry + whole, CAP);
+    }
+}
+"#;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+}
+
+fn settle_pipeline() -> Option<&'static Clamp> {
+    static SETTLE_PSO: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    SETTLE_PSO
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match compile_for(device, SETTLE) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no ledger settle: hoisted clamps one after another");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Entries a list's ledger holds (`LEDGER_BYTES` / 16).
+pub(crate) const LEDGER_ENTRIES: u32 = 1 << 16;
+/// A list's ledger's size.
+pub(crate) const LEDGER_BYTES: u64 = LEDGER_ENTRIES as u64 * 16;
+
+/// Records in `list`, after the clamps of a run went to `ledger`'s first
+/// `entries` entries, which of them run ([`SETTLE`]). The ledger stays
+/// writable by shaders; the caller makes it readable as arguments.
+pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, entries: u32) -> bool {
+    let Some(c) = settle_pipeline() else {
+        return false;
+    };
+    // SAFETY: an open list; our root signature and pipeline; a live ledger
+    // the clamps wrote before (the barrier).
+    unsafe {
+        list.ResourceBarrier(&[uav_barrier()]);
+        list.SetComputeRootSignature(&c.root);
+        list.SetPipelineState(&c.pso);
+        list.SetComputeRoot32BitConstants(0, 1, (&raw const entries).cast(), 0);
+        list.SetComputeRootUnorderedAccessView(1, ledger.GetGPUVirtualAddress());
+        list.Dispatch(1, 1, 1);
+    }
+    true
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -162,13 +266,17 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    compile_for(device, SOURCE)
+}
+
+fn compile_for(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -404,16 +512,22 @@ fn record_clamp_as(
 /// (a barrier between them), the default: the budget is then charged in the
 /// order of the draws, as when each clamp precedes its draw (without it
 /// whole mesh objects flickered there, as records past the budget were not
-/// the same from frame to frame).
+/// the same from frame to frame). 8 hoisted, the clamps free to overlap
+/// and the budget charged in the order of the draws all the same: each
+/// clamp adds its cost to an entry of the list's ledger, one dispatch
+/// afterwards ([`settle`]) walks the entries in order and gives each run of
+/// draws its count (all its active records, or none past the budget). The
+/// default: a barrier between every two clamps cost 7.9 of 110.7 ms of
+/// card time a frame (3,756 clamps).
 pub(crate) fn hoist_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let set = std::env::var("VICTORY_HOIST_CLAMPS")
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())
-            .filter(|n| matches!(n, 0 | 1 | 7))
-            .unwrap_or(7);
-        tracing::info!(mode = set, "clamps of indirect draws (VICTORY_HOIST_CLAMPS): 0 before each draw, 1/7 hoisted");
+            .filter(|n| matches!(n, 0 | 1 | 7 | 8))
+            .unwrap_or(8);
+        tracing::info!(mode = set, "clamps of indirect draws (VICTORY_HOIST_CLAMPS): 0 before each draw, 1/7/8 hoisted");
         set
     })
 }
@@ -423,15 +537,20 @@ pub(crate) fn hoisting() -> bool {
     hoist_mode() != 0
 }
 
+/// The clamped records' buffer and offset, and with a ledger the buffer
+/// and offset of the count the draws use in place of theirs.
+pub(crate) type Hoisted = (ID3D12Resource, u64, Option<(ID3D12Resource, u64)>);
+
 /// As [`bound`], recorded in `clamps`, a list that runs before the one that
 /// executes: the buffer and the offset of the clamped records, readable as
-/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]), and
+/// in mode 8 where the count to execute is.
 pub(crate) fn bound_before(
     clamps: &HostList,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-) -> Option<(ID3D12Resource, u64)> {
+) -> Option<Hoisted> {
     let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
     if records == 0 {
         return None;
@@ -455,9 +574,24 @@ pub(crate) fn bound_before(
     if !src_base.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
+    // Mode 8: the clamp's ledger entry, in place of the list's budget.
+    let entry = if hoist_mode() == 8 && settle_pipeline().is_some() {
+        clamps.clamp_entry()
+    } else {
+        None
+    };
     let (dst, at) = clamps.clamp_room(bytes)?;
-    // SAFETY: a live buffer.
+    // SAFETY: live buffers.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let (budget, has_count, ran) = match &entry {
+        // SAFETY: a live buffer.
+        Some((ledger, i)) => (
+            unsafe { ledger.GetGPUVirtualAddress() } + u64::from(*i) * 16,
+            has_count | 4,
+            Some((ledger.clone(), u64::from(*i) * 16 + 8)),
+        ),
+        None => (budget, has_count, None),
+    };
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
@@ -474,11 +608,11 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        if hoist_mode() == 7 {
+        if hoist_mode() == 7 || (hoist_mode() == 8 && ran.is_none()) {
             l.ResourceBarrier(&[uav_barrier()]);
         }
     }
-    Some((dst, at))
+    Some((dst, at, ran))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):

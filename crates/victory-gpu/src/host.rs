@@ -908,6 +908,10 @@ struct ClampChunks {
     used: usize,
     at: u64,
     barrier: bool,
+    /// The ledger of the clamps' costs (`VICTORY_HOIST_CLAMPS=8`), its
+    /// state, and the entries taken since the reset.
+    ledger: Option<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    entries: u32,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -5275,7 +5279,7 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-            (chunks.used, chunks.at, chunks.barrier) = (0, 0, false);
+            (chunks.used, chunks.at, chunks.barrier, chunks.entries) = (0, 0, false, 0);
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6032,11 +6036,52 @@ impl HostList {
         Some((buffer, 0))
     }
 
+    /// A ledger entry for the next hoisted clamp, writable by shaders from
+    /// here on in the list: the ledger and the entry. None once the ledger
+    /// is full (that clamp then charges the list's budget in turn).
+    pub(crate) fn clamp_entry(&self) -> Option<(ID3D12Resource, u32)> {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.entries >= crate::indirect::LEDGER_ENTRIES {
+            return None;
+        }
+        if chunks.ledger.is_none() {
+            // A new buffer holds zeros: the costs start from nothing.
+            let buffer = host()?.uav_buffer(crate::indirect::LEDGER_BYTES)?;
+            name(&buffer, || "ledger of hoisted clamps".to_string());
+            chunks.ledger = Some((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let (buffer, state) = chunks.ledger.as_mut()?;
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            let barrier = transition(buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            // SAFETY: an open list and a live buffer.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        let buffer = buffer.clone();
+        let entry = chunks.entries;
+        chunks.entries += 1;
+        Some((buffer, entry))
+    }
+
     /// The clamped arguments written so far become readable as indirect
-    /// arguments by the lists after this one (which then closes).
+    /// arguments by the lists after this one (which then closes); with
+    /// ledger entries, which clamps' draws run is settled first.
     pub(crate) fn clamp_end(&self) {
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
+        let entries = std::mem::take(&mut chunks.entries);
+        let settled = match &chunks.ledger {
+            Some((ledger, _)) if entries > 0 => crate::indirect::settle(&self.list, ledger, entries),
+            _ => false,
+        };
+        let ledger = chunks
+            .ledger
+            .as_mut()
+            .filter(|(_, state)| settled && *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let ledger_barrier = ledger.map(|(buffer, state)| {
+            *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            transition(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
+        });
         let barriers: Vec<_> = chunks.all[..used]
             .iter_mut()
             .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
@@ -6048,6 +6093,7 @@ impl HostList {
                     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 )
             })
+            .chain(ledger_barrier)
             .collect();
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers.

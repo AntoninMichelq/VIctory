@@ -2790,8 +2790,13 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        // With a ledger, the hoisted clamp says how many records run.
+        let mut ledger_count = None;
         let (bounded, at) = match (hoisted, hit) {
-            (Some(hoisted), _) => hoisted,
+            (Some((buffer, at, count)), _) => {
+                ledger_count = count;
+                (buffer, at)
+            }
             (None, Some(hit)) => hit,
             (None, None) => {
                 // A record a short step after the last window's last one
@@ -2872,14 +2877,19 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            match &ledger_count {
+                Some((ledger, entry)) => {
+                    list.list.ExecuteIndirect(&signature, max, &bounded, at, ledger, *entry)
+                }
+                None => list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                ),
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
