@@ -111,19 +111,36 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => {
-            // The host's wave width and view heap limit are set at run time
-            // (they may come after the first translation), so they join the
-            // key here: a cache moved to another PC, or warmed by a run that
-            // set them otherwise, serves none of the wrong forms.
-            let mut key = blake3::Hasher::new();
-            key.update(build());
-            key.update(&victory_shader::emit::host_max_wave().to_le_bytes());
-            key.update(&victory_shader::emit::view_heap_limit().to_le_bytes());
-            cached(cache, key.finalize().as_bytes(), container, translate)
-        }
+        Some(cache) => cached(cache, &key(), container, translate),
         None => translate(container),
     }
+}
+
+/// The key of a translation: [`build`], with the host's wave width and
+/// view heap limit. Those are set at run time (they may come after the
+/// first translation), so they join the key here: a cache moved to another
+/// PC, or warmed by a run that set them otherwise, serves none of the wrong
+/// forms.
+fn key() -> [u8; 32] {
+    let mut key = blake3::Hasher::new();
+    key.update(build());
+    key.update(&victory_shader::emit::host_max_wave().to_le_bytes());
+    key.update(&victory_shader::emit::view_heap_limit().to_le_bytes());
+    *key.finalize().as_bytes()
+}
+
+/// The offline warm-up (`victory translate --warm`, from fxceless/victory-fork):
+/// `container` is translated into the cache unless it is there already.
+/// `Ok(true)`: it was translated now. Needs [`use_shader_cache`] and the
+/// same host facts the run will have.
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, std::sync::atomic::Ordering::Relaxed);
+        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+    };
+    cached(cache, &key(), container, translate).map(|_| ran.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The cache entry's converter: the build and the container in, the
