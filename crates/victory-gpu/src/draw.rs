@@ -2011,7 +2011,24 @@ impl State {
         // promoted to a copy source) and the readback buffer are live.
         unsafe { list.list.CopyBufferRegion(&readback, 0, bounded, at, row as u64) };
         list.defer_read_back(readback, dst_at, [row, 1, row]);
-        let text = self.op_text(format!("indirect kind {kind} max {max}"), kind == 2);
+        // The topology, and the index buffer's first indices (title memory).
+        let IndexView { address, size, format } = self.index;
+        let first: Vec<u32> = if address != 0 && size >= 16 && crate::texture::committed(address as *const u8, 16) {
+            // SAFETY: 16 committed bytes of title memory.
+            let raw = unsafe { (address as *const [u8; 16]).read_unaligned() };
+            if format == 42 {
+                raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            } else {
+                raw.chunks_exact(2).map(|c| u32::from(u16::from_le_bytes([c[0], c[1]]))).collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let text = format!(
+            "topology {} index buffer {address:#x} size {size} format {format} first {first:?}; {}",
+            self.topology,
+            self.op_text(format!("indirect kind {kind} max {max}"), kind == 2)
+        );
         let address = dst_at as usize;
         std::thread::spawn(move || {
             // The list runs within a few frames: the bytes are there by then.
@@ -2122,6 +2139,7 @@ impl State {
         if !wanted.iter().any(|w| p.name.contains(w.as_str())) {
             return false;
         }
+        once!(pipeline = %p.name, "VICTORY_SCISSOR_PROBE: this pipeline's draws rasterise one pixel (logged once)");
         let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
         crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
         true
