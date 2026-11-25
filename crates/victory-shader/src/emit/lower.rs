@@ -9961,11 +9961,16 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL's Log (23) is already base 2: scaling it by
+                    // log2(e) as if it were the natural logarithm picked a
+                    // level 1.44 times too far (blurrier cube lookups). A
+                    // length of 0 gives minus infinity, which the sampler
+                    // clamps to level 0. Upstream 4f57f46 does the same.
+                    let mut lod = self.unary(23, texels);
+                    if has_cl {
+                        // The console's minimum level: the larger wins.
+                        lod = self.binary(35, lod, clamp);
+                    }
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
