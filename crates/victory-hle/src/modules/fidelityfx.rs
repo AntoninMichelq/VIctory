@@ -157,23 +157,56 @@ static SCALE_SLOT: OnceLock<usize> = OnceLock::new();
 /// default fixed-scale behavior).
 pub fn dynamic_target_ms() -> Option<f64> {
     static TARGET: OnceLock<Option<f64>> = OnceLock::new();
-    *TARGET.get_or_init(|| {
-        let raw = std::env::var("VICTORY_FFX_DYNAMIC").ok()?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "0" {
-            return None;
+    *TARGET.get_or_init(|| parse_target(std::env::var("VICTORY_FFX_DYNAMIC").ok().as_deref()))
+}
+
+/// The target of `VICTORY_FFX_DYNAMIC` from its text.
+fn parse_target(raw: Option<&str>) -> Option<f64> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(ms) if ms.is_finite() && ms > 0.0 => Some(ms),
+        _ => {
+            tracing::warn!(
+                value = trimmed,
+                "VICTORY_FFX_DYNAMIC: expected positive target GPU time in ms (e.g. 33); disabled"
+            );
+            None
         }
-        match trimmed.parse::<f64>() {
-            Ok(ms) if ms.is_finite() && ms > 0.0 => Some(ms),
-            _ => {
-                tracing::warn!(
-                    value = trimmed,
-                    "VICTORY_FFX_DYNAMIC: expected positive target GPU time in ms (e.g. 33); disabled"
-                );
-                None
-            }
+    }
+}
+
+/// Live (`victory_gpu::live`), once dynamic scaling is on at the start
+/// (the scale slot is patched in then): the target (`VICTORY_FFX_DYNAMIC`;
+/// `0` holds the scale at its maximum) and the minimum scale
+/// (`VICTORY_FFX_SCALE_MIN`). The maximum (`VICTORY_FFX_SCALE`) stays.
+fn live_dynamic(ctrl: &mut DynamicController) -> bool {
+    static TARGET: victory_gpu::live::Switch = victory_gpu::live::Switch::new();
+    static MIN: victory_gpu::live::Switch = victory_gpu::live::Switch::new();
+    let target = TARGET.get("VICTORY_FFX_DYNAMIC", |v, _| parse_target(v).map_or(0, f64::to_bits));
+    let min = MIN.get("VICTORY_FFX_SCALE_MIN", |v, _| {
+        let min = v
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+            .unwrap_or(DEFAULT_SCALE_MIN);
+        u64::from(min.to_bits())
+    });
+    ctrl.scale_min = f32::from_bits(min as u32).clamp(ABS_SCALE_MIN.min(ctrl.scale_max), ctrl.scale_max);
+    if target == 0 {
+        if ctrl.current_scale != ctrl.scale_max {
+            ctrl.current_scale = ctrl.scale_max;
+            write_scale_slot(ctrl.scale_max);
         }
-    })
+        return false;
+    }
+    ctrl.target_ms = f64::from_bits(target);
+    if ctrl.current_scale < ctrl.scale_min {
+        ctrl.current_scale = ctrl.scale_min;
+        write_scale_slot(ctrl.scale_min);
+    }
+    true
 }
 
 /// Registers the title's writable scale `f32` slot (4-byte aligned, mapped for
@@ -384,6 +417,10 @@ fn dynamic_on_dispatch(render_size: [u32; 2]) {
     let now = Instant::now();
     let (idle_us, wait_us, signals) = victory_gpu::external::card_totals_us();
     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !live_dynamic(&mut state.ctrl) {
+        state.last_sample = None;
+        return;
+    }
     let sample = state.last_sample.replace((now, idle_us, wait_us));
     if let Some((prev_now, prev_idle, prev_wait)) = sample {
         let dt_wall_us = now.duration_since(prev_now).as_micros() as u64;

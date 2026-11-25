@@ -170,12 +170,11 @@ fn card_limits() -> (u64, u64) {
 /// of the budget in gameplay) stayed in the PC's memory, snapshotted and
 /// compared on the CPU every submission (`VICTORY_COPY_STATS=1` counts
 /// those refused).
+/// Live (`crate::live`): for the copies asked for after a change.
 fn card_room() -> u64 {
-    static ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *ROOM.get_or_init(|| {
-        std::env::var("VICTORY_CARD_BUFFERS_ROOM")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
+    static ROOM: crate::live::Switch = crate::live::Switch::new();
+    ROOM.get("VICTORY_CARD_BUFFERS_ROOM", |v, _| {
+        v.and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(80)
             .clamp(50, 98)
     })

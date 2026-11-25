@@ -43,7 +43,7 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
-pub(crate) mod live;
+pub mod live;
 pub mod object;
 #[cfg(windows)]
 mod overlay;

@@ -44,13 +44,13 @@ pub(crate) fn on() -> bool {
 
 /// The configuration in force (0 at the start; one more per change
 /// applied).
-pub(crate) fn config() -> u64 {
+pub fn config() -> u64 {
     CONFIG.load(Ordering::Relaxed)
 }
 
 /// The value of switch `name` (full name, `VICTORY_...`): the file's if it
 /// holds it, else the environment's.
-pub(crate) fn var(name: &str) -> Option<String> {
+pub fn var(name: &str) -> Option<String> {
     if on()
         && let Some(v) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).get(name)
     {
@@ -61,13 +61,19 @@ pub(crate) fn var(name: &str) -> Option<String> {
 
 /// A switch read at every use for almost nothing: its value (a number,
 /// parsed from [`var`]) is parsed again only after a change is applied.
-pub(crate) struct Switch {
+pub struct Switch {
     generation: AtomicU64,
     value: AtomicU64,
 }
 
+impl Default for Switch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Switch {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Switch {
             generation: AtomicU64::new(u64::MAX),
             value: AtomicU64::new(0),
@@ -76,7 +82,7 @@ impl Switch {
 
     /// The value, from `parse` of the switch's text (`first`: the first
     /// parse, for a line telling what the switch does).
-    pub(crate) fn get(&self, name: &str, parse: impl FnOnce(Option<&str>, bool) -> u64) -> u64 {
+    pub fn get(&self, name: &str, parse: impl FnOnce(Option<&str>, bool) -> u64) -> u64 {
         let now = GENERATION.load(Ordering::Acquire);
         let seen = self.generation.load(Ordering::Acquire);
         if seen == now {
