@@ -106,8 +106,9 @@ impl Side {
 }
 
 /// Staging buffers: made (since the last frame-rate line), taken from the
-/// pool instead (the same), and the bytes the pool holds now.
-pub(crate) static STAGING_POOL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// pool instead (the same), the bytes the pool holds now, and made ahead
+/// by the maker thread (since the last line).
+pub(crate) static STAGING_POOL: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `VICTORY_STAGING_POOL_MB`: the most bytes of staging buffers let go that
 /// are kept to be used again (0, the default: none, every texture's
@@ -174,11 +175,61 @@ fn pool_keep(buffer: &ID3D12Resource, data: *mut u8, class: u64) {
 fn pool_take(class: u64) -> Option<(ID3D12Resource, *mut u8)> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
-    let at = kept.iter().position(|k| k.2 == class && only_reference(&k.0))?;
+    let Some(at) = kept.iter().position(|k| k.2 == class && only_reference(&k.0)) else {
+        drop(kept);
+        make_ahead(class);
+        return None;
+    };
     let Kept(buffer, data, class) = kept.swap_remove(at);
     STAGING_POOL[2].fetch_sub(class, Relaxed);
     STAGING_POOL[1].fetch_add(1, Relaxed);
     Some((buffer, data))
+}
+
+/// Classes a take found nothing for: the maker thread makes one of each
+/// for the pool, off the thread that records the frame (a staging buffer
+/// took about half a millisecond to make there: 236 a frame, 117 ms, in
+/// the opening cutscene of 2026-11-25's A2 run).
+static MISSED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static MISSED_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn make_ahead(class: u64) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("staging maker".into()).spawn(maker);
+    });
+    let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
+    if missed.len() < 1024 {
+        missed.push(class);
+    }
+    MISSED_WAKE.notify_one();
+}
+
+/// The maker thread: a staging buffer for each class missed, kept in the
+/// pool within its bytes.
+fn maker() {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let class = {
+            let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(class) = missed.pop() {
+                    break class;
+                }
+                missed = MISSED_WAKE.wait(missed).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        if STAGING_POOL[2].load(Relaxed) + class > staging_pool_mb() << 20 {
+            continue;
+        }
+        let Some((buffer, data)) = host().and_then(|h| h.upload_buffer(class)) else {
+            continue;
+        };
+        crate::host::name(&buffer, || format!("staging made ahead {class:#x}"));
+        STAGING_POOL[3].fetch_add(1, Relaxed);
+        // The pool's reference is the only one once this goes.
+        pool_keep(&buffer, data, class);
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
