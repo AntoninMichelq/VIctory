@@ -3,7 +3,7 @@
 ## Résumé en français (pour 4nto)
 
 - **Ce qui marche aujourd'hui** : le raccourci du Bureau « Jouer VIctory (tout cumulé).bat » lance **Peau3** (commit `b74ac64`, branche `jouer/peau3`). La prison est éclairée, avec bâtiments, personnages, peau et cheveux. Environ **6,2 à 6,5 images/s**, environ 21 Go de RAM, sur la RX 7600 avec FSR (rendu 1080p).
-- **Le gros défaut qui reste** : des reflets « chrome » ou des taches noires au hasard sur les habits et la peau. Cause trouvée : quand la carte graphique (8 Go) est pleine, des textures attendent ou sont retirées, et le jeu lisait des zéros à leur place. Correctif prêt : branche `fix/wait-grey` (`89e0bb6`). Il était en test au moment de l'arrêt (voir la section « Last results »).
+- **Le gros défaut qui reste** : des reflets « chrome » ou des taches noires au hasard sur les habits et la peau. Cause trouvée : quand la carte graphique (8 Go) est pleine, des textures attendent ou sont retirées, et le jeu lisait des zéros à leur place. Premier correctif essayé le 25/11 au soir (branche `fix/wait-grey`, `89e0bb6`) : la chemise redevient mate, mais il reste des affiches noires, des visages noirs et du chrome. Il n'est donc pas dans Jouer. La vraie solution : retirer beaucoup moins de textures (voir section 8).
 - **Pour aller plus vite** : l'« essai groupé » (`essai/groupe`) passe de ~6,4 à ~7 images/s, mais il donne une tête flottante et des taches argentées. Il n'est donc pas encore dans Jouer.
 - **Règles à garder** : un seul jeu lancé à la fois. Ne jamais fermer le jeu de force pendant que tu joues. Toujours garder un « Jouer precedent ». Ne jamais publier de fichiers du jeu.
 - Les **prompts à coller dans T3 Code** sont tout en bas (section 12).
@@ -138,7 +138,7 @@ Notes on that env:
 | Branch / commit | What | Status |
 |---|---|---|
 | `fix/evict-grey` `056a9b5` (on b74ac64) | texture slots given up for VRAM room point at a 4x4 grey stand-in instead of a NULL view (`VICTORY_EVICT_GREY=0` = old) | superseded by the next line |
-| **`fix/wait-grey` `89e0bb6`** (on 056a9b5) | also slots still **waiting** for their host copy, and placed/streamed textures; integer formats stay 0 (`VICTORY_WAIT_GREY=0` = control) | Windows clippy clean; **being tested on PC at handoff time** with Peau3 env, expected: no chrome/black silhouettes, characters briefly grey while streaming. Check `given_up` at w+300 (Peau3: 16k window cutscene, 33k common room) |
+| **`fix/wait-grey` `89e0bb6`** (on 056a9b5) | also slots still **waiting** for their host copy, and placed/streamed textures; integer formats stay 0 (`VICTORY_WAIT_GREY=0` = control) | Run 2026-11-25 20:48 (run-20261125-204839-jouer-evictgrey): shirt matte at the window, BUT posters solid black, face/neck black in corridor A102, NPCs in cells still chrome; given-up count doubled (65.6k at w+300); no "grey" line in the log, so the stand-in use is unconfirmed; 4.90 fps (heavy scene), 21.8 GB. **Not clean, not promoted.** |
 | `fix/loading-sharp` `2cde495` | TEXTURE_HALF skips non-power-of-two textures (loading art sharp again); `VICTORY_TEXTURE_HALF_NPOT=1` = old | compiled, not run alone |
 | `jouer/peau3-overlay` `bbc847a` (aeebeec + fix) | overlay only shows console mode + FSR lines; box sized to its lines | compiled |
 | `perf/lean-math` `4237bce` | `VICTORY_LEAN_MATH` bitmask: 1 legacy mul in 3 ops (+0 for zero product), 2 plain max/min, 4 med3 w/o NaN, 8 plain mul + operand clamps, 16 finite pixel outputs, 32 v_mad as FMad, 64 fast rcp. In the cache key. | L7 6.68 fps (+4%, GPU 70.7 ms, grey-white hair at w+120 before the 4237bce fix); L31 6.93 (+8%, GPU 61.6); L127 in the group. **Chrome seen on L31 was also on the Peau3 control → not proof against it.** L1/L6/L97 split pending |
@@ -155,12 +155,15 @@ Notes on that env:
 - L7 vs Peau3 control vs L31: see table above. Control run `run-20261125-195202-jouer-ctl`: 6.50 fps, GPU 70.5 ms, also had a chrome shirt and missing window glass.
 - J-sans-sondes (Peau3 + `NO_COMPILE=39f0e9aeb156a61c`, probes off): chrome **remains** → probes are not the cause. Purple frames/white haze are expected without probes.
 - Given-up texture slots at w+300: Peau3 16,428 (window cutscene), sans-sondes 33,003 and GROUPE2 32,928 (common room). Common room = worst chrome.
-- Evict-grey / wait-grey run: **in progress at handoff** (`_work\Jouer essai evict grey (temporaire).bat`, log `run-*-jouer-evictgrey.log`). Read that log and the user's screenshots first.
-<!-- FINAL_RESULTS -->
+- `fix/wait-grey` 89e0bb6 run: partial (see section 6). Given up at w+300: 16.4k (Peau3, window scene), ~33k (common room), 65.6k (wait-grey). The chrome and black areas follow this count.
+- Grouped trials (`essai/groupe*`, LEAN=127, FLAT_INSTANCES=e732a8b4): GPU 53–57 ms vs 70, ~7 fps steady; chrome patches, black silhouettes and a guard's head floating with no body in the common room. **Not promotable.** DISPATCH_PEEK: `39f0e9ae` = 2040x1x1 groups (x32 threads), `5cf00dc3` = 240x135x1.
+- **Desktop Jouer is unchanged (Peau3 b74ac64). Nothing promoted. The PC is idle.**
+- Not run (to do next): group splits on `essai/groupe-overlay` — A: LEAN unset; B: LEAN=127 + HOIST_CLAMPS=7; C: LEAN=97. D: GPU_TIMING + DRED diag on the best mix (e732 time, new top 20). Ledger 7068acc 10-min torso check. fx d510ee4 F0–F2 (user has not OK'd).
+- Full report: `docs/notes/nuit-2026-11-25/essais-soir-2026-11-25.md`.
 
 ## 8. Open problems, ranked
 
-1. **Random chrome / rainbow / black patches on characters and floors** (also on Jouer). Cause: texture slots evicted or waiting under VRAM pressure were NULL views → zeros (black albedo, normal (-1,-1), roughness 0 = mirror). Fix in test: `fix/wait-grey`. Real fix next: give up far fewer slots — evict least-recently-sampled instead of oldest-made, or keep/remake small mips instead of emptying the slot. Code: `crates/victory-gpu` texture queue / `texture_slots_evict`, `resource::room()` (90% of the VRAM budget).
+1. **Random chrome / rainbow / black patches on characters and floors** (also on Jouer). Cause: texture slots evicted or waiting under VRAM pressure were NULL views → zeros (black albedo, normal (-1,-1), roughness 0 = mirror). `fix/wait-grey` only partly helps (it also doubled given-up slots; find the views that still stay null — posters, faces). Real fix next: give up far fewer slots — evict least-recently-sampled instead of oldest-made, or keep/remake small mips instead of emptying the slot. Code: `crates/victory-gpu` texture queue / `texture_slots_evict`, `resource::room()` (90% of the VRAM budget).
 2. **Floating head / torso missing** with the ledger (`HOIST_CLAMPS=9`) and/or flat tiles (`FLAT_INSTANCES`). Bisect with the group splits A/B/C; logs of ledger `8a89721` show 49–80k "a flight's shaders write it".
 3. **Speed: GPU-bound ~70 ms/frame** (~6.4 fps, user's goal was 10). Biggest card costs (F0d, 105.7 ms/frame diag): ScreenProbes `39f0e9ae` 8.8 ms (1 dispatch, scalar-bound; idea: async compute queue), tiles `e732a8b4`/`456f02b5` 8.5, hoisted clamps 7.0, scattering gathers ~9, shadowmask `5cf00dc3` 2.6. Levers: lean math (−8..−18 ms), ledger, flat tiles, fx merge, `FFX_SCALE=0.4`.
 4. Eyes glowing white in cutscenes, satin streaks on shirts, blotchy inmate faces (some may be #1).
@@ -233,8 +236,8 @@ Travaille sur ta propre branche (git worktree si un autre agent utilise le dossi
 
 **Agent A — "PC / tests" (Claude, the only one that builds Jouer and runs the game):**
 ```
-Tu es le seul agent qui lance le jeu. 1) Lis le dernier journal _work\runs\run-*-jouer-evictgrey.log et dis-moi si le chrome a disparu
-(given_up à w+300, fps, mémoire). 2) Si c'est bon, fabrique un Jouer = jouer/peau3 + fix/wait-grey + fix/loading-sharp + jouer/peau3-overlay,
+Tu es le seul agent qui lance le jeu. 1) Jouer reste Peau3 (b74ac64). Lis la section 7 de HANDOFF.md (essais du 25/11 au soir).
+2) Propose-moi d'abord un Jouer = jouer/peau3 + fix/loading-sharp + jouer/peau3-overlay (images de chargement nettes, overlay court),
 même env que Peau3, garde l'ancien en "Jouer precedent". 3) Ensuite les essais de vitesse (section 6 et 8 de HANDOFF.md),
 un à la fois, en groupant, et seulement après mon OK écrit pour chaque nouveau lancement.
 ```
