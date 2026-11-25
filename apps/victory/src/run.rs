@@ -19,6 +19,9 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Before the import registry is first used: it holds the module only
+    // when the host's FidelityFX serves.
+    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -111,6 +114,10 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // The FidelityFX switches (VICTORY_UPSCALER, VICTORY_FFX_SCALE), before
+    // any title code runs.
+    #[cfg(windows)]
+    crate::title_patch::apply(&image);
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
