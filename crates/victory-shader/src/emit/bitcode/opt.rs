@@ -52,6 +52,10 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a `VICTORY_SHADER_OPT` bit: only a branch on a constant goes one
+/// way ([`FOLD`] does that too), and the blocks then reached by nothing
+/// are not written. Runs whatever the switch says.
+pub const BRANCHES: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
@@ -215,6 +219,9 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
+        if passes & (FOLD | REUSE | FACTS | LOADS) == 0 && passes & BRANCHES != 0 {
+            while self.prune() {}
+        }
         if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
