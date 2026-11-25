@@ -252,7 +252,7 @@ fn memory_line(card: Option<[u64; 4]>) {
          {} MB; host textures the title fills {} alive {} MB; host lists {} alive, scratch {} chunks {} MB ({} spare {} MB), \
          other upload buffers {} {} MB; made so far: upload {} {} MB, shared {} {} MB, card {} {} MB; {} objects waiting for \
          submissions to finish; {} shaders {} MB, {} translations {} MB; library file {} MB; lists in the air {}, landed \
-         lists not yet reset {}",
+         lists not yet reset {}; texture passes with the loading budget so far {}",
         copies[0],
         mb(copies[1]),
         copies[2],
@@ -282,6 +282,7 @@ fn memory_line(card: Option<[u64; 4]>) {
         mb(kept[4]),
         lists,
         landed,
+        crate::draw::HEAP_TEXTURES_PRELOAD.load(Ordering::Relaxed),
     );
 }
 
