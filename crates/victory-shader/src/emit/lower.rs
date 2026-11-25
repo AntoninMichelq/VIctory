@@ -28,6 +28,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "hot.rs"]
+pub(super) mod hot;
 
 type Why = &'static str;
 
@@ -3291,6 +3293,7 @@ impl<'a> Lower<'a> {
             for k in 0..n {
                 let x = self.s.m.extract(c, r, u32::from(k));
                 let x = self.as_int(x);
+                let x = self.scalar_loaded(x);
                 self.write(inst, Reg::S(code + first + k), x, None);
             }
         }
@@ -5944,6 +5947,7 @@ impl<'a> Lower<'a> {
             }
             let both = self.end_guarded(at, &both);
             for (k, x) in both.into_iter().enumerate() {
+                let x = self.scalar_loaded(x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -5965,6 +5969,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.scalar_loaded(x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6007,6 +6012,7 @@ impl<'a> Lower<'a> {
                     self.cbuffer_dword(h, a)
                 }
             };
+            let x = self.scalar_loaded(x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -11630,6 +11636,7 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                let cond = self.uniform_branch(when, cond);
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
