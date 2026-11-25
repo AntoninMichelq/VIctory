@@ -4662,6 +4662,11 @@ impl<'a> Lower<'a> {
     /// bits per place, place 0 lowest), as one quad operation when the
     /// pattern is a swap or a broadcast, else through [`Self::quad_pick`].
     fn quad_perm(&mut self, at: usize, x: V, perm: u8) -> V {
+        // Every lane's constant is the same. (Not a quad operation on a constant either: AMD's
+        // compiler crashed on `quadOp(1)`, the studio-shot programs' blur weight.)
+        if matches!(x, V::Const(_)) {
+            return x;
+        }
         let here = self.cur;
         self.cur = at;
         let r = self.quad_perm_here(x, perm);
@@ -4700,6 +4705,9 @@ impl<'a> Lower<'a> {
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
+        if matches!(x, V::Const(_)) {
+            return x;
+        }
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let three = self.s.m.i32(3);

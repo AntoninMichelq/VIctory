@@ -134,6 +134,9 @@ struct Learned {
     compares: Vec<(u8, V, V)>,
 }
 
+/// Calls whose result is their value operand (the second argument) as another lane has it.
+const LANE_READS: [&str; 3] = ["dx.op.quadOp.", "dx.op.quadReadLaneAt.", "dx.op.waveReadLaneAt."];
+
 fn mask(bits: u32) -> u64 {
     if bits >= 64 { !0 } else { (1 << bits) - 1 }
 }
@@ -619,6 +622,16 @@ impl Module {
                     }
                     _ => None,
                 }
+            }
+            // Another lane's copy of a constant is that constant. (AMD's compiler crashed on
+            // a quad operation of a constant.)
+            Op::Call(f, ref args)
+                if args.len() >= 2
+                    && matches!(args[1], V::Const(_))
+                    && self.type_of(args[1]) == ty
+                    && LANE_READS.iter().any(|n| self.funcs[f as usize].name.starts_with(n)) =>
+            {
+                Some(args[1])
             }
             _ => None,
         }
