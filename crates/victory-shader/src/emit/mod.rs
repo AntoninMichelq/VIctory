@@ -322,6 +322,120 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<HostShader, ShaderErr
     translate_native(&Container::parse(gs)?, &merged.program(), true)
 }
 
+/// What [`translate_es_gs`] emits now: which half, and for the ES half the
+/// rows of the record it hands over (the GS half's input signature).
+#[derive(Clone)]
+struct MergedHalf {
+    ring: lower::Ring,
+    es_outputs: Vec<container::SigElement>,
+}
+
+thread_local! {
+    static MERGED: std::cell::RefCell<Option<MergedHalf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Translates a merged ES+GS stage (a pipeline with a geometry shader) as a
+/// host vertex shader and a host geometry shader. `vs` is the vertex
+/// container (its ES program is the vertex half), `gs` the geometry
+/// container. What the halves pass through LDS goes through the host's
+/// stage I/O ([`lower::Ring`]): the GS container's input signature is the
+/// vertex shader's outputs, its output signature the geometry shader's
+/// (the console's copy shader exports output row n as parameter n - 1, row
+/// 0 as the position, which is what the pixel shader's signature expects of
+/// those names).
+///
+/// shortcut: the GS half's outputs are taken as `rows x 4` dwords per
+/// vertex in LDS, vertex after vertex, each written before its GS_EMIT, and
+/// the vertices it emits as the number of GS_EMIT messages in its code (no
+/// loops around them).
+pub fn translate_es_gs(vs: &[u8], gs: &[u8]) -> Result<(HostShader, HostShader), ShaderError> {
+    let stage_of = |bytes: &[u8], stage| -> Result<NativeProgram, ShaderError> {
+        let c = Container::parse(bytes)?;
+        let dxil = c
+            .part(FourCC::DXIL)
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| p.stage == stage)
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without the ES or GS program of a merged stage",
+            })
+    };
+    let merged = crate::merged::pair_es_gs(stage_of(vs, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    let gs_c = Container::parse(gs)?;
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        match gs_c.part(fourcc) {
+            Some(part) => signature(part.data),
+            None => Ok(Vec::new()),
+        }
+    };
+    let es_outputs = sig(FourCC::ISG1)?;
+    let gs_outputs = sig(FourCC::OSG1)?;
+    let rows = gs_outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+    let emits = crate::gfx10::decode(&merged.gs.code)?
+        .iter()
+        .filter(|i| i.name() == Some("s_sendmsg"))
+        .filter(|i| {
+            let imm = i.words[0] & 0xFFFF;
+            imm & 0xF == 2 && imm >> 4 & 2 != 0
+        })
+        .count() as u32;
+    if rows == 0 || emits == 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a geometry program without outputs or emits",
+        });
+    }
+    let es = NativeProgram {
+        layout: merged.layout.clone(),
+        code: without_lane_count_exec(&merged.es.code)?,
+        ..merged.es.clone()
+    };
+    let gs_program = NativeProgram {
+        code: without_lane_count_exec(&merged.gs.code)?,
+        ..merged.program()
+    };
+    let half = |ring, f: &dyn Fn() -> Result<HostShader, ShaderError>| {
+        MERGED.with(|m| {
+            *m.borrow_mut() = Some(MergedHalf {
+                ring,
+                es_outputs: es_outputs.clone(),
+            })
+        });
+        let r = f();
+        MERGED.with(|m| *m.borrow_mut() = None);
+        r
+    };
+    let vs_c = Container::parse(vs)?;
+    let host_vs = half(lower::Ring::Es, &|| translate_native(&vs_c, &es, true))?;
+    let host_gs = half(
+        lower::Ring::Gs {
+            record: rows * 4,
+            max_vertices: emits,
+        },
+        &|| translate_native(&gs_c, &gs_program, true),
+    )?;
+    Ok((host_vs, host_gs))
+}
+
+/// `code` without the merged stage's EXEC set-up from its lane counts
+/// (`s_bfm_b64 exec, ...` and `s_cselect_b64 exec, -1, exec` near the
+/// start): on the host every lane of either half is a whole vertex or
+/// primitive.
+fn without_lane_count_exec(code: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    const EXEC_LO: u32 = 126;
+    const S_NOP: u32 = 0xBF80_0000;
+    let mut out = code.to_vec();
+    for i in crate::gfx10::decode(code)?.iter().take(16) {
+        let sdst = i.words[0] >> 16 & 0x7F;
+        if matches!(i.name(), Some("s_bfm_b64" | "s_cselect_b64")) && sdst == EXEC_LO && i.words.len() == 1 {
+            out[i.offset..i.offset + 4].copy_from_slice(&S_NOP.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
 /// `merged`: the layout is the merged ES+GS stage's ([`resource::track_merged`]).
 fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Result<HostShader, ShaderError> {
     let p = crate::spill::build(native)?;
@@ -344,7 +458,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    if native.stage == HwStage::Gs {
+    if native.stage == HwStage::Gs && MERGED.with(|m| m.borrow().is_none()) {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: GS_EMIT,
@@ -619,8 +733,24 @@ fn emit_program(
         }
     };
     let pixel = native.stage == HwStage::Ps;
+    let merged = MERGED.with(|m| m.borrow().clone());
     let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut outputs = match &merged {
+        Some(m) if m.ring == lower::Ring::Es => m.es_outputs.clone(),
+        _ => sig(FourCC::OSG1)?,
+    };
+    // A geometry shader's inputs are a vertex shader's outputs, with their
+    // modes.
+    if merged.as_ref().is_some_and(|m| m.ring != lower::Ring::Es) {
+        for e in inputs.iter_mut() {
+            e.interp = match (e.kind, e.comp) {
+                (3, _) => 4,
+                (0 | 6 | 7, 9) => 2,
+                (0, _) => 1,
+                _ => 0,
+            };
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -716,6 +846,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        ring: merged.map_or(lower::Ring::None, |m| m.ring),
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1394,6 +1525,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            ring: Default::default(),
         })
         .unwrap();
         let mut dxil = l.dxil;
