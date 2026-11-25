@@ -622,42 +622,53 @@ fn find_player() -> Result<Player, String> {
     // else that happened to move alike.
     let positions: Vec<(usize, [f32; 3])> =
         player.iter().filter_map(|&a| read_matrix(a).map(|m| (a, [m[12], m[13], m[14]]))).collect();
-    let median = |k: usize| {
-        let mut v: Vec<f32> = positions.iter().map(|p| p.1[k]).collect();
-        v.sort_by(f32::total_cmp);
-        v.get(v.len() / 2).copied().unwrap_or_default()
-    };
-    let middle = [median(0), median(1), median(2)];
-    let near: Vec<usize> = positions
-        .iter()
-        .filter(|(_, p)| flat(*p, middle) < 5.0 && (p[2] - middle[2]).abs() < 5.0)
-        .map(|&(a, _)| a)
-        .collect();
-    tracing::info!(near = near.len(), ?middle, "tour: of those, the ones around the player");
-    if near.is_empty() || near.len() > 4096 {
-        return Err(format!("{} matrices around the player: cannot use them", near.len()));
+    // Bunches of candidates within 5 m of one another, densest first (far
+    // strays, and the mirrored copies an inverse matrix holds, make
+    // bunches of their own). Each, up to three, is lifted 8 m for 2 s and
+    // let go: the player's own stay up a moment (recomputed from the
+    // player, who moved); others snap back.
+    let close = |p: [f32; 3], q: [f32; 3]| flat(p, q) < 5.0 && (p[2] - q[2]).abs() < 5.0;
+    let mut left = positions;
+    let mut fallback = None;
+    for bunch in 1..=3 {
+        let Some(middle) = left
+            .iter()
+            .map(|&(_, p)| (left.iter().filter(|&&(_, q)| close(p, q)).count(), p))
+            .max_by_key(|&(n, _)| n)
+            .map(|(_, p)| p)
+        else {
+            break;
+        };
+        let (near, rest): (Vec<_>, Vec<_>) = left.into_iter().partition(|&(_, p)| close(p, middle));
+        left = rest;
+        let found = Player { addresses: near.iter().map(|&(a, _)| a).take(4096).collect() };
+        let up = [middle[0], middle[1], middle[2] + 8.0];
+        let hold = found.hold_at(up);
+        std::thread::sleep(Duration::from_secs(2));
+        drop(hold);
+        std::thread::sleep(Duration::from_millis(300));
+        let stayed = found
+            .addresses
+            .iter()
+            .filter_map(|&a| read_matrix(a))
+            .filter(|m| m[14] > middle[2] + 4.0)
+            .count();
+        tracing::info!(
+            bunch,
+            ?middle,
+            matrices = found.addresses.len(),
+            stayed,
+            "tour: a bunch of candidates lifted; those still up after it was let go"
+        );
+        if stayed * 4 >= found.addresses.len() && stayed > 0 {
+            return Ok(found);
+        }
+        fallback.get_or_insert(found);
     }
-    let found = Player { addresses: near };
-    // Proof: lifted 8 m for 2 s, then let go; if the player itself moved,
-    // the matrices recomputed from it stay up there for a moment.
-    let up = [middle[0], middle[1], middle[2] + 8.0];
-    let hold = found.hold_at(up);
-    std::thread::sleep(Duration::from_secs(2));
-    drop(hold);
-    std::thread::sleep(Duration::from_millis(300));
-    let stayed = found
-        .addresses
-        .iter()
-        .filter_map(|&a| read_matrix(a))
-        .filter(|m| m[14] > middle[2] + 4.0)
-        .count();
-    tracing::info!(stayed, of = found.addresses.len(), "tour: matrices still up after the lift was let go");
-    if stayed * 4 < found.addresses.len() {
-        // Gone on with all the same: held over and over at a place, the
-        // matrices may still carry the player (the results will say).
-        tracing::warn!("tour: the lift did not seem to move the player; going on all the same");
-    }
-    Ok(found)
+    // None proved itself: the densest is used all the same (held over and
+    // over at a place, it may still carry the player; the results say).
+    tracing::warn!("tour: no bunch proved to be the player; the densest is used");
+    fallback.ok_or_else(|| "no bunch of candidates".into())
 }
 
 #[cfg(test)]

@@ -423,6 +423,9 @@ fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
 impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
+        if touring() {
+            return S_OK;
+        }
         let _saves = saves_lock();
         let current = match current(&self.dir) {
             Ok(v) => v,
@@ -483,8 +486,29 @@ impl Update {
     }
 }
 
+/// The map tour (`VICTORY_TOUR`, diagnostics builds) moves the player in
+/// ways no play does: the title's saves are then taken and dropped, so the
+/// player's own save is left as it was.
+fn touring() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_TOUR").is_some());
+        if on {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::warn!("map tour: the title's saves are not written"));
+        }
+        on
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    false
+}
+
 /// Deletes a container: renamed away (one step), then removed.
 fn delete(root: &Path, name: &str) -> HRESULT {
+    if touring() {
+        return S_OK;
+    }
     let _saves = saves_lock();
     let dir = container_dir(root, name);
     match current_named(&dir, name) {
