@@ -449,6 +449,33 @@ fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Resu
     emit(c, native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// [`with_no_structures`]'s choice, for this thread's translations.
+    static NO_STRUCTURES_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with every ray-tracing node test
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) answering as a
+/// structure with nothing in it would: a box node returns no children, a
+/// leaf a miss, and no node is read. For runs without the title's structure
+/// builder (its stages are dropped), whose structures' memory holds whatever
+/// was there: traversing it gave the trace programs garbage hits and misses,
+/// which came out as 16-pixel blocks on the screen-space tracing's tiles
+/// (runs 113/114: present in all 21 frames with the builder off, gone with
+/// it on). With nothing to hit every ray misses, as an empty structure's
+/// would.
+pub fn with_no_structures<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = NO_STRUCTURES_HERE.replace(on);
+    let out = f();
+    NO_STRUCTURES_HERE.set(before);
+    out
+}
+
+/// Whether [`with_no_structures`] asked for it on this thread.
+pub(crate) fn no_structures_here() -> bool {
+    NO_STRUCTURES_HERE.get()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
