@@ -379,6 +379,8 @@ fn flush(clamps: &HostList, c: &Clamp, batch: Option<Batch>) {
     let (src, count, kind, stride, dst, ledger) = b.key;
     let constants = [kind, stride];
     let l = &clamps.list;
+    // Another pipeline: the next clamp binds its own again.
+    clamps.clamp_rebind();
     // SAFETY: an open list; our root signature and pipeline; the source,
     // count, destination and ledger buffers the clamps named (live while
     // the list is), and the jobs just written.
@@ -870,6 +872,19 @@ fn settle_later_with(c: &Clamp, l: &ID3D12GraphicsCommandList, chunk: &ID3D12Res
     }
 }
 
+/// `VICTORY_CLAMP_BIND_ONCE=1`: the hoisted clamps of a list bind their
+/// root signature, pipeline and budget once, not before each clamp (three
+/// calls fewer per indirect draw). After Belobug/VIctory-Belobug-AMD
+/// ab5ece8f (GPL-3). Off (the default): bound before each, as before.
+fn bind_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_CLAMP_BIND_ONCE").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "hoisted clamps bind their pipeline once a list (VICTORY_CLAMP_BIND_ONCE)");
+        on
+    })
+}
+
 /// Whether clamps of indirect draws go to a list before the one that draws.
 pub(crate) fn hoisting() -> bool {
     hoist_mode() != 0
@@ -975,14 +990,26 @@ pub(crate) fn bound_before(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
     // clamps write apart and charge the budget atomically.
+    // With `VICTORY_CLAMP_BIND_ONCE=1` the first clamp of the list binds
+    // the signature, pipeline and budget and the others find them bound,
+    // until something else binds compute state in `clamps` (a batch of
+    // mode 9, a clamp charged to a ledger entry).
+    // A clamp charged to a ledger entry binds another budget: it binds all,
+    // and the next clamp of the list binds all again (as after a batch).
+    let plain = entry.is_none();
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if !bind_once() || !plain || clamps.clamp_unbound() {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
+        if !plain {
+            clamps.clamp_rebind();
+        }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         if later.is_none() && (hoist_mode() == 7 || (hoist_mode() >= 8 && ran.is_none())) {
             l.ResourceBarrier(&[uav_barrier()]);

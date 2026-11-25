@@ -1688,6 +1688,9 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // The barriers leaving uploaded textures readable: together at the
+        // end (`VICTORY_UPLOAD_BARRIERS`).
+        let _held = crate::list::HoldReads::new(list);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;

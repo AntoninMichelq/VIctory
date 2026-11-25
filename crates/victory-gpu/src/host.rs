@@ -919,6 +919,9 @@ struct ClampChunks {
     /// the offsets of their heads, in order (made on first use).
     later: u32,
     heads: Option<(ID3D12Resource, usize)>,
+    /// Whether a clamp bound the clamps' root signature, pipeline and
+    /// budget in the list (`crate::indirect`, `VICTORY_CLAMP_BIND_ONCE`).
+    bound: bool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -5287,7 +5290,7 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
-            (chunks.used, chunks.at, chunks.barrier, chunks.entries, chunks.later) = (0, 0, false, 0, 0);
+            (chunks.used, chunks.at, chunks.barrier, chunks.entries, chunks.later, chunks.bound) = (0, 0, false, 0, 0, false);
             *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5329,6 +5332,8 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        // A barrier held for it (`VICTORY_UPLOAD_BARRIERS`) goes first.
+        crate::list::release_held(self, texture);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -5348,6 +5353,7 @@ impl HostList {
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
+        crate::list::release_held(self, &copy.texture);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -6043,6 +6049,20 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         Some((buffer, 0))
+    }
+
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, the others find
+    /// them bound. After Belobug/VIctory-Belobug-AMD ab5ece8f (GPL-3).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
+    }
+
+    /// Something else bound compute state in the list: the next clamp
+    /// binds its own again ([`HostList::clamp_unbound`]).
+    pub(crate) fn clamp_rebind(&self) {
+        self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner()).bound = false;
     }
 
     /// The hoisted clamps of this list waiting to be recorded together.
