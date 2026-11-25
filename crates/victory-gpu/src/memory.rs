@@ -84,6 +84,19 @@ struct Memory {
     /// Numbers given a copy during this `ready`: their copies are brought
     /// up to date by this list.
     fresh: Vec<usize>,
+    /// The frame each number's copy was last brought up to date in.
+    refreshed: Vec<u64>,
+    /// Copies given back (by where they start): one numbered again was
+    /// still read, through pointers that touch nothing here.
+    retired: std::collections::HashSet<u64>,
+    /// Copies numbered again after being given back: not given back for
+    /// idling, and the last given back for the cap.
+    sticky: std::collections::HashSet<u64>,
+    /// Since the last stats line: pages shaders faulted on, those of them
+    /// that got no copy, and copies numbered again after being given back.
+    faulted: u64,
+    unmapped: u64,
+    again: u64,
     /// Per host view heap (by address): the first slot of its run, and per
     /// number the copy whose view its slot holds (its id; 0: none).
     heaps: HashMap<usize, (u32, Vec<u64>)>,
@@ -127,6 +140,12 @@ impl Memory {
             touched: Vec::new(),
             cooling: Vec::new(),
             fresh: Vec::new(),
+            refreshed: Vec::new(),
+            retired: Default::default(),
+            sticky: Default::default(),
+            faulted: 0,
+            unmapped: 0,
+            again: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -194,6 +213,10 @@ impl Memory {
                 self.copies[n] = Some(shadow.clone());
                 self.touched[n] = std::time::Instant::now();
                 self.fresh.push(n);
+                if self.retired.remove(&shadow.span().0) {
+                    self.again += 1;
+                    self.sticky.insert(shadow.span().0);
+                }
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -253,6 +276,10 @@ impl Memory {
             at += PAGE;
         }
         self.cooling.push((n, self.frame));
+        if self.retired.len() > 1 << 16 {
+            self.retired.clear();
+        }
+        self.retired.insert(first);
     }
 
     /// Once a frame: copies nothing named or found for a while are given
@@ -270,15 +297,16 @@ impl Memory {
             };
             (var("VICTORY_MEMORY_IDLE_S", 30), var("VICTORY_MEMORY_COPIES_MB", 2048) << 20)
         });
+        let sticky = |m: &Memory, n: usize| m.copies[n].as_ref().is_some_and(|c| m.sticky.contains(&c.span().0));
         for n in 0..self.copies.len() {
-            if self.copies[n].is_some() && self.touched[n].elapsed().as_secs() >= idle_s {
+            if self.copies[n].is_some() && !sticky(self, n) && self.touched[n].elapsed().as_secs() >= idle_s {
                 self.retire(n);
             }
         }
         let mut live: Vec<usize> = (0..self.copies.len()).filter(|&n| self.copies[n].is_some()).collect();
         let mut bytes: u64 = live.iter().map(|&n| self.copies[n].as_ref().map_or(0, |c| c.span().1)).sum();
         if bytes > cap {
-            live.sort_by_key(|&n| self.touched[n]);
+            live.sort_by_key(|&n| (sticky(self, n), self.touched[n]));
             for n in live {
                 if bytes <= cap {
                     break;
@@ -315,8 +343,17 @@ impl Memory {
                 );
             }
         }
+        self.faulted += pages.len() as u64;
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            let at = u64::from(page) * PAGE;
+            self.map(at);
+            // SAFETY: inside the directory's mapping (map passes over pages
+            // past it, which then count as without a copy).
+            let has = u64::from(page) < u64::from(MEMORY_PAGES) - 1
+                && unsafe { self.directory.1.add(page as usize * 2).read() } != 0;
+            if !has {
+                self.unmapped += 1;
+            }
         }
     }
 
@@ -365,8 +402,16 @@ pub(crate) fn ready(
                 copies = count,
                 numbers = m.copies.len(),
                 mb = bytes >> 20,
-                "title memory by address: numbered copies, each refreshed by every list that runs such a shader"
+                faulted = m.faulted,
+                no_copy = m.unmapped,
+                numbered_again = m.again,
+                sticky = m.sticky.len(),
+                "title memory by address: numbered copies (brought up to date once a frame); since the last line, pages \
+                 shaders found without a copy, of them pages that got none, copies numbered again after being given back"
             );
+            m.faulted = 0;
+            m.unmapped = 0;
+            m.again = 0;
         }
     }
     for &address in addresses {
@@ -423,14 +468,31 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    // Brought up to date by the first list of a frame that runs such a
+    // shader, not by every one: asking the write watch over the 2 GB of
+    // copies and copying what changed, 30 times a frame, was 110-300 ms of
+    // every frame with the structure builder on (runs of 2026-11-25).
+    // `VICTORY_MEMORY_REFRESH_LISTS=1`: by every list again.
+    // shortcut: what the title writes there between two lists of a frame is
+    // seen by the first list of the next frame.
+    static EVERY_LIST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let every_list = *EVERY_LIST.get_or_init(|| std::env::var("VICTORY_MEMORY_REFRESH_LISTS").is_ok_and(|v| v == "1"));
+    let Memory { copies, fresh, refreshed, .. } = &mut *m;
+    refreshed.resize(copies.len(), u64::MAX);
+    for (n, shadow) in copies.iter().enumerate() {
         let Some(shadow) = shadow else {
             continue;
         };
         let (start, len) = shadow.span();
-        let fresh = m.fresh.contains(&n);
-        if first_read || fresh {
+        let fresh = fresh.contains(&n);
+        if fresh || first_read && (every_list || refreshed[n] != frame) {
             shadow.refresh(list, start, len);
+            refreshed[n] = frame;
+        } else if first_read {
+            // The list reads it through its slot: kept alive until the list
+            // is reset, as a refresh would keep it (a number given back
+            // makes its slot null and lets the buffer go).
+            list.keep(&shadow.buffer);
         }
         if writes && (first_write || fresh) {
             shadow.gpu_writes(list, start, len);
