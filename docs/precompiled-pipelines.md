@@ -99,9 +99,36 @@ state (blend, depth, raster, render target formats, input layout) is in the
 registers and info sections, which are not decoded; the stages found are
 logged. `VICTORY_UNKNOWN_PIPELINES=0` leaves both methods failing, as before.
 
+## Graphics registers (first look, 64 descriptions)
+
+`VICTORY_PRECOMPILED_DUMP=<dir>` (diagnostics) saves every section of the
+first 64 descriptions of each method. The graphics registers section is 97
+dwords (0x184). Most never change across the 64; the ones that do, read
+against GFX10's public register layouts:
+
+| dwords | values seen | reading |
+|--------|-------------|---------|
+| 14, 15 | `0x082c034x`, `0x12`/`0x14`/`0x18` | `SPI_SHADER_PGM_RSRC1/2` of the pixel program (VGPR/SGPR blocks, float mode `0xc0`, user SGPRs) |
+| 19, 20 | `0x022c[c]34x`, same | the same for the vertex program |
+| 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL`: `0x007007f0` = no depth test, no stencil; `0x2f7` = stencil, depth test and write |
+| 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (test value, mask `0xff`, write mask, op value) |
+| 51 | `0xffffffff` / `0` | a colour write mask over the eight targets (`CB_TARGET_MASK`-like) |
+| 52-59 | `0x80000000` (23), `0xe5040504` (25), ... | `CB_BLEND0..7_CONTROL`: bit 30 enable, bit 31 no ROP3; `0xe5040504` = source alpha / one minus source alpha, separate alpha the same |
+| 64-71 | `0x06000600` (23), `0x01540154` (25), ... | `SX_MRT0..7_BLEND_OPT`, matching dwords 52-59 (`6` = blending off) |
+| 63 | `0` / `0x33333333` | likely `SPI_SHADER_COL_FORMAT` (4 bits a target) |
+| 74 | `0x19fc0130` (47), `...01c0`, `...0120` | not identified (rasterizer or interpolation control) |
+| 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup) |
+
+**No render target or depth formats are in the description.** On the
+console they come with the targets bound at draw time; a host pipeline
+needs them at creation (`D3D12_RT_FORMAT_ARRAY`, the depth format). So a
+graphics pipeline of this method has to be made at its first draw, keyed
+by the formats bound then (and remade for other formats), with blend,
+depth-stencil and write masks taken from the dwords above and the
+rasterizer from the console defaults until dword 74 is read.
+
 ## Open
 
-- The registers and info sections of graphics descriptions: only their
-  first 16 bytes have been logged. A run that logs them whole (and the
-  graphics map) would let graphics pipelines be made too.
+- Making graphics pipelines at first draw from the bound formats (above).
+- Dwords 74 and 92-96 of the graphics registers, and the info section.
 - Two of the logged program heads were not found in `shaders.rpf`.

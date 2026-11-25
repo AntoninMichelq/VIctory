@@ -1003,7 +1003,27 @@ pub(crate) fn create_from_words(
     let mut seen: Vec<String> = Vec::new();
     // The programs of a description read as one (`crate::precompiled`),
     // else every (address, size) pair among the words.
-    let pairs: Vec<(u64, u64)> = match crate::precompiled::Description::parse(slot, words) {
+    let parsed = crate::precompiled::Description::parse(slot, words);
+    // Diagnostics: `VICTORY_PRECOMPILED_DUMP=<dir>` saves every section of
+    // the first 64 descriptions of each method as a file of its own
+    // (`<slot>-<n>-<role>.bin`), to work out what the graphics ones' state
+    // sections hold.
+    if let (Some(d), Some(dir)) = (&parsed, std::env::var_os("VICTORY_PRECOMPILED_DUMP")) {
+        static DUMPED: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+        let n = DUMPED[usize::from(slot == crate::precompiled::GRAPHICS_SLOT)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 64 {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            for s in &d.sections {
+                let mut bytes = vec![0u8; s.size as usize];
+                if read(s.address as usize, &mut bytes) {
+                    let _ = std::fs::write(dir.join(format!("{slot:x}-{n:02}-{:?}.bin", s.role)), &bytes);
+                }
+            }
+        }
+    }
+    let pairs: Vec<(u64, u64)> = match &parsed {
         Some(d) => d.code().map(|s| (s.address, s.size)).collect(),
         None => words.windows(2).map(|p| (p[0], p[1])).collect(),
     };
