@@ -1,0 +1,165 @@
+//! `VICTORY_COPY_STATS=1` (off by default): what goes between title memory
+//! and the host copies, by copy, in an INFO table every frame line (5 s):
+//! the 20 copies that move the most bytes a frame, each with its title
+//! address and size, where its host copy lives (the PC's memory or the
+//! card's), and its bytes a frame:
+//! - `up`: read from title memory into the copy, because the title's CPU
+//!   wrote the pages since the last refresh (write watch, or the guards of
+//!   physical views; our own copy-back writes count too: the next refresh
+//!   reads them again, an "echo");
+//! - `sent`: of a copy in the card's memory, bytes sent from its CPU side
+//!   to its card side;
+//! - `declared`: ranges shaders were declared to write (unordered access);
+//! - `snap`: of those, bytes snapshotted on the CPU before the submission
+//!   (copies in the PC's memory) to find what the shaders wrote;
+//! - `back`: bytes written back into title memory after the submission
+//!   (found by the CPU compare, or fetched from the card).
+//!
+//! Also why big buffers were not given a card copy (`VICTORY_CARD_BUFFERS`).
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// What a count is of (see the module's text).
+pub(crate) const UP: usize = 0;
+pub(crate) const SENT: usize = 1;
+pub(crate) const DECLARED: usize = 2;
+pub(crate) const SNAP: usize = 3;
+pub(crate) const BACK: usize = 4;
+const KINDS: usize = 5;
+
+/// One copy's counts since the last line.
+struct Row {
+    start: u64,
+    len: u64,
+    card: bool,
+    window: bool,
+    bytes: [u64; KINDS],
+    times: [u64; KINDS],
+}
+
+static ROWS: Mutex<Option<HashMap<u64, Row>>> = Mutex::new(None);
+
+/// Big title buffers (`VICTORY_CARD_BUFFERS_MIN_MB` or more) refused a card
+/// copy since the last line: the card was not ready, the bytes of card
+/// copies were at `VICTORY_CARD_BUFFERS_MB`, the card's memory in use was
+/// past four fifths of its budget, the host refused the buffer.
+pub(crate) static CARD_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Their bytes, by the same causes.
+pub(crate) static CARD_REFUSED_BYTES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether the counts are kept (`VICTORY_COPY_STATS=1`).
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_STATS").is_some_and(|v| v == "1"))
+}
+
+/// Counts `bytes` of kind `kind` for the copy numbered `id` (title
+/// memory from `start`, `len` bytes; in the card's memory: `card`; a
+/// window of memory outside buffers: `window`).
+pub(crate) fn add(id: u64, start: u64, len: u64, card: bool, window: bool, kind: usize, bytes: u64) {
+    if bytes == 0 || kind >= KINDS {
+        return;
+    }
+    let mut rows = ROWS.lock().unwrap_or_else(|e| e.into_inner());
+    let row = rows.get_or_insert_with(HashMap::new).entry(id).or_insert_with(|| Row {
+        start,
+        len,
+        card,
+        window,
+        bytes: [0; KINDS],
+        times: [0; KINDS],
+    });
+    row.bytes[kind] += bytes;
+    row.times[kind] += 1;
+}
+
+/// A big title buffer was refused a card copy for cause `cause` (see
+/// [`CARD_REFUSED`]).
+pub(crate) fn card_refused(cause: usize, bytes: u64) {
+    if on() && cause < 4 {
+        CARD_REFUSED[cause].fetch_add(1, Ordering::Relaxed);
+        CARD_REFUSED_BYTES[cause].fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Frames since the last table.
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// `n` more frames went by (with the frame counts).
+pub(crate) fn frames(n: u32) {
+    if on() {
+        FRAMES.fetch_add(u64::from(n), Ordering::Relaxed);
+    }
+}
+
+/// The table, per frame since the last one (with the frame line).
+pub(crate) fn line() {
+    if !on() {
+        return;
+    }
+    let rows = ROWS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let frames = (FRAMES.swap(0, Ordering::Relaxed) as f64).max(1.0);
+    let mb = |b: u64| b as f64 / 1e6 / frames;
+    let mut all: Vec<(u64, Row)> = rows.into_iter().collect();
+    let total = |r: &Row| r.bytes[UP] + r.bytes[SENT] + r.bytes[SNAP] + r.bytes[BACK];
+    let mut sums = [0u64; KINDS];
+    for (_, r) in &all {
+        for (s, b) in sums.iter_mut().zip(r.bytes) {
+            *s += b;
+        }
+    }
+    all.sort_unstable_by_key(|(_, r)| std::cmp::Reverse(total(r)));
+    let refused = |i: usize| {
+        (
+            CARD_REFUSED[i].swap(0, Ordering::Relaxed),
+            CARD_REFUSED_BYTES[i].swap(0, Ordering::Relaxed) >> 20,
+        )
+    };
+    let [not_ready, cap, full, host] = [0, 1, 2, 3].map(refused);
+    tracing::info!(
+        "copy stats per frame (VICTORY_COPY_STATS=1), {} copies moved bytes: up {:.1} MB, sent to the card {:.1} MB, \
+         declared shader writes {:.1} MB, snapshotted {:.1} MB, back {:.1} MB; big buffers refused a card copy since the \
+         last line: card not ready {} ({} MB), at VICTORY_CARD_BUFFERS_MB {} ({} MB), card past 80% of its budget {} ({} MB), \
+         host refused {} ({} MB); the top {}:",
+        all.len(),
+        mb(sums[UP]),
+        mb(sums[SENT]),
+        mb(sums[DECLARED]),
+        mb(sums[SNAP]),
+        mb(sums[BACK]),
+        not_ready.0,
+        not_ready.1,
+        cap.0,
+        cap.1,
+        full.0,
+        full.1,
+        host.0,
+        host.1,
+        all.len().min(20)
+    );
+    for (rank, (id, r)) in all.iter().take(20).enumerate() {
+        let per = |k: usize| r.times[k] as f64 / frames;
+        tracing::info!(
+            "copy stats #{:<2} copy {id} title {:#x}+{:.1} MB {}{}: up {:.2} MB ({:.0}x), sent {:.2} MB ({:.0}x), declared {:.2} MB ({:.0}x), \
+             snap {:.2} MB, back {:.2} MB ({:.0}x){}",
+            rank + 1,
+            r.start,
+            r.len as f64 / 1e6,
+            if r.card { "card" } else { "pc" },
+            if r.window { " window" } else { " buffer" },
+            mb(r.bytes[UP]),
+            per(UP),
+            mb(r.bytes[SENT]),
+            per(SENT),
+            mb(r.bytes[DECLARED]),
+            per(DECLARED),
+            mb(r.bytes[SNAP]),
+            mb(r.bytes[BACK]),
+            per(BACK),
+            // Echo: bytes read up again after we wrote them back.
+            if r.bytes[BACK] > 0 && r.bytes[UP] > 0 { " (up includes the echo of back)" } else { "" }
+        );
+    }
+}

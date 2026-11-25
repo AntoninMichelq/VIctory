@@ -208,6 +208,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let host = host()?;
     if !host.card_ready() {
+        crate::copytop::card_refused(0, size);
         return None;
     }
     // Only while the card has room: with this copy on it, a fifth of the
@@ -219,10 +220,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        crate::copytop::card_refused(2, size);
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        crate::copytop::card_refused(1, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -230,6 +233,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         Some(b) => crate::host::residency_high(b),
         None => {
             CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            crate::copytop::card_refused(3, size);
         }
     }
     buffer
@@ -324,7 +328,9 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            let ranges = joined(ranges);
+            shadow.top(crate::copytop::SENT, ranges.iter().map(|&(a, b)| (b - a) as u64).sum());
+            out.push((shadow, ranges));
         }
         true
     });
@@ -1647,6 +1653,14 @@ unsafe impl Sync for Shadow {}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
+    /// Counts `bytes` of kind `kind` for this copy (`VICTORY_COPY_STATS`,
+    /// [`crate::copytop`]).
+    pub(crate) fn top(&self, kind: usize, bytes: u64) {
+        if crate::copytop::on() {
+            crate::copytop::add(self.id, self.start, self.len, self.card.is_some(), self.window, kind, bytes);
+        }
+    }
+
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
     }
@@ -1796,6 +1810,7 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
+        self.top(crate::copytop::DECLARED, len as u64);
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -1826,6 +1841,7 @@ impl Shadow {
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        self.top(crate::copytop::SNAP, taken as u64);
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -1900,6 +1916,13 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let n = self.copy_back_with_counted(address, len, found);
+        self.top(crate::copytop::BACK, n as u64);
+        n
+    }
+
+    /// [`Shadow::copy_back_with`], before it is counted (`VICTORY_COPY_STATS`).
+    fn copy_back_with_counted(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -2021,6 +2044,13 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let n = self.relay_merge_counted(at, n, now, title);
+        self.top(crate::copytop::BACK, n as u64);
+        n
+    }
+
+    /// [`Shadow::relay_merge`], before it is counted (`VICTORY_COPY_STATS`).
+    fn relay_merge_counted(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -2373,6 +2403,13 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let n = self.update_counted(address, len);
+        self.top(crate::copytop::UP, n as u64);
+        n
+    }
+
+    /// [`Shadow::update`], before it is counted (`VICTORY_COPY_STATS`).
+    fn update_counted(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -2565,6 +2602,13 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        let n = self.card_merge_counted(at, gpu, title);
+        self.top(crate::copytop::BACK, n as u64);
+        n
+    }
+
+    /// [`Shadow::card_merge`], before it is counted (`VICTORY_COPY_STATS`).
+    fn card_merge_counted(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -2635,6 +2679,13 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let n = self.card_merge_relay_counted(at, gpu, fetched_after, title);
+        self.top(crate::copytop::BACK, n as u64);
+        n
+    }
+
+    /// [`Shadow::card_merge_relay`], before it is counted (`VICTORY_COPY_STATS`).
+    fn card_merge_relay_counted(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
