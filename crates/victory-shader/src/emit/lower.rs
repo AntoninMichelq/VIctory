@@ -382,6 +382,15 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// - 64: `v_rcp_f32` as a `fast` division, which the host computes with
 ///   its reciprocal instruction (as approximate as the console's) instead
 ///   of a full division.
+/// - 128: the safe forms of the bits above, which keep the old bits'
+///   meaning otherwise: with 16, the finite filter also covers 16-bit
+///   pixel outputs and the vertex and mesh programs' parameters (not their
+///   position, clip or cull distances: a NaN there drops the primitive on
+///   the console too); with 8, a tiny or zero `v_rcp_f32` denominator keeps
+///   its sign (-1e-30, not +1e-30); with 64, the division only allows the
+///   reciprocal (`arcp`), not the whole fast-math set, so the host compiler
+///   may not assume there is no NaN or infinity around it. Compute stores
+///   stay as they are (raw dwords: no telling floats apart).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -392,7 +401,7 @@ pub fn lean_math() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
-            & 127
+            & 255
     })
 }
 
@@ -3745,6 +3754,18 @@ impl<'a> Lower<'a> {
         let abs = self.s.m.bin(c, Bin::And, bits, mask);
         let inf = self.s.m.i32(0x7F80_0000);
         self.s.m.cmp(c, pred::IUGT, abs, inf)
+    }
+
+    /// `f`, or +0 where it is a NaN or an infinity.
+    fn finite_or_zero(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+        let m = self.s.m.bin(c, Bin::And, bits, magnitude);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let finite = self.s.m.cmp(c, pred::IULT, m, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, finite, f, zero)
     }
 
     /// The median of three. With a NaN among them the hardware gives the
@@ -7638,12 +7659,24 @@ impl<'a> Lower<'a> {
                     let small = self.s.m.f32(1e-30f32.to_bits());
                     let m = self.unary(6, a);
                     let under = self.s.m.cmp(c, pred::ULT, m, small);
-                    a = self.s.m.select(c, under, small, a);
+                    // Bit 128: of the sign of `a` (-0 and tiny negatives
+                    // give -1e30, as -inf on the console, not +1e30).
+                    let floor = if lean_math() & 128 != 0 {
+                        let bits = self.as_int(a);
+                        let sign = self.s.m.i32(0x8000_0000);
+                        let sign = self.s.m.bin(c, Bin::And, bits, sign);
+                        let k = self.s.m.i32(1e-30f32.to_bits());
+                        let signed = self.s.m.bin(c, Bin::Or, sign, k);
+                        self.as_float(signed)
+                    } else {
+                        small
+                    };
+                    a = self.s.m.select(c, under, floor, a);
                 }
                 let one = self.s.m.f32(1.0f32.to_bits());
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 if lean_math() & 64 != 0 {
-                    self.s.m.tag(r, Tag::Fast);
+                    self.s.m.tag(r, if lean_math() & 128 != 0 { Tag::Recip } else { Tag::Fast });
                 }
                 float(self, r)
             }
@@ -11462,14 +11495,26 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            // Bits 16 and 128: the parameters of vertex and mesh programs,
+            // and 16-bit pixel outputs, are made finite too.
+            let safe = lean_math() & (16 | 128) == 16 | 128;
+            let param = matches!(el.kind, 0 | 16);
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let mut f = self.as_float(x);
+                    if safe && (self.s.pixel || param) {
+                        f = self.finite_or_zero(f);
+                    }
+                    (".f32", f)
+                }
                 9 => {
                     let mut f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    if lean_math() & 16 != 0 && self.s.pixel && !mesh {
+                    if safe && param && !(self.s.pixel && !mesh) {
+                        f = self.finite_or_zero(f);
+                    } else if lean_math() & 16 != 0 && self.s.pixel && !mesh {
                         // finite: |bits| below the infinity's
                         let c = self.cur;
                         let bits = self.as_int(f);
