@@ -1798,7 +1798,19 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a draw; one whose shaders store to memory may have written
+    /// indirect arguments (`HostList::count_write`).
+    fn drawn(&self, list: &HostList) {
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        if crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        {
+            list.count_write();
+        }
     }
 
     /// `VICTORY_ARGS_PEEK=<hash prefix>,...`: the arguments (clamped, as
@@ -1962,7 +1974,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    self.drawn(list);
                     true
                 }
                 Err(_) => false,
@@ -2338,7 +2350,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn(list);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2460,7 +2472,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn(list);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2483,8 +2495,9 @@ impl State {
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        clamps: Option<&HostList>,
     ) -> bool {
-        let ran = self.execute_indirect_logged(list, (kind, stride, max), arguments, count);
+        let ran = self.execute_indirect_logged(list, (kind, stride, max), arguments, count, clamps);
         #[cfg(feature = "diagnostics")]
         self.trace_op(
             "indirect",
@@ -2500,6 +2513,7 @@ impl State {
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        clamps: Option<&HostList>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
@@ -2585,7 +2599,26 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        // A draw of a run whose clamps go to the list before this one
+        // (`crate::indirect::hoisting`, `crate::list`): nothing of ours comes
+        // between the draws. Dispatches may write arguments and rectangles
+        // are rewritten on the GPU: theirs stay before each.
+        let hoisted = match clamps {
+            Some(clamps) if kind != DISPATCH && self.topology != RECTANGLES => {
+                args.refresh(clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(clamps, *at, 4);
+                }
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                crate::indirect::bound_before(clamps, (&args.buffer, offset), count_arg, (kind, stride, max))
+            }
+            _ => None,
+        };
+        let inline = hoisted.is_none();
+        let windowed = inline
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -2602,9 +2635,10 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
-            Some(hit) => hit,
-            None => {
+        let (bounded, at) = match (hoisted, hit) {
+            (Some(hoisted), _) => hoisted,
+            (None, Some(hit)) => hit,
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -2667,7 +2701,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if inline {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2693,13 +2729,17 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
-        #[cfg(feature = "diagnostics")]
-        self.peek_args(list, &bounded, at, stride, max, kind);
+        if inline {
+            crate::indirect::done(list, &bounded);
+            // (Hoisted arguments stay readable as arguments only.)
+            #[cfg(feature = "diagnostics")]
+            self.peek_args(list, &bounded, at, stride, max, kind);
+        }
         if kind == DISPATCH {
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn(list);
         }
         true
     }

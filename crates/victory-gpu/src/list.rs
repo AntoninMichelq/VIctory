@@ -127,6 +127,12 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// While the last of `earlier` is the open list of the clamps of
+    /// `host`'s indirect draws ([`hoist`]): `host`'s dispatches and copies
+    /// when it began; once they change, the next run of draws gets a list
+    /// of its own (what ran since may have written their arguments).
+    #[cfg(windows)]
+    hoist: Option<u64>,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -222,7 +228,7 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: (usize, u64) = (384, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -278,6 +284,83 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// Ends the list of hoisted clamps of `list`'s draws, if one is open: the
+/// clamped arguments become readable as arguments and the list closes.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    if list.hoist.take().is_some()
+        && let Some(part) = list.earlier.last()
+    {
+        part.host.clamp_end();
+        part.host.close();
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here as at a wait
+/// ([`cut`], with no wait): what was recorded keeps its place, a list for
+/// the clamps of the draws to come follows it, and the recording goes on in
+/// another list after that, with the state the title set. The clamps list
+/// is returned while it is open. After Belobug/VIctory-Belobug-AMD ccab973
+/// (GPL-3), written anew on our parts.
+#[cfg(windows)]
+fn hoist(this: This) -> Option<&'static crate::host::HostList> {
+    if this.is_null() || !crate::indirect::hoisting() || !crate::queue::cuts() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let current = list.host.as_ref()?;
+    if list.hoist == Some(current.writes()) {
+        return list.earlier.last().map(|part| &part.host);
+    }
+    end_hoist(list);
+    let fresh = fresh_list()?;
+    let current = list.host.as_ref()?;
+    let (clamps, waits) = if current.untouched() {
+        // Nothing done yet: it holds the clamps itself (the state set in it
+        // does them no harm), behind the waits before it.
+        let old = list.host.replace(fresh)?;
+        (old, std::mem::take(&mut list.gate))
+    } else {
+        let Some(clamps) = fresh_list() else {
+            // No second list: the first goes back, unused.
+            recycle_unused(fresh);
+            return None;
+        };
+        current.close();
+        let done = list.host.replace(fresh)?;
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: done });
+        (clamps, Vec::new())
+    };
+    list.earlier.push(Part { waits, host: clamps });
+    static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(parts = list.earlier.len() + 1, "a list is cut for the clamps of a run of indirect draws");
+    }
+    let host = list.host.as_ref()?;
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).replay(host);
+    list.hoist = Some(host.writes());
+    list.earlier.last().map(|part| &part.host)
+}
+
+/// A host list taken for a cut and not used: closed and given back.
+#[cfg(windows)]
+fn recycle_unused(host: crate::host::HostList) {
+    host.close();
+    recycle(
+        vec![Detached {
+            host,
+            _uploads: Vec::new(),
+            _state: Default::default(),
+        }],
+        &[0],
+    );
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
@@ -303,6 +386,7 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -589,6 +673,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        hoist: None,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -619,6 +705,12 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists and does not record
+        // into it while it closes it.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -644,6 +736,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         list.earlier.clear();
         list.gate.clear();
     }
@@ -815,6 +908,11 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -841,6 +939,11 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
+    }
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -930,6 +1033,11 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1338,6 +1446,11 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -1393,6 +1506,11 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
+    }
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1751,8 +1869,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let clamps = if kind == DISPATCH { None } else { hoist(this) };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, clamps);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2090,6 +2209,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        // What may write indirect arguments (`hoist`).
+        list.count_write();
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
