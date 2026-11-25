@@ -66,7 +66,10 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+#ifndef BUDGET_LOG2
+#define BUDGET_LOG2 27
+#endif
+static const uint BUDGET = 1u << BUDGET_LOG2;
 // Where a ledger entry's cost stops (two of them still fit 32 bits).
 static const uint LEDGER_CAP = 1u << 30;
 // Groups of one dispatch; more run empty.
@@ -171,6 +174,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         over = !ledger && (before >= BUDGET || BUDGET - before < cost);
     }
+    if (over) {
+        // Diagnostics: records emptied by the budget (`over` is never set
+        // with a ledger, so `budget` is the list's own here).
+        budget.InterlockedAdd(12, 1);
+    }
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -199,12 +207,18 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// charged the budget in turn; the costs are zeroed for the list's next use.
 /// Entries are 16 bytes: cost, active records, count to run, unused.
 const SETTLE: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1)"
 cbuffer Entries : register(b0) {
     uint entries;
 };
 RWByteAddressBuffer ledger : register(u0);
-static const uint BUDGET = 1u << 27;
+// The list's budget words, for the diagnostics only (word 3: records
+// emptied by the budget).
+RWByteAddressBuffer budget : register(u1);
+#ifndef BUDGET_LOG2
+#define BUDGET_LOG2 27
+#endif
+static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint CAP = 1u << 30;
 // One wave's worth: most runs hold a few clamps, and a large group is
 // slow to start and to walk for them.
@@ -234,7 +248,11 @@ void main(uint t : SV_GroupIndex) {
         if (j < entries) {
             uint upto = min(carry + sums[t], CAP);
             uint active = ledger.Load(j * 16 + 4);
-            ledger.Store(j * 16 + 8, (cost == 0 || upto <= BUDGET) ? active : 0);
+            bool runs = cost == 0 || upto <= BUDGET;
+            ledger.Store(j * 16 + 8, runs ? active : 0);
+            if (!runs && active > 0) {
+                budget.InterlockedAdd(12, active);
+            }
             ledger.Store(j * 16, 0);
         }
         uint whole = sums[63];
@@ -261,7 +279,10 @@ cbuffer Settle : register(b0) {
 ByteAddressBuffer heads : register(t0);
 RWByteAddressBuffer chunk : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+#ifndef BUDGET_LOG2
+#define BUDGET_LOG2 27
+#endif
+static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint WIDE = 1024;
 groupshared uint scan[WIDE];
 groupshared uint carry;
@@ -317,6 +338,7 @@ void main(uint tid : SV_GroupIndex) {
                 if (c == 0) continue;
                 if (run >= BUDGET || BUDGET - run < c) {
                     run = BUDGET;
+                    budget.InterlockedAdd(12, 1);
                     if (kind <= 1) {
                         chunk.Store2(at, uint2(0, 0));
                     } else {
@@ -441,7 +463,7 @@ pub(crate) const LEDGER_BYTES: u64 = LEDGER_ENTRIES as u64 * 16;
 /// Records in `list`, after the clamps of a run went to `ledger`'s first
 /// `entries` entries, which of them run ([`SETTLE`]). The ledger stays
 /// writable by shaders; the caller makes it readable as arguments.
-pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, entries: u32) -> bool {
+pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, entries: u32, budget: u64) -> bool {
     let Some(c) = settle_pipeline() else {
         return false;
     };
@@ -453,6 +475,7 @@ pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, 
         list.SetPipelineState(&c.pso);
         list.SetComputeRoot32BitConstants(0, 1, (&raw const entries).cast(), 0);
         list.SetComputeRootUnorderedAccessView(1, ledger.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(2, budget);
         list.Dispatch(1, 1, 1);
     }
     true
@@ -489,11 +512,33 @@ fn compile_for(device: &ID3D12Device, source: &str) -> windows::core::Result<Cla
     compile_with(device, source, false)
 }
 
+/// `VICTORY_CLAMP_BUDGET=<n>`: a list's budget of indirect work is 2^n
+/// vertex instances or threads (20 to 29; 27, the default, as before).
+/// Records past it run empty (counted in the frame's INFO line "indirect
+/// records emptied by the budget"), so geometry drawn late in a busy list
+/// can vanish; a higher budget lets more run, at the risk of longer
+/// submissions if arguments are garbage.
+fn budget_log2() -> &'static std::ffi::CStr {
+    static LOG2: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    LOG2.get_or_init(|| {
+        let n = std::env::var("VICTORY_CLAMP_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| (20..=29).contains(n))
+            .unwrap_or(27);
+        tracing::info!(log2 = n, "indirect work budget per list (VICTORY_CLAMP_BUDGET)");
+        std::ffi::CString::new(n.to_string()).unwrap_or_default()
+    })
+}
+
 fn compile_with(device: &ID3D12Device, source: &str, batch: bool) -> windows::core::Result<Clamp> {
+    let log2 = windows::core::PCSTR(budget_log2().as_ptr().cast());
     let defines = [
+        D3D_SHADER_MACRO { Name: s!("BUDGET_LOG2"), Definition: log2 },
         D3D_SHADER_MACRO { Name: s!("BATCH"), Definition: s!("1") },
         D3D_SHADER_MACRO::default(),
     ];
+    let plain = [D3D_SHADER_MACRO { Name: s!("BUDGET_LOG2"), Definition: log2 }, D3D_SHADER_MACRO::default()];
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -502,7 +547,7 @@ fn compile_with(device: &ID3D12Device, source: &str, batch: bool) -> windows::co
             source.as_ptr().cast(),
             source.len(),
             s!("clamp"),
-            batch.then_some(defines.as_ptr()),
+            Some(if batch { defines.as_ptr() } else { plain.as_ptr() }),
             None,
             s!("main"),
             s!("cs_5_1"),

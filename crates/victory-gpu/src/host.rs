@@ -1518,9 +1518,10 @@ pub(crate) fn dred_on() -> bool {
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
-/// count a record asked for, and the groups asked in all (from the lists'
-/// budget buffers, a run late).
-static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// count a record asked for, and the groups asked in all; and indirect
+/// records of any kind the list's budget emptied (from the lists' budget
+/// buffers, a run late).
+static MESH_GROUPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -6618,7 +6619,9 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                // Word 3: records the budget emptied.
+                MESH_GROUPS[2].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
+                for k in 0..4 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6836,7 +6839,10 @@ impl HostList {
         let used = chunks.used;
         let entries = std::mem::take(&mut chunks.entries);
         let settled = match &chunks.ledger {
-            Some((ledger, _)) if entries > 0 => crate::indirect::settle(&self.list, ledger, entries),
+            Some((ledger, _)) if entries > 0 => match self.budget() {
+                Some(budget) => crate::indirect::settle(&self.list, ledger, entries, budget),
+                None => false,
+            },
             _ => false,
         };
         let ledger = chunks
@@ -7539,8 +7545,9 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let emptied = MESH_GROUPS[2].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; indirect records emptied by the budget (VICTORY_CLAMP_BUDGET): {emptied:.1} per frame"
         );
         late_line(frames);
         if async_compute() {
