@@ -1686,6 +1686,20 @@ impl State {
         };
         let mut evicted = false;
         let mut refused = 0;
+        // Small copies made while the card was full are made whole again
+        // once it has room (at most once a second, up to the low mark).
+        if less.is_some() && room && PASS_BUDGET.get().is_none() {
+            static LAST_UP: AtomicU64 = AtomicU64::new(0);
+            let (now, last) = (crate::host::now_ms(), LAST_UP.load(Ordering::Relaxed));
+            if now.saturating_sub(last) >= 1000
+                && LAST_UP.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let up = crate::resource::room_up(memory);
+                if up > 0 {
+                    host.texture_slots_upgrade(up, 256);
+                }
+            }
+        }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1835,6 +1849,7 @@ impl State {
             // A small copy while the card is full (`VICTORY_EVICT_LESS=1`).
             let small = !room;
             crate::resource::shrinking(small);
+            let shrunk_before = crate::resource::SHRUNK.load(Ordering::Relaxed);
             let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1846,7 +1861,7 @@ impl State {
                     continue;
                 }
             };
-            if small && crate::resource::shrunk_levels(resource) > 0 {
+            if small && crate::resource::SHRUNK.load(Ordering::Relaxed) > shrunk_before {
                 let n = HEAP_TEXTURES_SMALL.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::info!(
