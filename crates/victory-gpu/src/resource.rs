@@ -1308,12 +1308,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
         // A small copy while the card is full ([`shrinking`]).
-        let extra = if SHRINK.get() { shrink_levels(&r.desc, mip_skip(&r.desc)) } else { 0 };
+        let extra = small_extra(&r.desc);
         r.host.shrunk.store(extra, Relaxed);
-        if extra > 0 {
-            SHRUNK.fetch_add(1, Relaxed);
-        }
-        let Some(texture) = host_texture(&r.desc, mip_skip(&r.desc) + extra, r.host.state, clear) else {
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1445,6 +1442,26 @@ fn hysteresis() -> Option<(u64, u64)> {
 std::thread_local! {
     /// Host copies made on this thread now are made small ([`shrinking`]).
     static SHRINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+std::thread_local! {
+    /// Levels the host copy [`hosted`] makes on this thread now leaves off
+    /// for being small ([`small_extra`]), read by [`host_texture`].
+    static EXTRA: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// For [`hosted`], about to make a host copy of a texture described by
+/// `desc`: the levels it leaves off for being small ([`shrinking`]), also
+/// set for [`host_texture`] on this thread (0 when not making it small).
+#[cfg(windows)]
+fn small_extra(desc: &ResourceDesc) -> u32 {
+    let extra = if SHRINK.get() { shrink_levels(desc, mip_skip(desc)) } else { 0 };
+    EXTRA.set(extra);
+    if extra > 0 {
+        SHRUNK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    extra
 }
 
 /// Host copies made small while the card was full ([`shrinking`]), since
@@ -1913,7 +1930,6 @@ pub(crate) fn subresources(this: This) -> u32 {
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
-    skip: u32,
     state: u32,
     clear: *const c_void,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
@@ -1927,6 +1943,8 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    let skip = mip_skip(desc);
+    let skip = skip + EXTRA.get();
     if skip > 0 {
         d.width >>= skip;
         d.height >>= skip;

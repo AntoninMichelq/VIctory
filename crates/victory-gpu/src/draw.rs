@@ -409,8 +409,8 @@ fn evict_less() -> Option<u64> {
 /// part) or without it again, since the start ([`partly_clamp`]).
 pub(crate) static HEAP_TEXTURES_CLAMPED: AtomicU64 = AtomicU64::new(0);
 /// Title slots whose views sample no level above the first one all there,
-/// by slot: that level.
-static PARTLY_CLAMPED: std::sync::Mutex<std::collections::BTreeMap<u32, u32>> =
+/// by slot: the title texture and that level.
+static PARTLY_CLAMPED: std::sync::Mutex<std::collections::BTreeMap<u32, (usize, u32)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// `VICTORY_PARTLY_CLAMP` (on; `=0` off): a texture streaming in that was
@@ -1898,31 +1898,25 @@ impl State {
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
             }
-            if tabled {
-                // Nothing was staged here, so nothing is counted or spent,
-                // and the staging buffer stays: taking it away made the
-                // next draw that reads the texture through a table stage,
-                // detile and upload all of it once more.
-                HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
-                host.texture_slot_done(index, write, again);
-                continue;
-            }
-            // Uploaded: the list holds the staging buffer until it has run;
-            // a table read, or the next look at a texture not all mapped
-            // yet, makes it anew. (Kept for those until now: every partly
-            // streamed texture of the heap held a staging buffer of its full
-            // size for good.)
             // Uploaded in part: the levels not there yet are not sampled
-            // (they read zeros); all of them again once it is whole.
+            // (they read zeros); all of them again once it is whole. Before
+            // the tabled case below, which the clamp concerns as much (it
+            // stayed on for good there once the texture was whole), and by
+            // texture: a slot written with another texture since is made
+            // again too.
             if partly_clamp() {
                 let least = if partly.is_some() { crate::texture::first_whole_level(resource).unwrap_or(0) } else { 0 };
                 let mut clamped = PARTLY_CLAMPED.lock().unwrap_or_else(|e| e.into_inner());
-                let before = clamped.get(&index).copied().unwrap_or(0);
-                if least != before {
+                let before = clamped.get(&index).copied();
+                let changed = match before {
+                    Some((texture, level)) => texture != resource as usize || level != least,
+                    None => least != 0,
+                };
+                if changed {
                     if least == 0 {
                         clamped.remove(&index);
                     } else {
-                        clamped.insert(index, least);
+                        clamped.insert(index, (resource as usize, least));
                     }
                     drop(clamped);
                     if let Some(handle) = heap.handle(index) {
@@ -1938,6 +1932,20 @@ impl State {
                     }
                 }
             }
+            if tabled {
+                // Nothing was staged here, so nothing is counted or spent,
+                // and the staging buffer stays: taking it away made the
+                // next draw that reads the texture through a table stage,
+                // detile and upload all of it once more.
+                HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
+                host.texture_slot_done(index, write, again);
+                continue;
+            }
+            // Uploaded: the list holds the staging buffer until it has run;
+            // a table read, or the next look at a texture not all mapped
+            // yet, makes it anew. (Kept for those until now: every partly
+            // streamed texture of the heap held a staging buffer of its full
+            // size for good.)
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);

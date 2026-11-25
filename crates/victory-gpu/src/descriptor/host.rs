@@ -2531,8 +2531,10 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// Whether DXGI format `format` is read as integers (`_UINT`, `_SINT`).
 fn integer_format(format: u32) -> bool {
     const UINT: [u32; 11] = [3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62];
-    const SINT: [u32; 9] = [4, 8, 14, 18, 32, 38, 43, 52, 64];
-    UINT.contains(&format) || SINT.contains(&format)
+    const SINT: [u32; 10] = [4, 8, 14, 18, 32, 38, 43, 52, 59, 64];
+    // The stencil planes' views (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT).
+    const STENCIL: [u32; 2] = [22, 47];
+    UINT.contains(&format) || SINT.contains(&format) || STENCIL.contains(&format)
 }
 
 /// `VICTORY_WAIT_GREY` (on; `=0` off): a texture slot that waits for its host
@@ -2599,7 +2601,10 @@ fn grey_texture() -> Option<&'static ID3D12Resource> {
             return None;
         }
         let texture = texture?;
-        let texels = [0x0080_8080u32; 16];
+        // Alpha 0 as a null view's (`VICTORY_GREY_ALPHA=1`: opaque, for
+        // cards whose colour is weighed by alpha, which drew black).
+        let alpha = if std::env::var_os("VICTORY_GREY_ALPHA").is_some_and(|v| v == "1") { 0xff00_0000 } else { 0 };
+        let texels = [0x0080_8080u32 | alpha; 16];
         for slice in 0..6 {
             // SAFETY: mapped with no pointer (as WriteToSubresource asks);
             // 16 texels of 4 bytes, rows of 16 bytes, one slice; the
@@ -2607,7 +2612,11 @@ fn grey_texture() -> Option<&'static ID3D12Resource> {
             let written = unsafe {
                 texture
                     .Map(slice, None, None)
-                    .and_then(|()| texture.WriteToSubresource(slice, None, texels.as_ptr().cast(), 16, 64))
+                    .and_then(|()| {
+                        let written = texture.WriteToSubresource(slice, None, texels.as_ptr().cast(), 16, 64);
+                        texture.Unmap(slice, None);
+                        written
+                    })
             };
             if let Err(e) = written {
                 tracing::warn!(error = %e, "the grey stand-in texture could not be written: slots given up read zeros");
