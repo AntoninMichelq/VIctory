@@ -362,6 +362,13 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// `VICTORY_LOOP_ABORT_KEEPS_DEPTH=1` (see `abort_block`). Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+fn abort_keeps_depth() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_ABORT_KEEPS_DEPTH").is_some_and(|v| v == "1"))
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -11595,7 +11602,13 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
-        if self.s.pixel {
+        // `VICTORY_LOOP_ABORT_KEEPS_DEPTH=1`: a pixel lane stopped by the
+        // limit leaves with what it exported so far instead of discarding.
+        // The discard put in every pixel program with a loop (the
+        // characters' deferred one has 21) is one the title's code does
+        // not have, and a program that can discard has its depth written
+        // late, after it ran, not before.
+        if self.s.pixel && !abort_keeps_depth() {
             let t = self.s.m.bool(true);
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
