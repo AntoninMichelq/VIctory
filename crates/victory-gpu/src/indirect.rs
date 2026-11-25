@@ -786,17 +786,33 @@ fn record_clamp_flags(
 /// (and one count buffer) with one kind and stride batched into one
 /// dispatch ([`Batch`]), as each dispatch of ours costs the card more than
 /// the few records it clamps.
+/// Live (`crate::live`) between the hoisted modes 1, 7, 8 and 9 (each
+/// clamp reads it; what a list holds is settled by what it holds, at its
+/// end); hoisted or not (0) stays as at the start, which decides how
+/// lists are cut.
 pub(crate) fn hoist_mode() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let set = std::env::var("VICTORY_HOIST_CLAMPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u8>().ok())
+    static START: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    static MODE: crate::live::Switch = crate::live::Switch::new();
+    let parse = |v: Option<&str>| {
+        v.and_then(|v| v.trim().parse::<u8>().ok())
             .filter(|n| matches!(n, 0 | 1 | 7 | 8 | 9))
-            .unwrap_or(9);
+            .unwrap_or(9)
+    };
+    let start = *START.get_or_init(|| {
+        let set = parse(std::env::var("VICTORY_HOIST_CLAMPS").ok().as_deref());
         tracing::info!(mode = set, "clamps of indirect draws (VICTORY_HOIST_CLAMPS): 0 before each draw, 1/7/8/9 hoisted");
         set
-    })
+    });
+    if start == 0 {
+        return 0;
+    }
+    MODE.get("VICTORY_HOIST_CLAMPS", |v, _| match parse(v) {
+        0 => {
+            tracing::warn!("VICTORY_HOIST_CLAMPS=0 is not taken while the title runs (hoisted at the start): the start's mode stays");
+            u64::from(start)
+        }
+        n => u64::from(n),
+    }) as u8
 }
 
 /// The pass that charges the budget of clamps recorded without waits
@@ -824,13 +840,18 @@ fn settler_later() -> Option<&'static Clamp> {
 /// with its wait (the card drained between two of them) and a lock-step
 /// charge of the budget in host memory per record. Off (the default): as
 /// before.
+/// Live (`crate::live`): each clamp reads it; a list settles at its end
+/// the clamps it recorded to be settled.
 pub(crate) fn batching() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_CLAMP_BATCH").is_ok_and(|v| v.trim() == "1");
-        tracing::info!(on, "clamps of a list settled in one pass (VICTORY_CLAMP_BATCH)");
-        on && hoisting()
-    })
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    let on = ON.get("VICTORY_CLAMP_BATCH", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if first {
+            tracing::info!(on, "clamps of a list settled in one pass (VICTORY_CLAMP_BATCH)");
+        }
+        u64::from(on)
+    });
+    on == 1 && hoisting()
 }
 
 /// How many of a list's clamps one settling pass takes; the ones after
@@ -876,13 +897,16 @@ fn settle_later_with(c: &Clamp, l: &ID3D12GraphicsCommandList, chunk: &ID3D12Res
 /// root signature, pipeline and budget once, not before each clamp (three
 /// calls fewer per indirect draw). After Belobug/VIctory-Belobug-AMD
 /// ab5ece8f (GPL-3). Off (the default): bound before each, as before.
+/// Live (`crate::live`): turned on in a list, the next clamp binds all.
 fn bind_once() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_CLAMP_BIND_ONCE").is_ok_and(|v| v.trim() == "1");
-        tracing::info!(on, "hoisted clamps bind their pipeline once a list (VICTORY_CLAMP_BIND_ONCE)");
-        on
-    })
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_CLAMP_BIND_ONCE", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if first {
+            tracing::info!(on, "hoisted clamps bind their pipeline once a list (VICTORY_CLAMP_BIND_ONCE)");
+        }
+        u64::from(on)
+    }) == 1
 }
 
 /// Whether clamps of indirect draws go to a list before the one that draws.

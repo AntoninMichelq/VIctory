@@ -112,15 +112,17 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
 /// priority (`ID3D12Device1::SetResidencyPriority`), the rest keeps the
 /// normal one: past the budget the system moves textures to the PC's
 /// memory before those, which every frame writes or reads.
+/// Live (`crate::live`): for the resources made after a change.
 pub(crate) fn residency_high(resource: &ID3D12Resource) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_RESIDENCY_PRIORITY").is_some_and(|v| v == "1");
-        if on {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    let on = ON.get("VICTORY_RESIDENCY_PRIORITY", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if on && first {
             tracing::info!("VICTORY_RESIDENCY_PRIORITY=1: targets, depth, unordered access and card buffers kept on the card first");
         }
-        on
-    }) {
+        u64::from(on)
+    });
+    if on == 0 {
         return;
     }
     let Some(host) = host() else { return };
@@ -7025,6 +7027,8 @@ impl Meter {
             }
             memory_line(host().and_then(|h| h.video_memory()));
             tracing::info!(
+                // The configuration of live switches (`crate::live`).
+                live = crate::live::config(),
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \

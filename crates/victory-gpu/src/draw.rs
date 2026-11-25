@@ -392,20 +392,20 @@ pub(crate) static HEAP_TEXTURES_SMALL: AtomicU64 = AtomicU64::new(0);
 /// that found the card full gave up the 256 oldest made slots, whether that
 /// freed anything or not, while their copies took 5 s idle to go: 33,000
 /// to 65,000 slots grey or black in five minutes of the common room.
+/// Live (`crate::live`): `VICTORY_EVICT_LESS` (its `_MS` too) is read by
+/// each pass; `_SIZE` and `_MAX` once.
 fn evict_less() -> Option<u64> {
-    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        if std::env::var_os("VICTORY_EVICT_LESS").is_none_or(|v| v != "1") {
-            return None;
-        }
-        let ms = std::env::var("VICTORY_EVICT_LESS_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(6000u64)
-            .max(500);
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    static MS: crate::live::Switch = crate::live::Switch::new();
+    let on = ON.get("VICTORY_EVICT_LESS", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1")));
+    if on == 0 {
+        return None;
+    }
+    Some(MS.get("VICTORY_EVICT_LESS_MS", |v, _| {
+        let ms = v.and_then(|v| v.trim().parse().ok()).unwrap_or(6000u64).max(500);
         tracing::info!(every_ms = ms, "VICTORY_EVICT_LESS=1: slots given up by bytes, least used first; small copies while the card is full");
-        Some(ms)
-    })
+        ms
+    }))
 }
 /// Slots made again with a lowest level of detail (a texture uploaded in
 /// part) or without it again, since the start ([`partly_clamp`]).
@@ -3509,17 +3509,10 @@ fn peek_dispatch(pipeline: usize, groups: [u32; 3]) {
     tracing::info!(pipeline = %p.name, x, y, z, groups = u64::from(x) * u64::from(y) * u64::from(z), "VICTORY_DISPATCH_PEEK: a direct dispatch");
 }
 
+/// Live (`crate::live`): each draw reads it.
 fn flat_wanted(name: &str) -> bool {
-    static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let wanted = WANTED.get_or_init(|| {
-        std::env::var("VICTORY_FLAT_INSTANCES")
-            .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect()
-    });
-    !wanted.is_empty() && wanted.iter().any(|w| name.contains(w.as_str()))
+    static WANTED: crate::live::Words = crate::live::Words::new();
+    WANTED.any_in("VICTORY_FLAT_INSTANCES", name)
 }
 
 /// Our index and vertex buffers for flat draws: the index buffer's views
