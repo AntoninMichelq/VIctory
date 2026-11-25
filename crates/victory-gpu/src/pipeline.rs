@@ -1621,6 +1621,22 @@ mod rect_diag {
         out
     }
 
+    /// The names of a DXIL signature part's elements.
+    fn signature_names(dxil: &[u8], part: victory_shader::FourCC) -> Vec<String> {
+        let Ok(c) = victory_shader::Container::parse(dxil) else { return Vec::new() };
+        let Some(part) = c.part(part) else { return Vec::new() };
+        let d = part.data;
+        let word = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+        (0..word(0) as usize)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let name_at = word(at + 4) as usize;
+                let end = d[name_at..].iter().position(|&b| b == 0).unwrap();
+                format!("{}{}", String::from_utf8_lossy(&d[name_at..name_at + end]), word(at + 8))
+            })
+            .collect()
+    }
+
     #[test]
     #[ignore = "reads the title's shader pack and needs the host GPU"]
     fn rect_pairs_make_their_pipelines() {
@@ -1674,7 +1690,7 @@ mod rect_diag {
                         ps.translated().is_some()
                     );
                 };
-                println!("{v}/{p} topology {topology}: made, rectangle geometry stage {}", made.rects);
+                println!("{v}/{p} topology {topology}: made, rectangle geometry stage {}, pixel outputs {:?}", made.rects, ps.translated().map(|t| signature_names(&t.host.dxil, victory_shader::FourCC::OSG1)));
                 assert!(topology != 17 || made.rects, "{v}/{p}: made without its rectangle geometry stage");
             }
         }

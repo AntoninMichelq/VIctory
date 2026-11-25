@@ -294,6 +294,8 @@ mod at {
     pub const STENCIL_CONTROL: usize = 47;
     pub const STENCIL_REF_MASK: usize = 48;
     pub const STENCIL_REF_MASK_BF: usize = 49;
+    /// `PA_SU_POLY_OFFSET_CLAMP`, then `_FRONT_SCALE` and `_FRONT_OFFSET`.
+    pub const POLY_OFFSET: usize = 43;
     /// `CB_TARGET_MASK`: four bits (RGBA) a target.
     pub const TARGET_MASK: usize = 51;
     /// `CB_BLEND0_CONTROL`, seven more after it.
@@ -364,18 +366,22 @@ pub struct DepthStencil {
 }
 
 /// Rasterizer state, in D3D12's numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Raster {
     /// `D3D12_CULL_MODE`: 1 none, 2 front, 3 back.
     pub cull: u32,
     pub front_ccw: bool,
     pub wireframe: bool,
     pub depth_clip: bool,
+    /// `DepthBias`, `SlopeScaledDepthBias`, `DepthBiasClamp`.
+    pub depth_bias: i32,
+    pub slope_bias: f32,
+    pub bias_clamp: f32,
 }
 
 /// The pipeline state a graphics description's registers section holds,
 /// as far as it is read ([`GraphicsRegisters::decode`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraphicsRegisters {
     pub blend: [TargetBlend; 8],
     /// `D3D12_COLOR_WRITE_ENABLE` bits per target.
@@ -408,6 +414,9 @@ impl GraphicsRegisters {
                 front_ccw: true,
                 wireframe: false,
                 depth_clip: true,
+                depth_bias: 0,
+                slope_bias: 0.0,
+                bias_clamp: 0.0,
             },
         }
     }
@@ -416,10 +425,9 @@ impl GraphicsRegisters {
     /// host cannot have exactly (each a fixed text, for a log line once).
     /// A section too short to hold the registers read gets
     /// [`GraphicsRegisters::console_defaults`].
-    /// shortcut: the polygon offset enables (set in every description
-    /// seen) are not read: their offsets are not in the section and the
-    /// pipeline gets no depth bias; alpha to coverage, the sample mask and
-    /// the other dwords keep D3D12's defaults.
+    /// shortcut: alpha to coverage, the sample mask and the other dwords
+    /// keep D3D12's defaults; the back faces' polygon offset is taken to
+    /// be the front faces'.
     pub fn decode(dwords: &[u32]) -> (Self, Vec<&'static str>) {
         let mut notes = Vec::new();
         let mut r = Self::console_defaults();
@@ -537,6 +545,26 @@ impl GraphicsRegisters {
         r.raster.depth_clip = !(near_off || far_off);
         if near_off != far_off {
             notes.push("near or far clipping off but not both: neither is clipped");
+        }
+        // PA_SU_POLY_OFFSET_CLAMP, _FRONT_SCALE, _FRONT_OFFSET (floats),
+        // used when PA_SU_SC_MODE_CNTL bit 11 enables the front offset (in
+        // every description seen): the scale is D3D12's slope-scaled bias
+        // times 16 (as RADV writes it), the offset its constant bias. Seen:
+        // (0, 16, 1) and (0.003, 29, 0) on shadow passes, 0 otherwise.
+        if bits(sc_mode, 11, 1) != 0 {
+            let float = |i: usize| f32::from_bits(dwords[i]);
+            let (clamp, scale, offset) = (
+                float(at::POLY_OFFSET),
+                float(at::POLY_OFFSET + 1),
+                float(at::POLY_OFFSET + 2),
+            );
+            if [clamp, scale, offset].iter().all(|v| v.is_finite()) {
+                r.raster.bias_clamp = clamp;
+                r.raster.slope_bias = scale / 16.0;
+                r.raster.depth_bias = offset.round() as i32;
+            } else {
+                notes.push("a polygon offset that is not a number: none");
+            }
         }
         (r, notes)
     }
@@ -1321,7 +1349,10 @@ mod tests {
                 cull: 3,
                 front_ccw: true,
                 wireframe: false,
-                depth_clip: true
+                depth_clip: true,
+                depth_bias: 0,
+                slope_bias: 0.0,
+                bias_clamp: 0.0,
             }
         );
         // Front culled, clockwise front, lines, no depth clipping.
@@ -1335,12 +1366,42 @@ mod tests {
                 cull: 2,
                 front_ccw: false,
                 wireframe: true,
-                depth_clip: false
+                depth_clip: false,
+                depth_bias: 0,
+                slope_bias: 0.0,
+                bias_clamp: 0.0,
             }
         );
         assert!(notes.is_empty(), "{notes:?}");
         let (r, notes) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 3)]));
         assert_eq!(r.raster.cull, 1);
+        assert_eq!(notes.len(), 1);
+    }
+
+    /// The polygon offsets of run 50's descriptions: (clamp, scale,
+    /// offset) of (0, 16, 1) and, on passes without depth clipping,
+    /// (0.003, 29, 0).
+    #[test]
+    fn decodes_the_depth_bias() {
+        let bias = |words: [u32; 3], enable: u32| {
+            let mut set = vec![(at::SC_MODE_CNTL, 0x0020_0240 | enable << 11)];
+            set.extend((0..3).map(|i| (at::POLY_OFFSET + i, words[i])));
+            let r = GraphicsRegisters::decode(&registers(&set)).0.raster;
+            (r.depth_bias, r.slope_bias, r.bias_clamp)
+        };
+        assert_eq!(bias([0, 0x4180_0000, 0x3f80_0000], 1), (1, 1.0, 0.0));
+        assert_eq!(
+            bias([0x3b44_9ba6, 0x41e8_0000, 0], 1),
+            (0, 1.8125, f32::from_bits(0x3b44_9ba6))
+        );
+        // Not enabled, or none: no bias.
+        assert_eq!(bias([0, 0x4180_0000, 0x3f80_0000], 0), (0, 0.0, 0.0));
+        assert_eq!(bias([0, 0, 0], 1), (0, 0.0, 0.0));
+        // Not a number: none, noted.
+        let mut set = registers(&[(at::POLY_OFFSET + 1, 0x7fc0_0000)]);
+        set[at::SC_MODE_CNTL] |= 1 << 11;
+        let (r, notes) = GraphicsRegisters::decode(&set);
+        assert_eq!(r.raster.slope_bias, 0.0);
         assert_eq!(notes.len(), 1);
     }
 

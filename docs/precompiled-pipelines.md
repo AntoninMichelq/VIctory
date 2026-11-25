@@ -137,7 +137,8 @@ against GFX10's public register layouts:
 | 19, 20 | `0x022c[c]34x`, same | the same for the vertex program |
 | 31 | `0x00cc0010` (all) | `CB_COLOR_CONTROL`: normal mode, ROP3 copy (not read) |
 | 39 | `0x00080000` (all) | `PA_CL_CLIP_CNTL`: DX clip space; bits 26/27 (near/far clipping off) read as `DepthClipEnable` |
-| 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bits 11/12 polygon offset on (not read: the offsets are not in the section) |
+| 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bit 11 front polygon offset on (read; set in all) |
+| 43-45 | `0` mostly; `0, 16.0, 1.0`; `0.003, 29.0, 0` (floats, run 50) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET` (read): `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset; the second set on passes without depth clipping (dword 39 `0x0c080000`) |
 | 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL` (read): stencil, depth, depth write, depth bounds, depth func (bits 4-6), two-sided stencil (7), stencil funcs (8-10, 20-22); `0x007007f0` = no depth test, no stencil; `0x7e2` = greater-or-equal test, no write |
 | 47 | `0` (62), `0x1001`, `0x80080` | `DB_STENCIL_CONTROL` (read): fail, depth-pass, depth-fail ops, front then back, 4 bits each (`0x80080` = add one wrapping on pass) |
 | 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (read: mask, write mask; the test value is the draw's reference on the host; op value 1 = D3D12's increments) |
@@ -149,7 +150,7 @@ against GFX10's public register layouts:
 | 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
 
 What the host pipeline gets beyond these: the input layout of the info
-section (below), sample mask all, no depth bias, no alpha to coverage, D3D12's nearest for what has no exact equal (constant alpha
+section (below), sample mask all, no alpha to coverage, D3D12's nearest for what has no exact equal (constant alpha
 blend factors as the blend factor, stencil ops `ONES` and
 replace-by-op-value as replace, logic stencil ops as keep, both faces
 culled as none). A registers section shorter than 60 dwords or unreadable
@@ -197,15 +198,39 @@ alpha; 20 and 24, `e5040504`: source alpha over; 3: no depth, no culling).
 Two pairs of shaders differed in runs 47/48 and are not among the dumps:
 `e38865315b050ed9`/`62306a1922b106e8` (write mask 0 in run 45, 0xf here)
 and `1ce8ba2fe12072c1`/`4dd4a3d69c1bd8ca` (blending in run 45, none here);
-their registers are to be dumped. The black loading and menu screens of
+their registers were dumped in run 50 (`VICTORY_PRECOMPILED_DUMP`, 21,864
+graphics sections):
+
+- `e38865...` writes depth only: its pixel shader has no colour output
+  (`SV_Depth` alone), and its registers enable every target's writes
+  (dword 51 `ffffffff`) as those of many such passes do; the console
+  writes no colour without an export. The host would write undefined
+  values, so a precompiled pipeline now writes nothing to the targets its
+  pixel shader has no output for (`GraphicsState::host_blend_writing`).
+  That is also the other mask-0 pair of run 45 (`643101624bd14159`, no
+  output at all).
+- `1ce8ba...` has blending off in both its blend registers (`CB_BLEND0`
+  `0x80000000`, `SX_MRT0_BLEND_OPT` `0x06000600`) and a single registers
+  section: the title's description says no blending. Run 45's blended
+  pipeline of these shaders is another of the title's.
+
+Of the 89 states run 45 shows for shaders made precompiled in run 50, 80
+are matched in full by a decoded registers section of the same shaders,
+the write-mask pairs are explained above, and the rest (blend of
+`1ce8ba...`, culling of `ca5fa787aecf4e22`, two of `58d926085fca4999`, one
+of `a2f648245d70a85c`, a stencil enable of `5d3a25d932263bb7`) differ in
+one or two fields with no section of those shaders that agrees: pipelines
+the title made by the other method, or sections not dumped.
+
+The black loading and menu screens of
 runs 47/48 were not the state: the loading pictures and the full-screen
 rectangle pass that composes them were refused for want of an input layout
 (above) and dropped.
 
 ## Open
 
-- Not run in the game yet. Whether the front face reading (bit 2 of dword
-  40) is right shows in the 10 of 64 descriptions that cull back faces.
+- The front face reading (bit 2 of dword 40): all run-45 states with
+  culling that a section matches agree with it (counter-clockwise front).
 - The words of the info section's header besides the layout's size.
 - Dwords 63 and 92-96 of the graphics registers.
 - Host pipelines of precompiled pipelines are not started early in later

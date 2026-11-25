@@ -874,6 +874,31 @@ fn emit_program(
     Ok((shader, wave_size))
 }
 
+/// The render targets a translated pixel shader writes (`dxil`, as
+/// [`HostShader::dxil`]): bit `i` for `SV_Target<i>`; `None` if it has no
+/// output signature that reads.
+pub fn pixel_targets(dxil: &[u8]) -> Option<u8> {
+    let c = Container::parse(dxil).ok()?;
+    targets_written(c.part(FourCC::OSG1)?.data)
+}
+
+/// The `SV_Target` indices an `OSG1` part declares, as bits.
+fn targets_written(part: &[u8]) -> Option<u8> {
+    use crate::dxbc::u32_at;
+    const TARGET: u32 = 64;
+    let count = u32_at(part, 0).ok()? as usize;
+    let base = u32_at(part, 4).ok()? as usize;
+    let mut bits = 0u8;
+    for i in 0..count {
+        let at = base + 32 * i;
+        if u32_at(part, at + 12).ok()? == TARGET {
+            let index = u32_at(part, at + 8).ok()?;
+            bits |= 1u8.checked_shl(index).unwrap_or(0);
+        }
+    }
+    Some(bits)
+}
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -2025,5 +2050,34 @@ mod merged_gs_tests {
             Err(ShaderError::Unsupported { what, .. })
                 if what == "an address in an SGPR that is no root parameter"
         ));
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    /// An `OSG1` part of (system value, semantic index) rows.
+    fn part(rows: &[(u32, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend((rows.len() as u32).to_le_bytes());
+        p.extend(8u32.to_le_bytes());
+        for &(system, index) in rows {
+            // stream, name offset, index, system value, type, register,
+            // mask and the rest.
+            for w in [0, 0, index, system, 3, index, 0xf, 0] {
+                p.extend(u32::to_le_bytes(w));
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn targets_written_are_the_sv_target_rows() {
+        assert_eq!(super::targets_written(&part(&[(64, 0)])), Some(1));
+        assert_eq!(super::targets_written(&part(&[(64, 0), (64, 2)])), Some(0b101));
+        // Depth only, or nothing: no target written.
+        assert_eq!(super::targets_written(&part(&[(65, 0)])), Some(0));
+        assert_eq!(super::targets_written(&part(&[])), Some(0));
+        // Cut short.
+        assert_eq!(super::targets_written(&part(&[(64, 1)])[..20]), None);
     }
 }

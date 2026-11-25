@@ -39,6 +39,10 @@ pub(crate) struct GraphicsState {
     /// test and the host keeps it ([`depth_bounds_on`]): the pipeline is
     /// made from a stream with that description ([`bounds_pipeline`]).
     pub(crate) depth_bounds: bool,
+    /// Write nothing to the targets the pixel shader has no output for
+    /// (precompiled pipelines: their registers enable writes the console
+    /// makes nothing of when no colour is exported).
+    pub(crate) unwritten_masked: bool,
 }
 
 // SAFETY: `inputs`'s `SemanticName` pointers point into `names`'s owned
@@ -100,6 +104,7 @@ impl Default for GraphicsState {
             },
             title_depth_bounds: false,
             depth_bounds: false,
+            unwritten_masked: false,
         }
     }
 }
@@ -254,6 +259,9 @@ impl GraphicsState {
         g.rasterizer.CullMode = D3D12_CULL_MODE(r.raster.cull as i32);
         g.rasterizer.FrontCounterClockwise = r.raster.front_ccw.into();
         g.rasterizer.DepthClipEnable = r.raster.depth_clip.into();
+        g.rasterizer.DepthBias = r.raster.depth_bias;
+        g.rasterizer.SlopeScaledDepthBias = r.raster.slope_bias;
+        g.rasterizer.DepthBiasClamp = r.raster.bias_clamp;
         if r.raster.wireframe {
             g.rasterizer.FillMode = D3D12_FILL_MODE_WIREFRAME;
         }
@@ -289,7 +297,33 @@ impl GraphicsState {
             Count: t.samples.max(1),
             Quality: 0,
         };
+        g.unwritten_masked = true;
         g
+    }
+
+    /// [`GraphicsState::host_blend`] with nothing written to the targets
+    /// not in `written` (bits, `SV_Target` indices), if the state asks it.
+    /// A precompiled pipeline whose pixel shader writes no colour (a depth
+    /// pass) has every target's write mask on in its registers; the
+    /// console writes nothing there for want of an export, while the host
+    /// would write undefined values (run 45 showed the title's own
+    /// pipelines of such shaders with a write mask of 0).
+    pub(crate) fn host_blend_writing(&self, written: Option<u8>) -> D3D12_BLEND_DESC {
+        let mut blend = self.host_blend();
+        let Some(written) = written.filter(|_| self.unwritten_masked) else {
+            return blend;
+        };
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.IndependentBlendEnable = true.into();
+            let first = blend.RenderTarget[0];
+            blend.RenderTarget = [first; 8];
+        }
+        for (i, target) in blend.RenderTarget.iter_mut().enumerate() {
+            if written & 1 << i == 0 {
+                target.RenderTargetWriteMask = 0;
+            }
+        }
+        blend
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
@@ -357,7 +391,7 @@ impl GraphicsState {
         // Only a pipeline that keeps the depth bounds test has it in its
         // name: the others keep their names and library entries.
         format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{}",
+            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{}{}",
             self.blend,
             self.sample_mask,
             self.rasterizer,
@@ -367,7 +401,9 @@ impl GraphicsState {
             self.targets,
             self.depth_format.0,
             self.samples,
-            if self.bounds() { " depth-bounds" } else { "" }
+            if self.bounds() { " depth-bounds" } else { "" },
+            // Likewise a precompiled pipeline's (`host_blend_writing`).
+            if self.unwritten_masked { " unwritten-masked" } else { "" }
         )
     }
 
@@ -819,7 +855,12 @@ impl HostPipeline {
                 // The merged stage's geometry half (third), if any.
                 None => code(2),
             },
-            BlendState: g.host_blend(),
+            BlendState: g.host_blend_writing(
+                stages
+                    .get(1)
+                    .and_then(|(s, _)| s.translated())
+                    .and_then(|t| victory_shader::emit::pixel_targets(&t.host.dxil)),
+            ),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
