@@ -61,7 +61,11 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Merged stages keep their stage data in another layout (not read). A
+//! geometry shader is one: the console links the ES program (in the vertex
+//! container) and the GS program (in the geometry container) into one merged
+//! stage ([`crate::merged`]). The GS record is read as far as the common
+//! record goes (code, root layout, used resources); its stage data is not.
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -268,6 +272,11 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// The GS half of a merged ES+GS stage. Its stage data is not read yet
+    /// (the output signature and the LDS layout of the records the ES half
+    /// hands over are in it), so there is nothing to hold: what the program
+    /// reads on entry is [`crate::io::raise`]'s and [`crate::merged`]'s.
+    Gs,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -538,6 +547,11 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => StageIo::Gs,
+            // The ES half of a merged ES+GS stage: its stage data is laid out
+            // as a VS's (the fetched attributes and their VGPRs; the
+            // "outputs" are the rows of the record it hands the GS half).
+            HwStage::Es => vs_io(stage_data).unwrap_or(StageIo::None),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -669,7 +683,7 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -755,6 +769,30 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// A shader container whose `DXIL` part holds one native blob with the
+    /// given programs (stage and code), as the title's containers do.
+    pub(crate) fn container(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
+        let data = part(&[(KIND_NATIVE, &xbch(&fssm(programs)))]);
+        crate::dxbc::build(&[(crate::dxbc::FourCC::DXIL, &data)])
+    }
+
+    #[test]
+    fn a_geometry_program_has_its_own_io_and_its_es_half_a_vertex_ones() {
+        // The two halves are in different containers: ES next to the VS
+        // (here alone), GS by itself.
+        let es = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Es, &VS_CODE)])))]))
+            .unwrap();
+        let gs = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Gs, &VS_CODE)])))]))
+            .unwrap();
+        // The ES half's stage data is laid out as a VS's (its fetched
+        // attributes), with none here.
+        assert!(matches!(&es[0].io, StageIo::Vs { inputs, .. } if inputs.is_empty()), "{:?}", es[0].io);
+        assert_eq!((gs[0].stage, &gs[0].io), (HwStage::Gs, &StageIo::Gs));
+        // Both are merged stages: user data starts after the 8 system SGPRs.
+        assert_eq!(HwStage::Gs.user_sgpr(0), 8);
+        assert_eq!(HwStage::Es.user_sgpr(0), 8);
     }
 
     #[test]

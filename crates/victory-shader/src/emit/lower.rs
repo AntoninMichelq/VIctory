@@ -82,6 +82,31 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// A half of a merged ES+GS stage, and how its LDS accesses go.
+    pub ring: Ring,
+}
+
+/// The halves of a merged ES+GS stage run as a host vertex shader (the ES
+/// half) and a host geometry shader (the GS half). What they pass through
+/// LDS goes through the host's stage I/O instead, by LDS offset alone:
+///
+/// - `Es`: the ES half writes its record for the GS half; dword k of the
+///   record is channel k % 4 of the output in row k / 4 (the GS half's
+///   input signature).
+/// - `Gs`: the GS half reads the records of its primitive's vertices (the
+///   address names the vertex, [`crate::io::GS_VERTEX_BYTES`]; dword k is
+///   channel k % 4 of input row k / 4) and writes its output vertices,
+///   `record` dwords each (dword k of a vertex is channel k % 4 of output
+///   row k / 4), each followed by `s_sendmsg` GS_EMIT.
+///
+/// shortcut: the base the console adds to LDS addresses (the wave's, the
+/// lane's) is left out; offsets are taken as dword-aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Ring {
+    #[default]
+    None,
+    Es,
+    Gs { record: u32, max_vertices: u32 },
 }
 
 enum Stop {
@@ -1497,6 +1522,9 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        if let Ring::Gs { max_vertices, .. } = x.ring {
+            s.geometry = Some(super::shader::Geometry { max_vertices });
+        }
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -2336,13 +2364,33 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let i32t = self.s.t.i32;
+                let entry = self.s.entry;
+                return Val::I32(self.s.op(entry, "primitiveID.i32", Attr::ReadNone, i32t, 108, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            // Vertex n of the primitive at n * GS_VERTEX_BYTES (offsets in
+            // dwords, two 16-bit ones per VGPR).
+            Input::GsVertexOffsets(k) => {
+                let n = crate::io::GS_VERTEX_BYTES / 4;
+                let packed = if k == 0 { n << 16 } else { 2 * n };
+                return Val::I32(self.s.m.i32(packed));
+            }
+            // Every lane a vertex or primitive: the lane counts the code
+            // sets EXEC from are the whole wave.
+            Input::MergedLanes => {
+                let w = self.wave();
+                return Val::I32(self.s.m.i32(w | w << 8));
+            }
+            Input::RingOffset => return Val::I32(self.s.m.i32(0)),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::RuntimeTable(_) => return Val::Missing("the console runtime table"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -3308,6 +3356,11 @@ impl<'a> Lower<'a> {
             // The id of the last wave out of primitive order: zero (see
             // `inputs`).
             Operand::Const(POPS_EXITING_WAVE_ID) => Ok(self.s.m.i32(0)),
+            // `src_scc`: SCC as 0 or 1.
+            Operand::Const(253) => {
+                let bit = self.scc_in(inst)?;
+                Ok(self.s.m.cast(self.cur, Cast::ZExt, bit, self.s.t.i32))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4585,6 +4638,9 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if self.x.ring != Ring::None {
+            return self.ring_ds(inst, name, addr.as_ref(), data, dst_reg, (*offset0, *offset1), guard);
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -4924,6 +4980,14 @@ impl<'a> Lower<'a> {
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
+            // The halves of a merged stage meet in the host's stages, not in LDS.
+            Fields::Sopp { .. } if name == "s_barrier" && self.x.ring != Ring::None => Ok(()),
+            Fields::Sopp { imm } if name == "s_sendmsg" && matches!(self.x.ring, Ring::Gs { .. }) => {
+                match self.guard(b, i) {
+                    Ok(g) => self.gs_message(*imm, g),
+                    Err(e) => Err(e),
+                }
+            }
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
@@ -6898,6 +6962,37 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" | "v_dot4c_i32_i8" => {
+                // The four byte products of the first two operands, added
+                // to the third (`v_dot4c`: to the destination). The
+                // operands' byte selects do not apply to these.
+                // shortcut: without clamp (the sum wraps, as unclamped).
+                if v.clamp {
+                    return Err("a clamped byte dot product");
+                }
+                let signed = name.contains("_i8");
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let mut sum = if name == "v_dot4c_i32_i8" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+                } else {
+                    s(self, 2)?
+                };
+                for k in 0..4u32 {
+                    let byte = |l: &mut Self, x: V| {
+                        let up = l.s.m.i32(24 - 8 * k);
+                        let t = l.s.m.bin(c, Bin::Shl, x, up);
+                        let down = l.s.m.i32(24);
+                        l.s.m.bin(c, if signed { Bin::AShr } else { Bin::LShr }, t, down)
+                    };
+                    let (x, y) = (byte(self, a), byte(self, b));
+                    let m = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, m);
+                }
+                int(self, sum)
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -8341,7 +8436,13 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        // `v_pk_fmac_f16` is a VOP2 instruction without operand selects:
+        // each half reads the same half of its operands.
+        let sel = if inst.name() == "v_pk_fmac_f16" {
+            high
+        } else {
+            (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0
+        };
         let x = if float {
             self.f16_operand(inst, &op)?
         } else {
@@ -8365,8 +8466,11 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let float = op.ends_with("_f16");
+        // `v_pk_fmac_f16`: the accumulator is the destination, half by half.
+        let fmac = op == "fmac_f16";
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fmac_f16" => 2,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -8395,6 +8499,24 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if fmac {
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    x
+                };
+                let m = self.s.m.i32(0xFFFF);
+                let x = self.s.m.bin(c, Bin::And, x, m);
+                xs.push(
+                    self.s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]),
+                );
             }
             let r = if float {
                 let mut f = match op {
@@ -9961,11 +10083,16 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL's Log (23) is already base 2: scaling it by
+                    // log2(e) as if it were the natural logarithm picked a
+                    // level 1.44 times too far (blurrier cube lookups). A
+                    // length of 0 gives minus infinity, which the sampler
+                    // clamps to level 0. Upstream 4f57f46 does the same.
+                    let mut lod = self.unary(23, texels);
+                    if has_cl {
+                        // The console's minimum level: the larger wins.
+                        lod = self.binary(35, lod, clamp);
+                    }
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -10716,6 +10843,150 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// An LDS access of a half of a merged ES+GS stage ([`Ring`]).
+    #[allow(clippy::too_many_arguments)]
+    fn ring_ds(
+        &mut self,
+        inst: &Inst,
+        name: &str,
+        addr: Option<&Operand>,
+        data: &[Operand],
+        dst_reg: Option<u8>,
+        (offset0, offset1): (u8, u8),
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let width = match name.rsplit('_').next() {
+            Some("b64") => 2,
+            Some("b96") => 3,
+            Some("b128") => 4,
+            Some("b32") => 1,
+            _ => return Err("a merged stage's LDS access of bytes or halves"),
+        };
+        if name.contains("st64") {
+            return Err("a merged stage's LDS access with 64-element offsets");
+        }
+        // (byte offset, dwords) per element.
+        let elements: Vec<(u32, u32)> = if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
+            let scale = 4 * width;
+            vec![(u32::from(offset0) * scale, width), (u32::from(offset1) * scale, width)]
+        } else if name.starts_with("ds_read_b") || name.starts_with("ds_write_b") {
+            vec![(u32::from(offset0) | u32::from(offset1) << 8, width)]
+        } else {
+            return Err("a merged stage's LDS operation");
+        };
+        if guard.is_some() {
+            return Err("a merged stage's LDS access in some lanes");
+        }
+        if name.starts_with("ds_read") {
+            let Ring::Gs { .. } = self.x.ring else {
+                return Err("an ES half that reads LDS");
+            };
+            // The vertex: the address over GS_VERTEX_BYTES.
+            let a = self.vgprs(inst, addr.ok_or("an LDS address")?, 1)?[0];
+            let c = self.cur;
+            let k = self.s.m.i32(crate::io::GS_VERTEX_BYTES.trailing_zeros());
+            let vertex = self.s.m.bin(c, Bin::LShr, a, k);
+            // A triangle's three vertices (an offset outside them reads the last).
+            let last = self.s.m.i32(2);
+            let inside = self.s.m.cmp(c, pred::IULE, vertex, last);
+            let vertex = self.s.m.select(c, inside, vertex, last);
+            let reg = dst_reg.ok_or("an LDS read result")?;
+            let mut n = 0;
+            for (off, w) in elements {
+                for d in 0..w {
+                    let dword = off / 4 + d;
+                    let x = self.gs_input(dword, vertex)?;
+                    self.write(inst, Reg::V(reg + n), x, None);
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
+        let record = match self.x.ring {
+            Ring::Gs { record, .. } => record,
+            _ => u32::MAX,
+        };
+        for (e, (off, w)) in elements.into_iter().enumerate() {
+            let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+            for (d, x) in vals.into_iter().enumerate() {
+                let dword = (off / 4 + d as u32) % record;
+                self.ring_store(dword, x)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dword `dword` of input `vertex`'s record (the GS half).
+    fn gs_input(&mut self, dword: u32, vertex: V) -> Result<V, Why> {
+        let (row, channel) = (dword / 4, (dword % 4) as u8);
+        let row = u8::try_from(row).map_err(|_| "an LDS read past the records")?;
+        let Some((id, col)) = self.find_input(row, channel) else {
+            // A dword the record does not carry.
+            return Ok(self.s.m.i32(0));
+        };
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let float = e.comp == 9;
+        let (suffix, ty) = if float { (".f32", self.s.t.f32) } else { (".i32", self.s.t.i32) };
+        let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), vertex];
+        let c = self.cur;
+        let v = self.s.op(c, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
+        Ok(if float { self.s.m.cast(c, Cast::Bitcast, v, self.s.t.i32) } else { v })
+    }
+
+    /// Dword `dword` of the record or output vertex: channel `dword % 4` of
+    /// output row `dword / 4`.
+    fn ring_store(&mut self, dword: u32, x: V) -> Result<(), Why> {
+        let (row, ch) = (dword / 4, (dword % 4) as u8);
+        let Some(id) = self.s.outputs.iter().position(|o| {
+            o.row == Some(row) && ch >= o.col && ch < o.col + o.cols
+        }) else {
+            // A dword no output carries (the console leaves it to the copy
+            // shader to drop).
+            return Ok(());
+        };
+        let col = ch - self.s.outputs[id].col;
+        let el = &mut self.s.outputs[id];
+        el.usage |= 1 << col;
+        let float = el.comp == 9;
+        let c = self.cur;
+        let (suffix, v) = if float {
+            (".f32", self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32))
+        } else {
+            (".i32", x)
+        };
+        let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), v];
+        let void = self.s.t.void;
+        self.s.op(c, &format!("storeOutput{suffix}"), Attr::NoUnwind, void, 5, &args);
+        Ok(())
+    }
+
+    /// `s_sendmsg` of the GS half: GS_EMIT and GS_CUT on stream 0 (GS_DONE
+    /// and the rest need nothing on the host).
+    fn gs_message(&mut self, imm: u16, guard: Option<V>) -> Result<(), Why> {
+        const MSG_GS: u16 = 2;
+        if imm & 0xF != MSG_GS {
+            return Ok(());
+        }
+        if guard.is_some() {
+            return Err("a GS emit in some lanes");
+        }
+        if imm >> 8 & 3 != 0 {
+            return Err("a GS emit to another stream");
+        }
+        let op = imm >> 4 & 3;
+        let stream = self.s.m.i8(0);
+        let void = self.s.t.void;
+        let c = self.cur;
+        if op & 2 != 0 {
+            self.s.op(c, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
+        }
+        if op & 1 != 0 {
+            self.s.op(c, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+        }
+        Ok(())
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -11154,6 +11425,8 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            // The ES half ends by jumping to the GS half's code.
+            LaneExit::Indirect if self.x.ring == Ring::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;
@@ -11611,6 +11884,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            ring: Default::default(),
         })
         .map(|_| ())
     }
@@ -11661,6 +11935,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            ring: Default::default(),
         })
     }
 
@@ -11772,6 +12047,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            ring: Default::default(),
         }).unwrap();
 
         let container =

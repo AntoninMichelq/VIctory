@@ -69,6 +69,13 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Geometry programs (the GS half of a merged ES+GS stage), those whose
+    /// resources were traced and whose I/O was raised, and those emission
+    /// stopped at [`emit::GS_EMIT`]: counted here, not among `failed`.
+    gs_programs: usize,
+    gs_tracked: usize,
+    gs_raised: usize,
+    gs_stopped: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +137,10 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.gs_programs += other.gs_programs;
+        self.gs_tracked += other.gs_tracked;
+        self.gs_raised += other.gs_raised;
+        self.gs_stopped += other.gs_stopped;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -275,6 +286,16 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "geometry     {} programs: {} resources traced, {} I/O raised, {} stopped at {} \
+         (no geometry emission yet; not among the failures below)",
+        t.gs_programs,
+        t.gs_tracked,
+        t.gs_raised,
+        t.gs_stopped,
+        emit::GS_EMIT
+    );
+    merged_pairs(validate.then_some(dll.as_deref()));
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -345,6 +366,7 @@ fn translate(
     // `~`: the hash of the code alone; containers that differ only around
     // it are translated once, the others listed as duplicates of it.
     let code = blake3::hash(dxil);
+    note_merged_half(source, &bytes, dxil, code);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
@@ -404,8 +426,15 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let geometry = p.stage == HwStage::Gs;
+                t.gs_programs += usize::from(geometry);
+                // (the ES half each geometry program pairs with is not in
+                // its container: its user data 0 and 1 are taken as free, which
+                // the geometry line says)
+                let track = if geometry { resource::track_merged } else { resource::track };
+                let res = match track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
+                        t.gs_tracked += usize::from(geometry);
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
@@ -423,13 +452,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || p.stage == HwStage::Ms || geometry {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
                             if graphics {
                                 tally_io(&r, t);
                             }
+                            t.gs_raised += usize::from(geometry);
                             raised = Some(r);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -456,6 +486,18 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
+                    if geometry {
+                        // No geometry emission yet: counted on its own line,
+                        // anything else it fails with is a failure.
+                        match emit::emit(container, &p, &program, &s, &i, &r) {
+                            Err(ShaderError::Unsupported { what, .. }) if what == emit::GS_EMIT => {
+                                t.gs_stopped += 1;
+                            }
+                            Err(e) => t.fail(format!("emit: {e}"), label),
+                            Ok(_) => unreachable!("geometry emission is refused"),
+                        }
+                        continue;
+                    }
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
@@ -551,6 +593,7 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        let start = std::time::Instant::now();
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -561,7 +604,11 @@ fn check(
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
                 if t.list {
-                    t.lines.push(format!("{}  pipeline created", label()));
+                    t.lines.push(format!(
+                        "{}  pipeline created in {:.1} s",
+                        label(),
+                        start.elapsed().as_secs_f32()
+                    ));
                 }
             }
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
@@ -689,6 +736,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
+            && a.param != resource::RUNTIME_TABLE
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap
@@ -777,6 +825,82 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
                 t.lane_branches += 1;
             }
         }
+    }
+}
+
+/// A container with a half of a merged ES+GS stage: its name without the
+/// stage prefix (`VS_`, `GS_`: the halves of one shader share the rest),
+/// whether it is the GS half, its bytes and the hash of its code.
+type Half = (String, bool, Vec<u8>, blake3::Hash);
+
+static HALVES: Mutex<Vec<Half>> = Mutex::new(Vec::new());
+
+/// Keeps a container holding an ES or GS program for [`merged_pairs`].
+fn note_merged_half(source: &Source, bytes: &[u8], dxil: &[u8], code: blake3::Hash) {
+    let Ok(programs) = native_programs(dxil) else { return };
+    let gs = programs.iter().any(|p| p.stage == HwStage::Gs);
+    if !gs && !programs.iter().any(|p| p.stage == HwStage::Es) {
+        return;
+    }
+    let label = source.label();
+    let name = label.rsplit(['/', '\\', ' ']).next().unwrap_or("");
+    let key = name.split_once('_').map_or(name, |(_, rest)| rest).to_owned();
+    lock(&HALVES).push((key, gs, bytes.to_vec(), code));
+}
+
+/// Merged ES+GS stages (the GS programs' pipelines): each geometry
+/// container with the vertex containers of the same name, the first pair
+/// that translates ([`emit::translate_es_gs`]) and, with `validator`, both
+/// host shaders validated.
+fn merged_pairs(validator: Option<Option<&Path>>) {
+    let halves = std::mem::take(&mut *lock(&HALVES));
+    let mut v = validator.and_then(|dll| Validator::load(dll).ok());
+    let (mut programs, mut translated, mut validated) = (0, 0, 0);
+    let mut failed: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for (key, _, gs, code) in halves.iter().filter(|h| h.1) {
+        if !seen.insert(*code) {
+            continue;
+        }
+        programs += 1;
+        let mut last = "no vertex container of the same name".to_owned();
+        let mut done = false;
+        let mut tried = HashSet::new();
+        for (_, _, vs, vcode) in halves.iter().filter(|h| !h.1 && &h.0 == key) {
+            if !tried.insert(*vcode) {
+                continue;
+            }
+            match emit::translate_es_gs(vs, gs) {
+                Ok((mut hv, mut hg)) => {
+                    translated += 1;
+                    done = true;
+                    if let Some(v) = v.as_mut() {
+                        match (v.validate(&mut hv.dxil), v.validate(&mut hg.dxil)) {
+                            (Ok(()), Ok(())) => validated += 1,
+                            (Err(e), _) => last = format!("validator (vertex half): {}", e.lines().find(|l| l.contains("error")).unwrap_or("")),
+                            (_, Err(e)) => last = format!("validator (geometry half): {}", e.lines().find(|l| l.contains("error")).unwrap_or("")),
+                        }
+                        if !last.starts_with("validator") {
+                            break;
+                        }
+                        let entry = failed.entry(last.clone()).or_insert((0, key.clone()));
+                        entry.0 += 1;
+                    }
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        if !done {
+            let entry = failed.entry(last).or_insert((0, key.clone()));
+            entry.0 += 1;
+        }
+    }
+    println!(
+        "geometry     {translated} of {programs} geometry programs translated with their ES half as a vertex and a geometry shader; {validated} pairs validated"
+    );
+    for (reason, (n, example)) in failed {
+        println!("  {n:>7}  geometry pair: {reason}  (e.g. {example})");
     }
 }
 

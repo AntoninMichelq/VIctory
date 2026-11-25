@@ -70,7 +70,29 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Geometry: dword 0 (low) or 1 (high) of the pointer to the console
+    /// runtime's table, in the first two user-data SGPRs
+    /// ([`crate::merged::RUNTIME_TABLE`]).
+    RuntimeTable(u8),
+    /// Merged ES+GS stage, translated as a host vertex and geometry shader:
+    /// v0 (`0`) or v1 (`1`) of the GS half, the packed LDS offsets of the
+    /// primitive's vertices. They are given as vertex `n` at `n * GS_VERTEX_BYTES`,
+    /// so that an LDS address names its vertex ([`GS_VERTEX_BYTES`]).
+    GsVertexOffsets(u8),
+    /// Merged ES+GS stage: s3, the wave info whose lane counts set EXEC on
+    /// entry (and the LDS bases): every lane is a whole vertex or primitive
+    /// on the host.
+    MergedLanes,
+    /// Merged ES+GS stage: s2, the GS half's offset in the ring of output
+    /// records (its records go to the host's outputs, by offset alone).
+    RingOffset,
 }
+
+/// Merged ES+GS stage: the bytes between the records of two input vertices
+/// of a primitive as [`Input::GsVertexOffsets`] gives them (4 x 4096 dwords,
+/// more than a record of the ES half ever has; the console masks an offset
+/// with 0x3fffc, which keeps three such vertices).
+pub const GS_VERTEX_BYTES: u32 = 0x4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -210,12 +232,24 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            let mut loaded = vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ];
+        (StageIo::Vs { inputs, outputs }, HwStage::Vs | HwStage::Es) => {
+            // The ES half of a merged stage gets the vertex id in v5 and the
+            // instance id in v8 (after the GS half's v0-v4), and hands its
+            // record over through LDS: it exports nothing.
+            let es = native.stage == HwStage::Es;
+            let mut loaded = if es {
+                vec![
+                    (Reg::V(5), Input::VertexId),
+                    (Reg::V(8), Input::InstanceId),
+                    (Reg::S(3), Input::MergedLanes),
+                ]
+            } else {
+                vec![
+                    (Reg::V(0), Input::VertexId),
+                    (Reg::V(2), Input::PrimitiveId),
+                    (Reg::V(3), Input::InstanceId),
+                ]
+            };
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
                     let input = Input::Attribute {
@@ -225,7 +259,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     loaded.push((Reg::V(i.vgpr + channel), input));
                 }
             }
-            (loaded, &[][..], &outputs[..])
+            (loaded, &[][..], if es { &[][..] } else { &outputs[..] })
         }
         // Compute: thread ids in v0-v2, group ids and the group info in the
         // SGPRs after the user data.
@@ -301,6 +335,28 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        // The GS half of a merged ES+GS stage: no exports (its output goes
+        // through LDS, not modeled yet); the runtime table pointer is the one
+        // input known. The root layout wins where it covers those dwords.
+        (StageIo::Gs, HwStage::Gs) => {
+            let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
+            let taken = native.layout.iter().any(|p| {
+                let at = u32::from(native.stage.user_sgpr(p.user_data));
+                at < u32::from(first) + 2 && u32::from(first) < at + p.sgprs
+            });
+            let mut loaded: Vec<(Reg, Input)> = (0..2u8)
+                .filter(|_| !taken)
+                .map(|k| (Reg::S(first + k), Input::RuntimeTable(k)))
+                .collect();
+            loaded.extend([
+                (Reg::V(0), Input::GsVertexOffsets(0)),
+                (Reg::V(1), Input::GsVertexOffsets(1)),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::S(2), Input::RingOffset),
+                (Reg::S(3), Input::MergedLanes),
+            ]);
+            (loaded, &[][..], &[][..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
@@ -847,5 +903,47 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    fn geometry(layout: Vec<crate::native::RootParam>) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 256,
+            layout,
+            used: vec![],
+            io: StageIo::Gs,
+            code: vec![],
+        }
+    }
+
+    #[test]
+    fn a_geometry_program_gets_the_runtime_table_and_exports_nothing() {
+        // s_load_dword s0, s[8:9], 0xb8
+        let p = program(&[0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+        let io = raise(&p, &geometry(vec![])).unwrap();
+        let mut got: Vec<_> = io.inputs.iter().map(|i| i.1).collect();
+        got.sort_by_key(|i| format!("{i:?}"));
+        assert_eq!(got, [Input::RuntimeTable(0), Input::RuntimeTable(1)]);
+        assert!(io.exports.is_empty() && io.interps.is_empty());
+        // Where the title's root layout covers the dwords, they are its own.
+        let own = crate::native::RootParam {
+            root: crate::native::RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        assert!(raise(&p, &geometry(vec![own])).unwrap().inputs.is_empty());
+    }
+
+    #[test]
+    fn geometry_io_is_for_the_geometry_stage_only() {
+        // Stage data of a geometry program on another stage's program.
+        let p = program(&[S_ENDPGM]);
+        let mut native = geometry(vec![]);
+        native.stage = HwStage::Vs;
+        assert!(raise(&p, &native).is_err());
     }
 }
