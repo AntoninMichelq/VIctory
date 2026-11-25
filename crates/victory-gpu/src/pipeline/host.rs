@@ -359,20 +359,19 @@ pub(crate) struct HostPipeline {
 }
 
 /// Whether pipelines with the shader `hash` are not compiled at all
-/// (`VICTORY_NO_COMPILE`: shader hashes, comma-separated; empty compiles
-/// every one). By default the screen probes' ray activation,
-/// 39f0e9aeb156a61c (indirect_diffuse_lighting:CS_ScreenProbes_ActivateRays):
-/// 22,000 blocks with joins of 1,900 predecessors inside loops spanning
-/// the whole function. The AMD driver's compile of it ran for minutes and
-/// took the game from 22 to 34 GB in 80 s, then the game ran out of memory
-/// (2026-11-25 02:35); with less free memory it was refused after the same
-/// climb (purple lighting either way, as the probes are missing).
+/// (`VICTORY_NO_COMPILE`: shader hashes, comma-separated; unset, empty or
+/// a word that is no hash, such as `none`, compiles every one). It kept
+/// the screen probes' ray activation, 39f0e9aeb156a61c, out while
+/// `VICTORY_SHADER_OPT=0` left its never-taken branches in (22,000 blocks:
+/// the AMD driver's compile took the game from 22 to 34 GB); with them
+/// folded it compiles in about a minute and 2 GB, and `VICTORY_NO_COMPILE=
+/// 39f0e9aeb156a61c` brings the old guard back.
 fn not_compiled(hash: &str) -> bool {
     static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     HASHES
         .get_or_init(|| {
             std::env::var("VICTORY_NO_COMPILE")
-                .unwrap_or_else(|_| "39f0e9aeb156a61c".into())
+                .unwrap_or_default()
                 .split(',')
                 .map(|h| h.trim().to_ascii_lowercase())
                 .filter(|h| !h.is_empty())
