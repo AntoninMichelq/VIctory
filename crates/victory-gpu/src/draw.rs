@@ -1499,6 +1499,15 @@ impl State {
         if crate::host::wide_textures() {
             per_frame = per_frame * FRAME_MS.load(Ordering::Relaxed).clamp(150, 600) / 150;
         }
+        // While the title shows little (a loading screen, a black frame
+        // with text: under `VICTORY_PRELOAD_DRAWS`, 400, draws in the last
+        // frame), the queue takes eight times the bytes and up to a second:
+        // what the world will show is uploaded before the world is.
+        let loading = loading_frame(frame);
+        if loading {
+            per_frame = per_frame.saturating_mul(8);
+            HEAP_TEXTURES_PRELOAD.fetch_add(1, Ordering::Relaxed);
+        }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -1545,10 +1554,10 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        let span = std::time::Duration::from_millis(if loading { 1000 } else { 250 });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2843,6 +2852,33 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// Passes over textures picked by index that took the loading budget
+/// ([`loading_frame`]).
+pub(crate) static HEAP_TEXTURES_PRELOAD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the frame before `frame` drew under `VICTORY_PRELOAD_DRAWS`
+/// (400) draws: a loading screen or a frame with little on it, whose time
+/// goes to loading what comes next (`VICTORY_PRELOAD_DRAWS=0`: never).
+fn loading_frame(frame: u64) -> bool {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    static AT_START: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_PRELOAD_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(400)
+    });
+    if SEEN.swap(frame, Ordering::Relaxed) != frame {
+        let now = drawn();
+        let before = AT_START.swap(now, Ordering::Relaxed);
+        LAST.store(now.saturating_sub(before), Ordering::Relaxed);
+    }
+    let last = LAST.load(Ordering::Relaxed);
+    most > 0 && last < most
 }
 
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
