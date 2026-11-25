@@ -124,13 +124,13 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
-/// Makes null again every host slot of the shader-visible heaps that shows
-/// one of the host textures `old` (raw pointers), and queues those slots
-/// for the texture pass: they are made again from the title's view, with
-/// the texture's new host copy (`crate::resource::loading_full_frame`).
-/// Returns how many slots were made null.
+/// Has every host slot of the shader-visible heaps that shows one of the
+/// host textures `old` (raw pointers) made again from the title's view,
+/// with the texture's new host copy (`crate::resource::loading_full_frame`);
+/// until then they keep showing `old` (never a null view: lists in flight
+/// may read them). Returns how many slots there were.
 #[cfg(windows)]
-pub(crate) fn unmake_views_of(old: &[*mut std::ffi::c_void]) -> usize {
+pub(crate) fn forget_views_of(old: &[*mut std::ffi::c_void]) -> usize {
     if old.is_empty() {
         return 0;
     }
@@ -141,7 +141,7 @@ pub(crate) fn unmake_views_of(old: &[*mut std::ffi::c_void]) -> usize {
         // the lock held here).
         let heap = unsafe { &*(at as *const Heap) };
         if let Some(Some(host)) = heap.host.get() {
-            n += host.unmake_views_of(old);
+            n += host.forget_views_of(old);
         }
     }
     n

@@ -999,12 +999,13 @@ impl HostHeap {
         true
     }
 
-    /// Makes null again the title slots (not the dynamic ones, which lists
-    /// recorded may still read) that show one of the host textures `old`
-    /// (raw pointers), and queues them for the texture pass from the next
-    /// frame; a draw that reads one through a table makes it again first.
-    /// Returns how many there were.
-    pub(crate) fn unmake_views_of(&self, old: &[*mut std::ffi::c_void]) -> usize {
+    /// Has the title slots (not the dynamic ones) that show one of the host
+    /// textures `old` (raw pointers) made again, and queues them for the
+    /// texture pass from this frame; a draw that reads one through a table
+    /// makes it again first. The slot keeps its descriptor (and `kept` the
+    /// texture alive) until then: lists recorded and in flight read it, and
+    /// a null view there drew black frames. Returns how many there were.
+    pub(crate) fn forget_views_of(&self, old: &[*mut std::ffi::c_void]) -> usize {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let hits: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1016,14 +1017,17 @@ impl HostHeap {
                 .collect()
         };
         for &i in &hits {
-            self.unmake(&mut made, i);
+            // Not made: the next use writes the view again in place.
+            if let Some(key) = made.get_mut(i as usize) {
+                *key = 0;
+            }
         }
         drop(made);
         if !hits.is_empty() {
             let frame = crate::frame::current();
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &i in &hits {
-                textures.written(i, frame, frame + 1, false);
+                textures.written(i, frame, frame, false);
             }
         }
         hits.len()
