@@ -2506,9 +2506,70 @@ type CrossCopy = (std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::s
 /// earlier frame). The copies go in the list's prelude, which runs after
 /// the earlier lists. A list's own writes after the one copied win over it:
 /// the copy of that range is dropped.
+///
+/// A write step names what a shader MAY write (its whole view), not what it
+/// wrote: where it did not, the writer's copy holds whatever it last had.
+/// So only ranges the writer itself was refreshed over in this submission
+/// are copied (there its bytes are title memory's, or newer), and not the
+/// reader's ranges its own shaders wrote in a submission still in the air
+/// (they are newer than either).
+/// Copying the whole view lost the player's hair strands and made shirts
+/// look like chrome (runs of 2026-11-25, 14:00-14:45).
 fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
     use std::sync::Arc;
     let mut out: Vec<Vec<CrossCopy>> = Vec::with_capacity(runs.len());
+    // Every range of every copy refreshed in this submission: all of them
+    // are done on the CPU before any list runs.
+    let mut fresh: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step {
+                fresh.entry(Arc::as_ptr(shadow) as usize).or_default().push((*address, *address + *len));
+            }
+        }
+    }
+    // The parts of [from, to) inside the ranges refreshed for `writer`.
+    let refreshed = |writer: usize, from: usize, to: usize| -> Vec<(usize, usize)> {
+        let mut parts: Vec<(usize, usize)> = fresh
+            .get(&writer)
+            .into_iter()
+            .flatten()
+            .map(|&(a, b)| (a.max(from), b.min(to)))
+            .filter(|(a, b)| a < b)
+            .collect();
+        parts.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in parts {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        merged
+    };
+    // The parts of `part` outside every range of `busy`.
+    let outside = |part: (usize, usize), busy: &[(usize, usize)]| -> Vec<(usize, usize)> {
+        let mut parts = vec![part];
+        for &(a, e) in busy {
+            parts = parts
+                .into_iter()
+                .flat_map(|(from, to)| {
+                    if e <= from || a >= to {
+                        return vec![(from, to)];
+                    }
+                    let mut rest = Vec::with_capacity(2);
+                    if from < a {
+                        rest.push((from, a));
+                    }
+                    if e < to {
+                        rest.push((e, to));
+                    }
+                    rest
+                })
+                .collect();
+        }
+        parts
+    };
     // Writes of the lists before, in submission order.
     let mut written: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
@@ -2523,6 +2584,9 @@ fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
                 continue;
             }
             let me = Arc::as_ptr(reader) as usize;
+            // Ranges earlier submissions' shaders wrote in the reader and
+            // not yet copied back: newer than any other copy's bytes there.
+            let busy = reader.pending_ranges();
             let (rs, rl) = reader.span();
             let (lo, hi) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
             if lo >= hi {
@@ -2545,8 +2609,11 @@ fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
                 }
             }
             for (writer, from, to) in wanted {
-                if seen.insert((me, Arc::as_ptr(&writer) as usize, from, to)) {
-                    copies.push((reader.clone(), writer, from, to));
+                let them = Arc::as_ptr(&writer) as usize;
+                for (a, b) in refreshed(them, from, to).into_iter().flat_map(|part| outside(part, &busy)) {
+                    if seen.insert((me, them, a, b)) {
+                        copies.push((reader.clone(), writer.clone(), a, b));
+                    }
                 }
             }
         }
