@@ -99,6 +99,11 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With [`relay`]: the newest send number a merge into this copy was
+    /// made after (`Shadow::card_merge_relay`). A piece the card copied out
+    /// within an older submission (`crate::host`'s gather) holds older
+    /// bytes than what was merged since, and is fetched instead.
+    merged_after: std::sync::atomic::AtomicU64,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -2581,6 +2586,12 @@ impl Shadow {
         written
     }
 
+    /// With [`relay`]: the newest send number a merge into this copy was
+    /// made after (0 for a copy not in the card's memory).
+    pub(crate) fn card_merged_after(&self) -> u64 {
+        self.card.as_ref().map_or(0, |c| c.merged_after.load(Ordering::Relaxed))
+    }
+
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
     /// card's side held at offset `at` on when a fetch sent after send
     /// `fetched_after` (`crate::host`'s order of the queue) ran, in a piece
@@ -2608,6 +2619,7 @@ impl Shadow {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        card.merged_after.fetch_max(fetched_after, Ordering::Relaxed);
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -2807,6 +2819,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    merged_after: std::sync::atomic::AtomicU64::new(0),
                     size,
                 };
                 (on_card, Some(card))
@@ -3023,6 +3036,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                merged_after: std::sync::atomic::AtomicU64::new(0),
                 size: len,
             };
             (on_card, Some(card))
