@@ -20,23 +20,32 @@ use crate::host::host;
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
-    blend: D3D12_BLEND_DESC,
-    sample_mask: u32,
-    rasterizer: D3D12_RASTERIZER_DESC,
-    depth: D3D12_DEPTH_STENCIL_DESC,
+    pub(crate) blend: D3D12_BLEND_DESC,
+    pub(crate) sample_mask: u32,
+    pub(crate) rasterizer: D3D12_RASTERIZER_DESC,
+    pub(crate) depth: D3D12_DEPTH_STENCIL_DESC,
     /// Input elements, their names pointing into `names`.
-    inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
-    strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    pub(crate) inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    pub(crate) names: Vec<CString>,
+    pub(crate) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
-    samples: DXGI_SAMPLE_DESC,
+    pub(crate) depth_format: DXGI_FORMAT,
+    pub(crate) samples: DXGI_SAMPLE_DESC,
+    /// Whether the title's stream enabled the depth bounds test (saved in
+    /// `early-recipes.bin` so prewarm can follow `VICTORY_DEPTH_BOUNDS`).
+    pub(crate) title_depth_bounds: bool,
     /// The title's depth stencil description enables the depth bounds
     /// test and the host keeps it ([`depth_bounds_on`]): the pipeline is
     /// made from a stream with that description ([`bounds_pipeline`]).
     pub(crate) depth_bounds: bool,
 }
+
+// SAFETY: `inputs`'s `SemanticName` pointers point into `names`'s owned
+// `CString` heap allocations, which are only read after construction.
+unsafe impl Send for GraphicsState {}
+// SAFETY: as above.
+unsafe impl Sync for GraphicsState {}
 
 impl Default for GraphicsState {
     fn default() -> Self {
@@ -89,6 +98,7 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            title_depth_bounds: false,
             depth_bounds: false,
         }
     }
@@ -115,7 +125,8 @@ impl GraphicsState {
                     // pipeline is then made from a stream); otherwise
                     // dropped (the plain description).
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
-                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool() && depth_bounds_on();
+                    self.title_depth_bounds = d.DepthBoundsTestEnable.as_bool();
+                    self.depth_bounds = self.title_depth_bounds && depth_bounds_on();
                     if d.DepthBoundsTestEnable.as_bool() && !self.depth_bounds {
                         static SEEN: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
