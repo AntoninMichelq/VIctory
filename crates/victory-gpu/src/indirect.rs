@@ -706,7 +706,8 @@ pub(crate) fn bound_before(
         // SAFETY: live buffers.
         let (dst_base, ledger_base) = unsafe { (dst.GetGPUVirtualAddress(), ledger.GetGPUVirtualAddress()) };
         let key = (src_gpu, if has_count == 0 { 0 } else { count_gpu }, kind, stride, dst_base, ledger_base);
-        let job = [args_offset, records, has_count, count_offset, at as u32, i * 16, 0, 0];
+        // Bit 2: charged to the ledger entry, its active records noted there.
+        let job = [args_offset, records, has_count | 4, count_offset, at as u32, i * 16, 0, 0];
         let mut pending = clamps.clamp_batch();
         if pending.as_ref().is_some_and(|b| b.key != key || b.jobs.len() >= BATCH_MOST) {
             flush(clamps, pso, pending.take());
