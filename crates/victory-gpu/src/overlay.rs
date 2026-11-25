@@ -43,7 +43,7 @@ pub(crate) fn frame_rate(hwnd: HWND, fps: f64, ms: f64) {
     });
 }
 
-const WIDTH: i32 = 270;
+const WIDTH: i32 = 330;
 /// The box's height: five lines of numbers, a separator and the
 /// settings' lines.
 fn height() -> i32 {

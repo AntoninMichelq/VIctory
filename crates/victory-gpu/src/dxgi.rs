@@ -220,7 +220,8 @@ struct Mode {
 const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
+/// (or `auto`: the PC's main screen, so that the title's output, and its
+/// FidelityFX output, is the screen's size) if set (as a console reports the television it is plugged into: a
 /// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
@@ -228,6 +229,9 @@ fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            if v.trim().eq_ignore_ascii_case("auto") {
+                return primary_screen();
+            }
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
@@ -238,6 +242,14 @@ fn display_size() -> (u32, u32) {
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
+}
+
+/// The PC's main screen in pixels.
+fn primary_screen() -> Option<(u32, u32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    // SAFETY: plain queries.
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?))
 }
 
 /// The console's mode list: one 4K mode at 60 Hz (the title looks
