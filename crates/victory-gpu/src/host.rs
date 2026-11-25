@@ -6317,7 +6317,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    let timed = crate::cpuframe::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6328,7 +6330,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    let timed = crate::cpuframe::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -6468,7 +6472,26 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        let timed = crate::cpuframe::start();
+        match crate::cpuframe::refresh_split().filter(|&n| to - from > n) {
+            // In pieces, at once ([`crate::cpuframe::refresh_split`]).
+            Some(n) => {
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::cpuframe::cut(from, to, n)
+                    .into_iter()
+                    .map(|(a, b)| {
+                        let shadow = shadow.clone();
+                        Box::new(move || Self::update(&shadow, a, b)) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                let before = PREPARING[0].load(Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            }
+            None => Self::update(&shadow, from, to),
+        }
+        crate::cpuframe::done(crate::cpuframe::Work::OneRefresh, timed, to - from);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6525,9 +6548,24 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
+            crate::cpuframe::done(crate::cpuframe::Work::AskAhead, crate::cpuframe::stats().then_some(started), 0);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let split = crate::cpuframe::refresh_split();
+        if split.is_some() && wide_refresh() {
+            self.refreshes = self
+                .refreshes
+                .drain(..)
+                .flat_map(|(shadow, from, to)| {
+                    let n = split.unwrap_or(usize::MAX);
+                    crate::cpuframe::cut(from, to, n).into_iter().map(move |(a, b)| (shadow.clone(), a, b))
+                })
+                .collect();
+        }
+        let timed = crate::cpuframe::start();
+        let refreshed: usize = self.refreshes.iter().map(|r| r.2 - r.1).sum();
+        let wide = wide_refresh() && (self.refreshes.len() >= 4 || split.is_some() && self.refreshes.len() >= 2);
+        if wide {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -6546,6 +6584,8 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
+        let work = if wide { crate::cpuframe::Work::WideRefresh } else { crate::cpuframe::Work::OneRefresh };
+        crate::cpuframe::done(work, timed, refreshed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -6988,6 +7028,8 @@ impl Meter {
                 );
             }
         }
+        // Where the CPU's work around submissions goes (`VICTORY_CPU_STATS`).
+        crate::cpuframe::log(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =

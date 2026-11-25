@@ -954,7 +954,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
         // SAFETY: the caller's.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { crate::cpuframe::snapshot_copy(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
@@ -964,7 +964,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let n = each.min(len - at);
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                unsafe { crate::cpuframe::snapshot_copy((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
         }
     });
@@ -1013,7 +1013,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_count();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1033,6 +1033,14 @@ fn workers() -> &'static Workers {
         }
     });
     workers
+}
+
+/// Threads kept for [`wide`]: `VICTORY_WIDE_THREADS`
+/// ([`crate::cpuframe::wide_threads`]), else a quarter of the logical
+/// cores, 2 to 6.
+pub(crate) fn wide_count() -> usize {
+    crate::cpuframe::wide_threads()
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
@@ -1095,7 +1103,9 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
+    let (started, bytes) = (crate::cpuframe::start(), snaps.iter().map(|s| s.2).sum());
     wide(copy_jobs(snaps));
+    crate::cpuframe::done(crate::cpuframe::Work::Snapshots, started, bytes);
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -1111,7 +1121,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { crate::cpuframe::snapshot_copy(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -1149,8 +1159,11 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
                 None => (0, 0, 0, 0, 0),
             }
         })
-        .collect();
-    find_pieces(scans)
+        .collect::<Vec<(usize, usize, usize, usize, usize)>>();
+    let (started, bytes) = (crate::cpuframe::start(), scans.iter().map(|s| s.4.saturating_sub(s.3)).sum());
+    let found = find_pieces(scans);
+    crate::cpuframe::done(crate::cpuframe::Work::Compares, started, bytes);
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -2500,6 +2513,12 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
+        // With `VICTORY_REFRESH_SPLIT_MB` pieces of one copy are brought up
+        // to date at once, each its own pages: the runs are noted under the
+        // lock and copied after it, so that the pieces do not wait for one
+        // another's copies.
+        let later = crate::cpuframe::refresh_split().is_some();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2519,12 +2538,21 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                let r = ((first * PAGE).max(from), (page * PAGE).min(to));
+                if later {
+                    runs.push(r);
+                } else {
+                    bytes += self.copy(r.0, r.1);
+                }
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
+        }
+        drop(copied);
+        for (a, b) in runs {
+            bytes += self.copy(a, b);
         }
         bytes
     }

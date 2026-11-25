@@ -62,6 +62,8 @@ mod memory;
 #[cfg(windows)]
 mod copytop;
 #[cfg(windows)]
+mod cpuframe;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
