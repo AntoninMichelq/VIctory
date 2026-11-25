@@ -2164,6 +2164,69 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Two host copies of the same title memory (a title buffer inside
+/// another, aliased buffers, a window beside a buffer): shaders write one,
+/// and a submission refreshes the other from title memory.
+///
+/// - Behind flights: the writer's bytes reach title memory only when the
+///   flight is settled and copied back, so the refresh would take the bytes
+///   from before them and the reader runs a frame (or more) behind. With
+///   `VICTORY_ALIAS_SETTLE` on (the default; `=0` turns it off) the flights
+///   are settled first, as for [`stale_under_flights`].
+/// - Within this submission: the writer's shaders run after the refresh,
+///   whatever the order of the commands; that is only counted and logged.
+///
+/// Suspected for the pedestrians' hair drawn as long streaks and their
+/// bodies as spikes in some frames: vertices a frame apart.
+fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
+    use std::sync::Arc;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SETTLE").is_none_or(|v| v != "0"));
+    let flights: Vec<(usize, usize)> = if behind { line().written.clone() } else { Vec::new() };
+    // This submission's writes so far, by copy: (copy, from, to).
+    let mut own: Vec<(usize, usize, usize, (u64, u64))> = Vec::new();
+    let mut settle = false;
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::GpuWrite(shadow, address, len) => {
+                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
+                }
+                Step::Refresh(shadow, address, len) => {
+                    let (from, to) = (*address, *address + *len);
+                    let me = Arc::as_ptr(shadow) as usize;
+                    if let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
+                        alias_note(false, shadow.span(), (from, to), Some(w.3));
+                    }
+                    if !shadow.writes_pending() && touches(&flights, from, to) {
+                        alias_note(true, shadow.span(), (from, to), None);
+                        settle = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    settle && on
+}
+
+/// Counts and logs (the first ones, then every 1,000th) a refresh of a copy
+/// whose title memory another copy's shaders write ([`aliased_under_flights`]).
+fn alias_note(flight: bool, reader: (u64, u64), range: (usize, usize), writer: Option<(u64, u64)>) {
+    static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let n = SEEN[usize::from(flight)].fetch_add(1, Ordering::Relaxed);
+    if n < 12 || n % 1000 == 0 {
+        tracing::warn!(
+            kind = if flight { "a flight's shaders write it" } else { "this submission's shaders write it, after" },
+            seen = n + 1,
+            reader = format_args!("{:#x}+{:#x}", reader.0, reader.1),
+            range = format_args!("{:#x}+{:#x}", range.0, range.1 - range.0),
+            writer = format_args!("{}", writer.map_or("-".to_owned(), |w| format!("{:#x}+{:#x}", w.0, w.1))),
+            "a host copy refreshed from title memory that another copy of it is written in"
+        );
+    }
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -4042,16 +4105,20 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
+            } else if !behind {
+                aliased_under_flights(runs, false);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        } else if !behind {
+            aliased_under_flights(runs, false);
         }
         for list in runs {
             list.run_deferred(&mut batch);
