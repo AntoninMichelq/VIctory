@@ -2013,8 +2013,10 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let started = crate::copytop::on().then(std::time::Instant::now);
         let n = self.copy_back_with_counted(address, len, found);
         self.top(crate::copytop::BACK, n as u64);
+        crate::copytop::merged(started);
         n
     }
 
@@ -2139,8 +2141,10 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let started = crate::copytop::on().then(std::time::Instant::now);
         let n = self.relay_merge_counted(at, n, now, title);
         self.top(crate::copytop::BACK, n as u64);
+        crate::copytop::merged(started);
         n
     }
 
@@ -2738,8 +2742,10 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        let started = crate::copytop::on().then(std::time::Instant::now);
         let n = self.card_merge_counted(at, gpu, title);
         self.top(crate::copytop::BACK, n as u64);
+        crate::copytop::merged(started);
         n
     }
 
@@ -2813,8 +2819,10 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let started = crate::copytop::on().then(std::time::Instant::now);
         let n = self.card_merge_relay_counted(at, gpu, fetched_after, title);
         self.top(crate::copytop::BACK, n as u64);
+        crate::copytop::merged(started);
         n
     }
 
