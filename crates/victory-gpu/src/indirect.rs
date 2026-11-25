@@ -116,7 +116,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         // buffers are ours.
         if ((has_count & 4u) != 0) {
             uint per = (has_count & 8u) != 0 ? 3u : 6u;
-            draw_counts = uint2(min(asked.y, FLAT_MOST) * per, min(asked.y, 1u));
+            // (none for a record emptied on the card: no indices)
+            uint flat_n = asked.x == 0 ? 0u : min(asked.y, FLAT_MOST);
+            draw_counts = uint2(flat_n * per, min(flat_n, 1u));
             cost = draw_counts.x;
         }
     } else if (kind == 2) {

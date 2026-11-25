@@ -2165,6 +2165,14 @@ impl State {
             RECTANGLES => vec![a, b, c],
             _ => return None,
         };
+        // The record as the card will read it (refreshed from title memory
+        // below): drawn flat only as one instance of four (three) indices
+        // from index, vertex and instance 0, which is what our buffers
+        // repeat; anything else (offsets, an emptied record, more instances
+        // than a flat draw holds) is drawn as before.
+        if !flat_record_fits(args, arguments, if self.topology == RECTANGLES { 3 } else { 4 }) {
+            return None;
+        }
         // The four vertices of each buffer the layout reads.
         let mut vertices = Vec::new();
         for (slot, v) in self.vertex.iter().enumerate() {
@@ -2186,7 +2194,12 @@ impl State {
                 && crate::shadow::find_any(v.address, u64::from(v.size))
                     .is_some_and(|s| s.writes_pending() || s.stale_under_writes(v.address as usize, (4 * v.stride) as usize))
         });
-        once!(stale, "flat instances: title vertex bytes possibly stale on the CPU (logged once)");
+        if stale {
+            // Our copy would be of bytes from before the card's writes, kept
+            // for later draws too: the title's own draw instead.
+            once!(true, "flat instances: title vertex bytes possibly stale on the CPU, drawn as before (logged once)");
+            return None;
+        }
         let len = u64::from(stride);
         // `VICTORY_FLAT_CHECK=vb`: the title's own pipeline, indices and
         // instanced arguments over our vertex buffers (their first four
@@ -3380,6 +3393,40 @@ struct FlatBuffers {
 unsafe impl Send for FlatBuffers {}
 // SAFETY: as above.
 unsafe impl Sync for FlatBuffers {}
+
+/// Whether the indexed record at `arguments` (title memory, not written on
+/// the card since: what the refresh copies is what runs) is one a flat draw
+/// stands for: `indices` indices per instance, from index, vertex and
+/// instance 0, with 1 to [`crate::indirect::FLAT_MOST`] instances.
+fn flat_record_fits(args: &crate::shadow::Shadow, arguments: u64, indices: u32) -> bool {
+    if args.writes_pending() || args.stale_under_writes(arguments as usize, 20) {
+        return false;
+    }
+    if arguments == 0 || !crate::texture::committed(arguments as *const u8, 20) {
+        return false;
+    }
+    // SAFETY: committed title memory, checked above.
+    let r: [u32; 5] =
+        std::array::from_fn(|k| unsafe { (arguments as *const u32).add(k).read_unaligned() });
+    let [count, instances, start, base, first] = r;
+    let fits = count == indices
+        && (1..=crate::indirect::FLAT_MOST).contains(&instances)
+        && start == 0
+        && base == 0
+        && first == 0;
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !fits && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            count,
+            instances,
+            start,
+            base,
+            first,
+            "flat instances: a record drawn as before"
+        );
+    }
+    fits
+}
 
 /// The buffers for a flat draw of `pattern` (`per` of the title's indices:
 /// a quad's two triangles, or a rectangle's three corners) over `vertices`
