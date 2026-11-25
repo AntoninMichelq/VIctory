@@ -36,10 +36,62 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Whether compute command lists of the title (`D3D12_COMMAND_LIST_TYPE_COMPUTE`)
+/// run on a dedicated host `COMPUTE` queue (`VICTORY_ASYNC_COMPUTE=1`, off by default).
+pub(crate) fn async_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_COMPUTE").is_some_and(|v| v == "1"))
+}
+
+/// States legal on a `D3D12_COMMAND_LIST_TYPE_COMPUTE` command list:
+/// vertex/CBV, UAV, non-pixel SRV, indirect argument, copy dest, copy source
+/// (plus `COMMON = 0`). Graphics-only bits (`RENDER_TARGET`, `DEPTH_*`,
+/// `PIXEL_SHADER_RESOURCE`) are rejected by D3D12 on compute command lists.
+const COMPUTE_STATES: u32 = 0x1 | 0x8 | 0x40 | 0x200 | 0x400 | 0x800;
+
+/// Cross-queue GPU fence values a submission must wait for before executing.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QueueSync {
+    pub(crate) direct: u64,
+    pub(crate) compute: u64,
+}
+
+impl QueueSync {
+    pub(crate) fn merge(&mut self, other: QueueSync) {
+        self.direct = self.direct.max(other.direct);
+        self.compute = self.compute.max(other.compute);
+    }
+}
+
+/// Since the last frame-rate line (with `VICTORY_ASYNC_COMPUTE=1`):
+/// [0] dispatches sent on the compute queue,
+/// [1] submissions sent on the compute queue,
+/// [2] cross-queue GPU waits direct -> compute,
+/// [3] cross-queue GPU waits compute -> direct.
+static ASYNC_COMPUTE_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    /// Dedicated host compute queue and fence (`VICTORY_ASYNC_COMPUTE=1`).
+    compute_queue: Option<ID3D12CommandQueue>,
+    compute_fence: Option<ID3D12Fence>,
+    compute_event: Option<HANDLE>,
+    /// Last value signalled on `compute_fence`, updated under `submitted`.
+    compute_submitted: std::sync::atomic::AtomicU64,
+    /// Highest `compute_fence` value `queue` (direct) has already waited for.
+    direct_waited_compute: std::sync::atomic::AtomicU64,
+    /// Highest `fence` (direct) value `compute_queue` has already waited for.
+    compute_waited_direct: std::sync::atomic::AtomicU64,
+    /// Pools of tiny cross-queue transition lists (direct -> COMMON before
+    /// compute; compute -> COMMON after compute), recycled when flights land.
+    cross_direct: Mutex<Vec<Prelude>>,
+    cross_compute: Mutex<Vec<Prelude>>,
+    /// Per card-backed `Shadow` (pointer as usize): last `(direct, compute)`
+    /// fence value that ran `card_before` / `card_check` on it.
+    card_sync: Mutex<std::collections::HashMap<usize, (u64, u64)>>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -725,6 +777,18 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        let (compute_queue, compute_fence, compute_event) = if async_compute() {
+            let cq: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                ..Default::default()
+            })?;
+            let cf: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let ce = CreateEventW(None, false, false, None)?;
+            tracing::info!("host D3D12 async compute queue ready (VICTORY_ASYNC_COMPUTE=1)");
+            (Some(cq), Some(cf), Some(ce))
+        } else {
+            (None, None, None)
+        };
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -747,6 +811,15 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
+            compute_queue,
+            compute_fence,
+            compute_event,
+            compute_submitted: std::sync::atomic::AtomicU64::new(0),
+            direct_waited_compute: std::sync::atomic::AtomicU64::new(0),
+            compute_waited_direct: std::sync::atomic::AtomicU64::new(0),
+            cross_direct: Mutex::default(),
+            cross_compute: Mutex::default(),
+            card_sync: Mutex::default(),
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -853,6 +926,10 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Whether this command list is `D3D12_COMMAND_LIST_TYPE_COMPUTE`.
+    compute: bool,
+    /// Compute dispatches recorded since the last reset (for async compute stats).
+    dispatches: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1579,6 +1656,8 @@ struct CardWork {
     /// After them, in the same submission: the compare of the declared
     /// ranges with their bytes from before. As `sync`.
     check: Vec<Prelude>,
+    /// Compute-list equivalent of `check` for submissions on `compute_queue`.
+    check_compute: Vec<Prelude>,
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
     root: ID3D12RootSignature,
@@ -1885,9 +1964,11 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
-    /// The lists of ours the plan recorded (whether the compare, the
-    /// list), given back by `Host::card_done`.
-    lists: Vec<(bool, Prelude)>,
+    /// The lists of ours the plan recorded (`0` sync direct, `1` check direct,
+    /// `2` check compute), given back by `Host::card_done`.
+    lists: Vec<(u8, Prelude)>,
+    /// Whether `work.sync` ran on the direct queue ahead of this plan.
+    sync_ran: bool,
     /// With [`relay`]: the number of the send ahead of the submission's
     /// lists (`QUEUE_ORDER`): the card held what was sent up to it, and
     /// nothing sent after, when the submission ran.
@@ -2153,14 +2234,26 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// Of the line's things in order (a flight: the value signalled on the
-/// host's fence behind it; a write or a signal behind a flight: `None`):
+/// Of the line's things in order (a flight: whether it ran on the compute
+/// queue and the value signalled on that queue's fence behind it; a write
+/// or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
-/// `completed`: everything ahead of the first flight it has not run. A
-/// later flight never lands before an earlier one, and what follows a
-/// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: &[Option<u64>], completed: u64) -> usize {
-    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+/// `(direct_done, compute_done)`: everything ahead of the first flight it
+/// has not run. A later flight never lands before an earlier one, and what
+/// follows a flight (its bottom-of-pipe writes, signals) never before the
+/// flight.
+fn landable(line: &[Option<(bool, u64)>], direct_done: u64, compute_done: u64) -> usize {
+    line.iter()
+        .position(|f| {
+            f.is_some_and(|(on_compute, val)| {
+                if on_compute {
+                    val > compute_done
+                } else {
+                    val > direct_done
+                }
+            })
+        })
+        .unwrap_or(line.len())
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -2184,19 +2277,24 @@ mod relay_tests {
     /// before the flight.
     #[test]
     fn flights_land_in_the_order_they_were_sent() {
-        // Flight (fence 5), its write, a signal, flight (fence 6), its write.
-        let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
+        // Flight (direct fence 5), its write, a signal, flight (direct fence 6), its write.
+        let line = [Some((false, 5)), None, None, Some((false, 6)), None];
+        assert_eq!(landable(&line, 4, 0), 0);
+        assert_eq!(landable(&line, 5, 0), 3);
+        assert_eq!(landable(&line, 6, 0), 5);
+        assert_eq!(landable(&line, u64::MAX, u64::MAX), 5);
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
+        assert_eq!(landable(&[None, None], 0, 0), 2);
+        assert_eq!(landable(&[None, Some((false, 9)), None], 8, 0), 1);
+        assert_eq!(landable(&[], 3, 0), 0);
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
+        assert_eq!(landable(&line[3..], 5, 0), 0);
+        assert_eq!(landable(&line[3..], 6, 0), 2);
+        // Interleaved direct and compute flights land strictly in order.
+        let mixed = [Some((false, 5)), None, Some((true, 2)), None, Some((false, 6))];
+        assert_eq!(landable(&mixed, 5, 1), 2);
+        assert_eq!(landable(&mixed, 5, 2), 4);
+        assert_eq!(landable(&mixed, 6, 2), 5);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -2248,6 +2346,13 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
+    /// Whether this submission ran on `compute_queue` and the fence value
+    /// signalled on that queue's fence (`compute_fence` if true, `fence` if false).
+    on_compute: bool,
+    fence: u64,
+    /// Cross-queue transition lists (`(is_compute, Prelude)`) to recycle when
+    /// this flight lands.
+    extra_lists: Vec<(bool, Prelude)>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
     /// Its bottom-of-pipe writes.
@@ -2259,17 +2364,20 @@ struct Sent {
 /// what is to be done once it has run.
 struct Flight {
     number: u64,
-    /// The value signalled on the host's fence behind it.
+    /// Whether this flight ran on `compute_queue`.
+    on_compute: bool,
+    /// The value signalled on the host's fence (or `compute_fence`) behind it.
     fence: u64,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
+    extra_lists: Vec<(bool, Prelude)>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
 }
 
 /// One thing in the line of what waits for the card, in order.
 enum Late {
-    Run(Flight),
+    Run(Box<Flight>),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
@@ -2283,8 +2391,10 @@ struct Line {
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
-    /// The value signalled on the host's fence behind the last flight.
+    /// The value signalled on the host's direct fence behind the last flight.
     target: u64,
+    /// The value signalled on `compute_fence` behind the last compute flight.
+    compute_target: u64,
     /// A settle has taken the line and is not done: a signal still goes
     /// behind it.
     settling: bool,
@@ -2309,6 +2419,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     written: Vec::new(),
     lists: 0,
     target: 0,
+    compute_target: 0,
     settling: false,
     poke: false,
     landed: Vec::new(),
@@ -2750,20 +2861,18 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// flight, which is the order the wait asks for. If the flights may write
 /// the value in a way not known here (shaders, a timestamp, another
 /// width), they are settled and memory is asked again.
-pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
+/// [`late_met`], returning any cross-queue GPU fence wait needed when the
+/// matching bottom-of-pipe write is behind an in-flight submission.
+pub(crate) fn late_met_sync(wait: &crate::list::ValueWait) -> Option<QueueSync> {
     let (address, bytes) = wait.place();
     {
         let line = line();
         if line.line.is_empty() && line.in_hand.is_empty() {
-            return false;
+            return None;
         }
         let mut unsure = touches(&line.written, address, address + bytes);
-        // (With the relay: first the writes of flights being landed.)
-        let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-            Late::Write(at, what, n) => Some((at, what, n)),
-            _ => None,
-        }));
-        for (at, what, n) in writes {
+        // Flights in `in_hand` have already finished on the GPU.
+        for (at, what, n) in &line.in_hand {
             if *at >= address + bytes || address >= *at + *n {
                 continue;
             }
@@ -2771,18 +2880,71 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
                 crate::queue::Written::Value(v) if *at == address && *n >= bytes => {
                     if wait.holds_for(*v) {
                         LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
-                        return true;
+                        return Some(QueueSync::default());
                     }
                 }
                 _ => unsure = true,
             }
         }
+        let mut last_flight: Option<(bool, u64)> = None;
+        for item in &line.line {
+            match item {
+                Late::Run(flight) => last_flight = Some((flight.on_compute, flight.fence)),
+                Late::Write(at, what, n) => {
+                    if *at >= address + bytes || address >= *at + *n {
+                        continue;
+                    }
+                    match what {
+                        crate::queue::Written::Value(v) if *at == address && *n >= bytes => {
+                            if wait.holds_for(*v) {
+                                LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+                                let sync = match last_flight {
+                                    Some((true, val)) => QueueSync { direct: 0, compute: val },
+                                    Some((false, val)) => QueueSync { direct: val, compute: 0 },
+                                    None => QueueSync::default(),
+                                };
+                                return Some(sync);
+                            }
+                        }
+                        _ => unsure = true,
+                    }
+                }
+                Late::Signal(..) => {}
+            }
+        }
         if !unsure {
-            return false;
+            return None;
         }
     }
     settle_now(WHY_VALUE);
-    wait.met()
+    wait.met().then(QueueSync::default)
+}
+
+/// Checks if a title fence signal `>= value` is already queued in `LINE` behind
+/// an in-flight submission, returning the GPU fence wait for that submission
+/// (used under `VICTORY_ASYNC_COMPUTE=1` so a waiting queue can submit to the
+/// GPU immediately with a hardware `Wait` instead of waiting for CPU landing).
+pub(crate) fn late_signal_sync(fence: usize, value: u64) -> Option<QueueSync> {
+    if !late() {
+        return None;
+    }
+    let line = line();
+    let mut last_flight: Option<(bool, u64)> = None;
+    for item in &line.line {
+        match item {
+            Late::Run(flight) => last_flight = Some((flight.on_compute, flight.fence)),
+            Late::Signal(f, v) if *f == fence && *v >= value => {
+                let sync = match last_flight {
+                    Some((true, val)) => QueueSync { direct: 0, compute: val },
+                    Some((false, val)) => QueueSync { direct: val, compute: 0 },
+                    None => QueueSync::default(),
+                };
+                return Some(sync);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
@@ -2830,7 +2992,7 @@ fn late_helper() {
         return;
     };
     loop {
-        let target = {
+        let targets = {
             let mut line = line();
             loop {
                 if line.poke {
@@ -2839,21 +3001,27 @@ fn late_helper() {
                 }
                 // (With the relay the flights are another thread's.)
                 if !relay() && !line.line.is_empty() && !line.settling {
-                    break Some(line.target);
+                    break Some((line.target, line.compute_target));
                 }
                 line = LINE_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let Some(target) = target else {
+        let Some((target, compute_target)) = targets else {
             land();
             crate::queue::release_held(false);
             continue;
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
-        // SAFETY: our fence and event.
+        // SAFETY: our fences and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
+            if target > 0 && host.fence.SetEventOnCompletion(target, event).is_ok() {
+                WaitForSingleObject(event, INFINITE);
+            }
+            if compute_target > 0
+                && let Some(cf) = &host.compute_fence
+                && cf.SetEventOnCompletion(compute_target, event).is_ok()
+            {
                 WaitForSingleObject(event, INFINITE);
             }
         }
@@ -2861,9 +3029,11 @@ fn late_helper() {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
-            if line().target != target {
+            let cur = line();
+            if cur.target != target || cur.compute_target != compute_target {
                 continue;
             }
+            drop(cur);
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
@@ -2959,20 +3129,24 @@ fn relay_worker() {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                let fences: Vec<Option<u64>> = line
+                let fences: Vec<Option<(bool, u64)>> = line
                     .line
                     .iter()
                     .map(|l| match l {
-                        Late::Run(flight) => Some(flight.fence),
+                        Late::Run(flight) => Some((flight.on_compute, flight.fence)),
                         _ => None,
                     })
                     .collect();
-                // SAFETY: a plain query.
-                let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                // SAFETY: plain queries.
+                let direct_done = unsafe { host.fence.GetCompletedValue() };
+                let compute_done = host
+                    .compute_fence
+                    .as_ref()
+                    .map_or(u64::MAX, |f| unsafe { f.GetCompletedValue() });
+                let n = landable(&fences, direct_done, compute_done);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    break Err(fences[0].unwrap_or((false, 0)));
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -2988,11 +3162,16 @@ fn relay_worker() {
         };
         match next {
             Ok(items) => host.relay_land(items, &mut fetch),
-            Err(target) => {
+            Err((on_compute, target)) => {
                 let waiting = std::time::Instant::now();
+                let fence = if on_compute {
+                    host.compute_fence.as_ref().unwrap_or(&host.fence)
+                } else {
+                    &host.fence
+                };
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
+                    fence.SetEventOnCompletion(target, event).map(|()| {
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
@@ -3379,11 +3558,21 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_of(false)
+    }
+
+    /// A new compute command list (`D3D12_COMMAND_LIST_TYPE_COMPUTE`), open
+    /// for recording (`VICTORY_ASYNC_COMPUTE=1`).
+    pub(crate) fn new_compute_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_of(true)
+    }
+
+    fn new_list_of(&self, compute: bool) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let list = self.make_list_of(compute);
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -3400,14 +3589,21 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
+        self.make_prelude_of(false)
+    }
+
+    fn make_prelude_of(&self, compute: bool) -> Option<Prelude> {
+        let kind = if compute {
+            D3D12_COMMAND_LIST_TYPE_COMPUTE
+        } else {
+            D3D12_COMMAND_LIST_TYPE_DIRECT
+        };
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(kind)?;
                 let list: ID3D12GraphicsCommandList =
-                    self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    self.device.CreateCommandList(0, kind, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
             })()
@@ -3416,31 +3612,32 @@ impl Host {
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
-                tracing::warn!(error = %e, "no host list for a prelude");
+                tracing::warn!(error = %e, compute, "no host list for a prelude");
                 None
             }
         }
     }
 
-    fn make_list(&self) -> windows::core::Result<HostList> {
+    fn make_list_of(&self, compute: bool) -> windows::core::Result<HostList> {
+        let kind = if compute {
+            D3D12_COMMAND_LIST_TYPE_COMPUTE
+        } else {
+            D3D12_COMMAND_LIST_TYPE_DIRECT
+        };
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(kind)?;
+            let list: ID3D12GraphicsCommandList =
+                self.device.CreateCommandList(0, kind, &allocator, None)?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                let _ = prelude.set(self.make_prelude_of(compute));
             }
             Ok(HostList {
                 allocator,
                 list,
+                compute,
+                dispatches: std::sync::atomic::AtomicU64::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -3564,6 +3761,7 @@ impl Host {
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
+                check_compute: Vec::new(),
                 fetch: list()?,
                 root,
                 pso,
@@ -3654,7 +3852,7 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, runs: &[&HostList], flown: bool, on_compute: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3709,8 +3907,22 @@ impl Host {
                 }
             }
         }
-        let mut used: Vec<(bool, Prelude)> = Vec::new();
-        if !dirty.is_empty() {
+        let mut used: Vec<(u8, Prelude)> = Vec::new();
+        let sync_ran = !dirty.is_empty();
+        if sync_ran {
+            // If a prior compute flight hashed/wrote one of these card shadows,
+            // wait on the compute fence before the direct queue updates it.
+            if self.compute_fence.is_some() {
+                let wait_compute = {
+                    let cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                    dirty
+                        .iter()
+                        .filter_map(|(s, _)| cs.get(&(Arc::as_ptr(s) as usize)).map(|&(_, c)| c))
+                        .max()
+                        .unwrap_or(0)
+                };
+                self.wait_direct_on_compute(wait_compute);
+            }
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -3802,7 +4014,7 @@ impl Host {
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
-            used.push((false, sync));
+            used.push((0, sync));
         }
         drop(order);
         let mut plan = CardPlan {
@@ -3810,6 +4022,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            sync_ran,
             sent_as,
             gather: None,
         };
@@ -3867,7 +4080,11 @@ impl Host {
                 // this memory now (it came back with `card_done`).
                 unsafe { std::ptr::write_volatile(gather.data as *mut u32, 0) };
             }
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = (if on_compute {
+                work.check_compute.pop().or_else(|| self.make_prelude_of(true))
+            } else {
+                work.check.pop().or_else(|| self.make_prelude())
+            }) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -3936,7 +4153,7 @@ impl Host {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
             }
-            plan.lists.push((true, check));
+            plan.lists.push((if on_compute { 2 } else { 1 }, check));
             plan.gather = gather;
         }
         work.out += 1;
@@ -3963,8 +4180,12 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
-        for (check, list) in plan.lists {
-            if check { work.check.push(list) } else { work.sync.push(list) }
+        for (kind, list) in plan.lists {
+            match kind {
+                0 => work.sync.push(list),
+                2 => work.check_compute.push(list),
+                _ => work.check.push(list),
+            }
         }
         work.gathers.extend(plan.gather);
         work.out = work.out.saturating_sub(1);
@@ -4200,7 +4421,7 @@ impl Host {
             let flights: Vec<&Flight> = items
                 .iter()
                 .filter_map(|l| match l {
-                    Late::Run(flight) => Some(flight),
+                    Late::Run(flight) => Some(flight.as_ref()),
                     _ => None,
                 })
                 .collect();
@@ -4259,6 +4480,7 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
+                    self.recycle_extra_lists(flight.extra_lists);
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
@@ -4436,10 +4658,69 @@ impl Host {
         }
     }
 
+    /// Emits a GPU wait on the direct queue for `compute_fence >= want`, if
+    /// it has not already waited that far.
+    fn wait_direct_on_compute(&self, want: u64) {
+        if want == 0 {
+            return;
+        }
+        let Some(cf) = &self.compute_fence else {
+            return;
+        };
+        let prev = self.direct_waited_compute.load(Ordering::Relaxed);
+        if want <= prev {
+            return;
+        }
+        // SAFETY: our direct queue and compute fence.
+        if let Err(e) = unsafe { self.queue.Wait(cf, want) } {
+            tracing::warn!(error = %e, want, "direct queue wait on compute fence failed");
+            return;
+        }
+        self.direct_waited_compute.store(want, Ordering::Relaxed);
+        ASYNC_COMPUTE_STATS[3].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Emits a GPU wait on the compute queue for `self.fence >= want`, if it
+    /// has not already waited that far.
+    fn wait_compute_on_direct(&self, want: u64) {
+        if want == 0 {
+            return;
+        }
+        let Some(cq) = &self.compute_queue else {
+            return;
+        };
+        let prev = self.compute_waited_direct.load(Ordering::Relaxed);
+        if want <= prev {
+            return;
+        }
+        // SAFETY: our compute queue and direct fence.
+        if let Err(e) = unsafe { cq.Wait(&self.fence, want) } {
+            tracing::warn!(error = %e, want, "compute queue wait on direct fence failed");
+            return;
+        }
+        self.compute_waited_direct.store(want, Ordering::Relaxed);
+        ASYNC_COMPUTE_STATS[2].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recycle_extra_lists(&self, lists: Vec<(bool, Prelude)>) {
+        if lists.is_empty() {
+            return;
+        }
+        for (is_compute, p) in lists {
+            let pool = if is_compute { &self.cross_compute } else { &self.cross_direct };
+            pool.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+        }
+    }
+
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
+    #[cfg(any(feature = "diagnostics", test))]
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        let _ = self.submit(runs, false);
+        self.execute_sync(runs, QueueSync::default());
+    }
+
+    pub(crate) fn execute_sync(&self, runs: &[&HostList], sync: QueueSync) {
+        let _ = self.submit(runs, false, sync);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -4448,7 +4729,12 @@ impl Host {
     /// the air, at the next point where what they do can be observed
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
-    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    pub(crate) fn execute_late_sync(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        sync: QueueSync,
+    ) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -4456,7 +4742,7 @@ impl Host {
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, true)
+            self.submit(&runs, true, sync)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -4466,18 +4752,31 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line {
+                line: items,
+                written,
+                lists: flying,
+                target,
+                compute_target,
+                ..
+            } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             *flying += order.len();
-            *target = *submitted;
-            items.push(Late::Run(Flight {
+            if sent.on_compute {
+                *compute_target = sent.fence;
+            } else {
+                *target = sent.fence;
+            }
+            items.push(Late::Run(Box::new(Flight {
                 number: sent.number,
-                fence: *target,
+                on_compute: sent.on_compute,
+                fence: sent.fence,
                 lists,
                 order,
+                extra_lists: sent.extra_lists,
                 card: sent.card,
                 back: sent.back,
-            }));
+            })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
@@ -4502,26 +4801,39 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
-    fn execute_own(&self, list: &HostList) -> u64 {
+    fn execute_own(&self, list: &HostList, sync: QueueSync) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], true, sync) else {
             return 0;
         };
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line {
+                line: items,
+                written,
+                lists: flying,
+                target,
+                compute_target,
+                ..
+            } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             *flying += 1;
-            *target = *submitted;
-            items.push(Late::Run(Flight {
+            if sent.on_compute {
+                *compute_target = sent.fence;
+            } else {
+                *target = sent.fence;
+            }
+            items.push(Late::Run(Box::new(Flight {
                 number,
-                fence: *target,
+                on_compute: sent.on_compute,
+                fence: sent.fence,
                 lists: Vec::new(),
                 order: Vec::new(),
+                extra_lists: sent.extra_lists,
                 card: sent.card,
                 back: sent.back,
-            }));
+            })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4581,18 +4893,34 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
+                // SAFETY: the fences and events are ours, under the
+                // submission lock; `submitted` / `compute_submitted` are the
+                // last values signalled.
+                let compute_val = self.compute_submitted.load(Ordering::Relaxed);
                 unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
+                    let waited_direct = if *submitted > 0 {
+                        self.fence.SetEventOnCompletion(*submitted, self.event).map(|()| {
                             working(false);
                             WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
                             working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(e) = waited_direct {
+                        tracing::warn!(error = %e, "submissions sent ahead not waited for");
                     }
+                    if compute_val > 0
+                        && let (Some(cf), Some(ce)) = (&self.compute_fence, self.compute_event)
+                        && let Err(e) = cf.SetEventOnCompletion(compute_val, ce).map(|()| {
+                            working(false);
+                            WaitForSingleObject(ce, INFINITE);
+                            working(true);
+                        })
+                    {
+                        tracing::warn!(error = %e, "compute submissions sent ahead not waited for");
+                    }
+                    stood(waiting);
                 }
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -4659,6 +4987,7 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
+                        self.recycle_extra_lists(flight.extra_lists);
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
@@ -4688,7 +5017,12 @@ impl Host {
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+        sync: QueueSync,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4785,6 +5119,85 @@ impl Host {
         } else if !behind {
             aliased_under_flights(runs, false);
         }
+        let on_compute =
+            self.compute_queue.is_some() && !runs.is_empty() && runs.iter().all(|l| l.is_compute());
+        // Collect unique textures touched by `runs` for cross-queue sync and
+        // COMMON state transitions when `VICTORY_ASYNC_COMPUTE=1` is active.
+        let mut touched_textures: Vec<std::sync::Arc<crate::resource::HostTexture>> = Vec::new();
+        let mut need_direct = sync.direct;
+        let mut need_compute = sync.compute;
+        let mut extra_lists: Vec<(bool, Prelude)> = Vec::new();
+        if self.compute_queue.is_some() {
+            let mut seen_tex = std::collections::HashSet::new();
+            let mut push_tex = |copy: &std::sync::Arc<crate::resource::HostTexture>| {
+                if seen_tex.insert(std::sync::Arc::as_ptr(copy) as usize) {
+                    touched_textures.push(copy.clone());
+                }
+            };
+            for list in runs {
+                for (_, _, copy) in list.states.lock().unwrap_or_else(|e| e.into_inner()).values() {
+                    push_tex(copy);
+                }
+                for u in list.twins.lock().unwrap_or_else(|e| e.into_inner()).values() {
+                    push_tex(&u.depth);
+                    push_tex(&u.twin.colour);
+                    if let Some(plane) = &u.twin.plane {
+                        push_tex(plane);
+                    }
+                }
+            }
+            if on_compute {
+                // Before a compute submission runs: any texture not already in
+                // COMMON (e.g. left in RENDER_TARGET / DEPTH_WRITE / PIXEL_SHADER_RESOURCE
+                // by the direct queue) must be transitioned to COMMON on the direct queue.
+                let mut direct_barriers = Vec::new();
+                for tex in &touched_textures {
+                    need_direct = need_direct.max(tex.last_direct.load(Ordering::Relaxed));
+                    let real = tex.state.load(Ordering::Relaxed);
+                    if real != 0 {
+                        direct_barriers.push(transition(
+                            &tex.texture,
+                            D3D12_RESOURCE_STATES(real as i32),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        ));
+                        tex.state.store(0, Ordering::Relaxed);
+                    }
+                }
+                if !direct_barriers.is_empty() {
+                    let prelude = self
+                        .cross_direct
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop()
+                        .or_else(|| self.make_prelude_of(false));
+                    if let Some(prelude) = prelude {
+                        let (allocator, list) = &prelude;
+                        // SAFETY: pooled direct prelude, live textures.
+                        let recorded = unsafe {
+                            (|| -> windows::core::Result<()> {
+                                allocator.Reset()?;
+                                list.Reset(allocator, None)?;
+                                list.ResourceBarrier(&direct_barriers);
+                                list.Close()?;
+                                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                                *submitted += 1;
+                                self.queue.Signal(&self.fence, *submitted)?;
+                                Ok(())
+                            })()
+                        };
+                        if let Err(e) = recorded {
+                            fail(format_args!("cross-queue direct->COMMON transition failed ({e})"));
+                        }
+                        need_direct = need_direct.max(*submitted);
+                        extra_lists.push((false, prelude));
+                    }
+                }
+            } else {
+                for tex in &touched_textures {
+                    need_compute = need_compute.max(tex.last_compute.load(Ordering::Relaxed));
+                }
+            }
+        }
         let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
@@ -4797,6 +5210,51 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        // After a compute submission's lists: transition every texture it used
+        // back to COMMON on the compute queue so the direct queue can safely
+        // transition it from COMMON later.
+        if on_compute && !touched_textures.is_empty() {
+            let mut post_barriers = Vec::new();
+            for tex in &touched_textures {
+                let st = tex.state.load(Ordering::Relaxed);
+                if st != 0 {
+                    post_barriers.push(transition(
+                        &tex.texture,
+                        D3D12_RESOURCE_STATES(st as i32),
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ));
+                    tex.state.store(0, Ordering::Relaxed);
+                }
+            }
+            if !post_barriers.is_empty() {
+                let postlude = self
+                    .cross_compute
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop()
+                    .or_else(|| self.make_prelude_of(true));
+                if let Some(postlude) = postlude {
+                    let (allocator, list) = &postlude;
+                    // SAFETY: pooled compute postlude, live textures.
+                    let recorded = unsafe {
+                        (|| -> windows::core::Result<ID3D12CommandList> {
+                            allocator.Reset()?;
+                            list.Reset(allocator, None)?;
+                            list.ResourceBarrier(&post_barriers);
+                            list.Close()?;
+                            list.cast()
+                        })()
+                    };
+                    match recorded {
+                        Ok(cmd) => {
+                            lists.push(Some(cmd));
+                            extra_lists.push((true, postlude));
+                        }
+                        Err(e) => fail(format_args!("cross-queue compute->COMMON postlude failed ({e})")),
+                    }
+                }
+            }
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -4816,22 +5274,97 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, on_compute);
+        if self.compute_queue.is_some()
+            && let Some(card) = &card
+        {
+            if on_compute {
+                if card.sync_ran {
+                    *submitted += 1;
+                    // SAFETY: our direct queue and fence.
+                    if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
+                        fail(format_args!("card sync signal on direct queue failed ({e})"));
+                    }
+                    need_direct = need_direct.max(*submitted);
+                    let mut cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                    for s in &card._synced {
+                        cs.entry(std::sync::Arc::as_ptr(s) as usize).or_default().0 = *submitted;
+                    }
+                }
+                let cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                for r in &card.ranges {
+                    if let Some(&(d, _)) = cs.get(&(std::sync::Arc::as_ptr(&r.shadow) as usize)) {
+                        need_direct = need_direct.max(d);
+                    }
+                }
+            } else {
+                let cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                for r in &card.ranges {
+                    if let Some(&(_, c)) = cs.get(&(std::sync::Arc::as_ptr(&r.shadow) as usize)) {
+                        need_compute = need_compute.max(c);
+                    }
+                }
+            }
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
         if late {
-            *submitted += 1;
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let fence_val = if on_compute {
+                self.wait_compute_on_direct(need_direct);
+                let cq = self.compute_queue.as_ref().expect("compute queue");
+                let cf = self.compute_fence.as_ref().expect("compute fence");
+                let val = self.compute_submitted.fetch_add(1, Ordering::Relaxed) + 1;
+                // SAFETY: closed compute lists; our compute queue and fence.
+                let signalled = unsafe {
+                    cq.ExecuteCommandLists(&lists);
+                    cq.Signal(cf, val)
+                };
+                if let Err(e) = signalled {
+                    fail(format_args!("a compute submission sent ahead could not be followed by a signal ({e})"));
+                }
+                for tex in &touched_textures {
+                    tex.last_compute.store(val, Ordering::Relaxed);
+                }
+                if let Some(card) = &card {
+                    let mut cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                    for r in &card.ranges {
+                        cs.entry(std::sync::Arc::as_ptr(&r.shadow) as usize).or_default().1 = val;
+                    }
+                }
+                let dispatches: u64 = runs.iter().map(|l| l.dispatches.load(Ordering::Relaxed)).sum();
+                ASYNC_COMPUTE_STATS[0].fetch_add(dispatches, Ordering::Relaxed);
+                ASYNC_COMPUTE_STATS[1].fetch_add(1, Ordering::Relaxed);
+                val
+            } else {
+                self.wait_direct_on_compute(need_compute);
+                *submitted += 1;
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                self.card_sent();
+                if let Err(e) = signalled {
+                    fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+                }
+                if self.compute_queue.is_some() {
+                    for tex in &touched_textures {
+                        tex.last_direct.store(*submitted, Ordering::Relaxed);
+                    }
+                    if let Some(card) = &card {
+                        let mut cs = self.card_sync.lock().unwrap_or_else(|e| e.into_inner());
+                        for r in &card.ranges {
+                            cs.entry(std::sync::Arc::as_ptr(&r.shadow) as usize).or_default().0 = *submitted;
+                        }
+                        for s in &card._synced {
+                            cs.entry(std::sync::Arc::as_ptr(s) as usize).or_default().0 = *submitted;
+                        }
+                    }
+                }
+                *submitted
             };
-            self.card_sent();
-            if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
-            }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -4840,6 +5373,9 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
+                on_compute,
+                fence: fence_val,
+                extra_lists,
                 card,
                 back,
                 writes,
@@ -4861,25 +5397,53 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        if on_compute {
+            self.wait_compute_on_direct(need_direct);
+        } else {
+            self.wait_direct_on_compute(need_compute);
+        }
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
+            if on_compute {
+                let cq = self.compute_queue.as_ref().expect("compute queue");
+                let cf = self.compute_fence.as_ref().expect("compute fence");
+                let ce = self.compute_event.expect("compute event");
+                let val = self.compute_submitted.fetch_add(1, Ordering::Relaxed) + 1;
+                // SAFETY: closed compute lists; our compute queue, fence and event.
+                unsafe {
+                    cq.ExecuteCommandLists(group);
+                    let waited = cq
+                        .Signal(cf, val)
+                        .and_then(|()| cf.SetEventOnCompletion(val, ce));
+                    match waited {
+                        Ok(()) => {
+                            working(false);
+                            WaitForSingleObject(ce, INFINITE);
+                            stood(started);
+                            working(true);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host compute submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+            } else {
+                *submitted += 1;
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    self.card_sent();
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            working(false);
+                            WaitForSingleObject(self.event, INFINITE);
+                            stood(started);
+                            working(true);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    }
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -4909,6 +5473,12 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if on_compute {
+            let dispatches: u64 = runs.iter().map(|l| l.dispatches.load(Ordering::Relaxed)).sum();
+            ASYNC_COMPUTE_STATS[0].fetch_add(dispatches, Ordering::Relaxed);
+            ASYNC_COMPUTE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        self.recycle_extra_lists(extra_lists);
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -5170,6 +5740,22 @@ impl Host {
 }
 
 impl HostList {
+    /// Whether this command list is `D3D12_COMMAND_LIST_TYPE_COMPUTE`.
+    pub(crate) fn is_compute(&self) -> bool {
+        self.compute
+    }
+
+    /// Counts a compute dispatch recorded into this list.
+    pub(crate) fn count_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `legal_state` masked to states valid on this list's D3D12 type.
+    pub(crate) fn legal_state(&self, texture: &ID3D12Resource, state: u32) -> u32 {
+        let s = legal_state(texture, state);
+        if self.compute { s & COMPUTE_STATES } else { s }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -5273,6 +5859,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.writes.store(0, Ordering::Relaxed);
+        self.dispatches.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             (chunks.used, chunks.at, chunks.barrier) = (0, 0, false);
@@ -5315,7 +5902,7 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        let wanted = self.legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -5334,7 +5921,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = self.legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -5495,7 +6082,12 @@ impl HostList {
                 // Not copied again if the list copied since the last write
                 // and only the depth plane's pass is left.
                 let copy = u.behind[0] == Some(true);
-                u.behind[0] = Some(false);
+                // On a compute command list, `pass_plane` (a graphics draw) is
+                // illegal: keep `behind[0]` set so the next direct prelude
+                // updates the depth plane if needed.
+                if !self.compute || u.twin.plane.is_none() {
+                    u.behind[0] = Some(false);
+                }
                 u.late = false;
                 (u.depth.clone(), u.twin.clone(), copy)
             })
@@ -5505,9 +6097,11 @@ impl HostList {
             if *copy {
                 self.twin_copy(depth, twin, false);
             }
-            // Nothing of the title's is recorded after this: the pass may
-            // leave its own pipeline and target set.
-            self.pass_plane(depth, twin);
+            if !self.compute {
+                // Nothing of the title's is recorded after this: the pass may
+                // leave its own pipeline and target set.
+                self.pass_plane(depth, twin);
+            }
             self.settle(depth, SHADER_RESOURCE);
         }
     }
@@ -5597,7 +6191,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude_of(self.compute)))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -6731,6 +7325,20 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        if async_compute() {
+            let secs = elapsed.as_secs_f64().max(1e-6);
+            let [dispatches, subs, d2c, c2d] =
+                [0, 1, 2, 3].map(|i| ASYNC_COMPUTE_STATS[i].swap(0, Ordering::Relaxed) as f64);
+            tracing::info!(
+                "async compute (VICTORY_ASYNC_COMPUTE=1): {:.1} dispatches/s ({:.1}/frame) in {:.1} submissions/s, \
+                 cross-queue waits: {:.1}/frame direct->compute, {:.1}/frame compute->direct",
+                dispatches / secs,
+                dispatches / frames,
+                subs / secs,
+                d2c / frames,
+                c2d / frames,
+            );
+        }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
@@ -6940,7 +7548,7 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64, wait_compute: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7032,12 +7640,16 @@ impl Host {
                 ),
             ]);
             copy.close();
+            let present_sync = QueueSync {
+                direct: 0,
+                compute: wait_compute,
+            };
             match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = self.execute_own(copy, present_sync);
                     p.ahead[i].1 = flown;
                 }
-                None => self.execute(&[copy]),
+                None => self.execute_sync(&[copy], present_sync),
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {

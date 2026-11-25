@@ -223,6 +223,10 @@ unsafe impl Send for Idle {}
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+/// Idle host compute command lists (`D3D12_COMMAND_LIST_TYPE_COMPUTE`), kept
+/// apart from direct lists (`VICTORY_ASYNC_COMPUTE=1`).
+#[cfg(windows)]
+static IDLE_COMPUTE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
@@ -238,12 +242,25 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a title list of type `kind` records onto a host compute command
+/// list (`D3D12_COMMAND_LIST_TYPE_COMPUTE`).
+#[cfg(windows)]
+fn is_compute_kind(kind: u32) -> bool {
+    kind == 2 && crate::host::async_compute()
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
+    fresh_list_for(false)
+}
+
+#[cfg(windows)]
+fn fresh_list_for(compute: bool) -> Option<crate::host::HostList> {
+    let pool = if compute { &IDLE_COMPUTE } else { &IDLE };
     let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = pool.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
@@ -252,7 +269,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => crate::host::host().and_then(|h| {
+            if compute {
+                h.new_compute_list().ok()
+            } else {
+                h.new_list().ok()
+            }
+        }),
     }
 }
 
@@ -269,14 +292,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let pool = if host.is_compute() { &IDLE_COMPUTE } else { &IDLE };
+        if !ran.contains(&i) || pool.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = pool.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
@@ -394,7 +418,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list_for(is_compute_kind(list.kind)) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -471,15 +495,15 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // SAFETY: one of our lists, closed and submitted: nothing records
+        // into it until the title resets it.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        let Some(fresh) = fresh_list_for(is_compute_kind(list.kind)) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -543,13 +567,16 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let list = this.cast_mut().cast::<List>();
+        // SAFETY: one of our lists, closed and submitted: nothing records
+        // into it until the title resets it.
+        let compute = is_compute_kind(unsafe { (*list).kind });
+        let Some(fresh) = fresh_list_for(compute) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
-        let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
@@ -656,11 +683,18 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
+        host: crate::host::host().and_then(|h| {
+            let made = if is_compute_kind(kind) {
+                h.new_compute_list()
+            } else {
+                h.new_list()
+            };
+            match made {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host command list");
+                    None
+                }
             }
         }),
         #[cfg(windows)]
@@ -785,7 +819,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(list.legal_state(texture, wanted)),
             })
         }
         1 => Some(Barrier {
@@ -873,7 +907,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+        let state = list.legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -2207,7 +2241,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list_for(is_compute_kind(list.kind)) else {
             return;
         };
         current.close();

@@ -1913,6 +1913,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_write();
+        list.count_dispatch();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // After the program that resolves the indirect light: the ambient
         // light in its place (`crate::ambient`); the title's bindings go
@@ -2892,6 +2893,7 @@ impl State {
         }
         if kind == DISPATCH {
             list.count_write();
+            list.count_dispatch();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             self.drawn(list);
