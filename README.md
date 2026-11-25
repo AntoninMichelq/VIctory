@@ -22,11 +22,32 @@ developer or publisher.
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
+## Results on an AMD Radeon RX 7600 (this fork's `main`, 2026-11-25)
+
+Measured on one PC: Windows, AMD Radeon RX 7600 (8 GB), 32 GB RAM, Series X
+profile, in the prison at the start of the game.
+
+| | Result |
+|---|---|
+| Frame rate in the world | about 6.2-6.4 fps, with the game's AMD FSR upscaling from 1080p to 4K |
+| Memory | about 21 GB of RAM, steady over a 10-minute run |
+| Loading | about one minute to reach the world once shaders are cached; the very first run spends a long time preparing shaders (white screen) |
+| Stability | no driver crash or device loss in a 10-minute test run |
+| Picture | lit prison: buildings, cells, characters with hair and skin, sky; the stray triangle lines, the purple fog and the black skin are fixed |
+
+Settings used: `VICTORY_FFX_SCALE=0.5` (FSR), `VICTORY_TEXTURE_HALF=2`,
+`VICTORY_STAGING_POOL_MB=1024`, `VICTORY_VRAM_HYSTERESIS=85,75`, `VICTORY_AMBIENT=off`.
+
+Known issues: textures can arrive late and walls stay flat-coloured for a moment, and
+some objects stream in late. On top of the upstream fork, this branch adds
+fixes for GPU hangs on AMD, mesh triangle assembly, out-of-bounds shader
+views, DirectStorage page copies, memory use and frame pacing.
+
 ## Status of this fork (2026-11-25)
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+Upstream fork's notes, measured on another machine: Windows 11, Intel
+i7-14700KF, NVIDIA RTX 4070 12 GB, 32 GB RAM. **2.5 to 4 frames per second,
+and shadowed areas are black.** The Series X profile is used throughout.
 
 | Stage | State in this fork |
 |-------|--------------------|
