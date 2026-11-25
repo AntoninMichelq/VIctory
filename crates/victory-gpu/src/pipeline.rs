@@ -129,12 +129,15 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
-    /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// The translation, made on first use (or taken from the cache); a
+    /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let (started, cpu) = (std::time::Instant::now(), thread_cpu());
+                let (done, cached) = translate(&self.container);
+                let ms = started.elapsed().as_millis() as u64;
+                let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -156,12 +159,20 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        cached,
+                        ms,
+                        user_ms,
+                        kernel_ms,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        cached,
+                        ms,
+                        user_ms,
+                        kernel_ms,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
@@ -171,17 +182,46 @@ impl Shader {
     }
 }
 
+/// This thread's processor time so far, user and kernel, in 100 ns units.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn thread_cpu() -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [created, exited, kernel, user] = &mut t;
+    // SAFETY: four times of our own thread into our own variables.
+    unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
+    let v = |f: &FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
+    (v(user), v(kernel))
+}
+
+/// This thread's processor time since `then` ([`thread_cpu`]): user and
+/// kernel milliseconds. Against the wall time, it tells work from waiting
+/// (for a processor, a lock, the disk).
+#[cfg(windows)]
+fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
+    let now = thread_cpu();
+    ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
+}
+
+/// The translation, and whether it came from the cache.
+#[cfg(windows)]
+fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+    let (host, cached) = crate::shader_cache::host_shader(container);
+    (host.and_then(|host| with_resources(container, host)), cached)
+}
+
+#[cfg(windows)]
+fn with_resources(
+    container: &[u8],
+    host: victory_shader::emit::HostShader,
+) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    // The translation depends on it (a view index past a capped heap).
-    crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -351,9 +391,24 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    let missing_pipelines: Vec<Arc<make::Pending>> = b
+        .pipelines
+        .iter()
+        .filter(|p| !make::now(p))
+        .cloned()
+        .collect();
+    let missing = missing_pipelines.len();
     if missing > 0 {
         b.off = true;
+        for p in &missing_pipelines {
+            if let Some(shader) = p.shaders.first() {
+                tracing::warn!(
+                    hash = %shader.hash,
+                    stage = %shader.stage,
+                    "the ray-tracing structure builder is missing this program's host pipeline"
+                );
+            }
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
