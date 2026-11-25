@@ -105,15 +105,24 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (ledger && id.x == 0) {
         budget.Store(entry + 4, eff_count);
     }
+    // Diagnostics (the list's budget words 4 to 6; in a ledger, the
+    // entry's fourth word, summed by `SETTLE`): active records, those the
+    // title wrote empty (its culling), those emptied by our bounds.
+    if (!ledger && id.x == 0) {
+        budget.InterlockedAdd(20, min(eff_count, records));
+    }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = dst_base + (later ? 16u : 0u) + id.x * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+    // The record as the title wrote it was empty.
+    bool title_empty = false;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 asked = src_args.Load2(src_at);
+        title_empty = asked.x == 0 || asked.y == 0;
         if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
             asked = uint2(0, 0);
         }
@@ -133,6 +142,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        title_empty = g.x == 0 || g.y == 0 || g.z == 0;
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -142,6 +152,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
+        title_empty = g.x == 0;
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
@@ -173,6 +184,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             before = prev;
         }
         over = !ledger && (before >= BUDGET || BUDGET - before < cost);
+    }
+    if (title_empty) {
+        budget.InterlockedAdd(ledger ? entry + 12 : 16, 1);
+    } else if (cost == 0 && !ledger) {
+        budget.InterlockedAdd(24, 1);
     }
     if (over) {
         // Diagnostics: records emptied by the budget (`over` is never set
@@ -250,6 +266,9 @@ void main(uint t : SV_GroupIndex) {
             uint active = ledger.Load(j * 16 + 4);
             bool runs = cost == 0 || upto <= BUDGET;
             ledger.Store(j * 16 + 8, runs ? active : 0);
+            budget.InterlockedAdd(20, active);
+            budget.InterlockedAdd(16, ledger.Load(j * 16 + 12));
+            ledger.Store(j * 16 + 12, 0);
             if (!runs && active > 0) {
                 budget.InterlockedAdd(12, active);
             }
