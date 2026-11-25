@@ -1834,8 +1834,18 @@ impl State {
         let pass_ms = *PASS_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_PASS_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(200)
         });
+        // Gameplay frames have a time for the frame too
+        // (`VICTORY_TEXTURE_FRAME_MS`, default 60 ms over all passes, catch-up
+        // included), and each pass at most `VICTORY_TEXTURE_STAGE_MS`: with
+        // the catch-up's three times 250 ms a pass, the heap passes took
+        // 101 ms a frame against 31 (tout-5b against tout-3, 2026-11-25).
+        static TEXTURE_FRAME_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let frame_ms = *TEXTURE_FRAME_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_FRAME_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(60)
+        });
+        let left = |ms: u64| std::time::Duration::from_micros((ms * 1000).saturating_sub(SPENT_US.load(Ordering::Relaxed)));
         let span = if loading {
-            std::time::Duration::from_micros((pass_ms * 1000).saturating_sub(SPENT_US.load(Ordering::Relaxed)))
+            left(pass_ms)
         } else {
             std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
                 std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
@@ -1846,7 +1856,12 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && !loading && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let caught_up = catchup && !loading && due.len() >= 1024;
+        let (per_frame, span) = if caught_up { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let span = if loading { span } else { span.min(left(frame_ms)) };
+        if caught_up {
+            HEAP_TEXTURES_CATCHUP[0].fetch_add(1, Ordering::Relaxed);
+        }
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -1864,6 +1879,7 @@ impl State {
             }
         }
         let _took = Took(&SPENT_US, began);
+        let _catchup_took = caught_up.then(|| Took(&HEAP_TEXTURES_CATCHUP[1], began));
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
@@ -3593,6 +3609,8 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 /// Passes over textures picked by index that took the loading budget
 /// ([`loading_frame`]).
 pub(crate) static HEAP_TEXTURES_PRELOAD: AtomicU64 = AtomicU64::new(0);
+/// Since the start: passes with the catch-up's budget, and their microseconds.
+pub(crate) static HEAP_TEXTURES_CATCHUP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the frame before `frame` drew under `VICTORY_PRELOAD_DRAWS`
 /// (400) draws: a loading screen or a frame with little on it, whose time

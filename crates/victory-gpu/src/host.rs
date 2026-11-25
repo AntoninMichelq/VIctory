@@ -6749,6 +6749,23 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        {
+            // The catch-up's share of the heap passes (counters since the start).
+            static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+            let passes = crate::draw::HEAP_TEXTURES_CATCHUP[0].load(Ordering::Relaxed);
+            let us = crate::draw::HEAP_TEXTURES_CATCHUP[1].load(Ordering::Relaxed);
+            let uploaded = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
+            let [p0, u0, t0] = [0, 1, 2].map(|i| LAST[i].load(Ordering::Relaxed));
+            [passes, us, uploaded].iter().zip(&LAST).for_each(|(v, l)| l.store(*v, Ordering::Relaxed));
+            if passes > p0 {
+                tracing::info!(
+                    "texture catch-up per frame: {:.1} passes, {:.1} ms; textures picked by index uploaded per frame {:.1}",
+                    (passes - p0) as f64 / frames,
+                    (us - u0) as f64 / 1e3 / frames,
+                    uploaded.saturating_sub(t0) as f64 / frames,
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
