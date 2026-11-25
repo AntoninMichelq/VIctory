@@ -182,6 +182,54 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// The title's blend description as D3D12 takes it: no blending into
+    /// a target of an integer format (the console's blender passes such
+    /// targets through; D3D12 refuses the pipeline, E_INVALIDARG), and a
+    /// logic operation only into one of an unsigned integer format, never
+    /// beside blending.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        const UINT: [i32; 11] = [3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62];
+        const SINT: [i32; 9] = [4, 8, 14, 18, 32, 38, 43, 52, 64];
+        let mut b = self.blend;
+        let formats = &self.targets.RTFormats;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |n: usize| UINT.contains(&formats[n].0) || SINT.contains(&formats[n].0);
+        let needs = (0..count).any(|n| {
+            let rt = if b.IndependentBlendEnable.as_bool() { &b.RenderTarget[n] } else { &b.RenderTarget[0] };
+            (rt.BlendEnable.as_bool() && integer(n))
+                || (rt.LogicOpEnable.as_bool() && (!UINT.contains(&formats[n].0) || rt.BlendEnable.as_bool()))
+        });
+        if !needs {
+            return b;
+        }
+        if !b.IndependentBlendEnable.as_bool() {
+            for n in 1..8 {
+                b.RenderTarget[n] = b.RenderTarget[0];
+            }
+            b.IndependentBlendEnable = true.into();
+        }
+        for n in 0..8 {
+            let rt = &mut b.RenderTarget[n];
+            let format = formats.get(n).map_or(0, |f| f.0);
+            if n >= count || UINT.contains(&format) || SINT.contains(&format) {
+                rt.BlendEnable = false.into();
+            }
+            if rt.LogicOpEnable.as_bool() && (n >= count || !UINT.contains(&format)) {
+                rt.LogicOpEnable = false.into();
+            }
+        }
+        // D3D12 wants one logic operation for all targets or none.
+        if b.RenderTarget.iter().any(|rt| rt.LogicOpEnable.as_bool()) {
+            b.IndependentBlendEnable = false.into();
+            let first = b.RenderTarget.iter().copied().find(|rt| rt.LogicOpEnable.as_bool());
+            if let Some(mut rt) = first {
+                rt.BlendEnable = false.into();
+                b.RenderTarget = [rt; 8];
+            }
+        }
+        b
+    }
+
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -374,10 +422,7 @@ impl HostPipeline {
         // With a geometry stage: the merged ES+GS stage's two halves, in
         // place of the title's vertex shader (vertex, pixel, then geometry).
         let merged = match (find("geometry"), find("vertex")) {
-            (Some(gs), Some(vs)) if mesh.is_none() => match super::merged_halves(vs, gs) {
-                Some(halves) => Some(halves),
-                None => return None,
-            },
+            (Some(gs), Some(vs)) if mesh.is_none() => Some(super::merged_halves(vs, gs)?),
             (Some(_), _) => return refuse("a geometry stage without a vertex stage", shaders),
             _ => None,
         };
@@ -604,7 +649,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -651,7 +696,7 @@ impl HostPipeline {
                 // The merged stage's geometry half (third), if any.
                 None => code(2),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -715,7 +760,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, %state, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -813,7 +858,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
