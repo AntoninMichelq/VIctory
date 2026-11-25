@@ -899,7 +899,7 @@ impl Staging {
             return;
         }
         let mips = self.mips as usize;
-        if mips < 2 || self.footprints.len() % mips != 0 {
+        if mips < 2 || !self.footprints.len().is_multiple_of(mips) {
             return;
         }
         let n = self.layout.desc.element_bytes as usize;
