@@ -1694,7 +1694,13 @@ impl State {
             if now.saturating_sub(last) >= 1000
                 && LAST_UP.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
             {
-                let up = crate::resource::room_up(memory);
+                // At most `VICTORY_EVICT_LESS_UP_MB` (64) a second: each is
+                // uploaded again whole.
+                static UP_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let cap = *UP_MB.get_or_init(|| {
+                    std::env::var("VICTORY_EVICT_LESS_UP_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64u64)
+                }) << 20;
+                let up = crate::resource::room_up(memory).min(cap);
                 if up > 0 {
                     host.texture_slots_upgrade(up, 256);
                 }
@@ -1832,7 +1838,18 @@ impl State {
                                 // Queued again by when their copies went.
                                 let frame_ms = FRAME_MS.load(Ordering::Relaxed).max(16);
                                 let later = ((every + 1500) / frame_ms).clamp(30, 1000);
-                                let (n, _) = host.texture_slots_evict_less(now.saturating_sub(4000), need, 4096, later);
+                                // At most `VICTORY_EVICT_LESS_ROUND_MB` (128) a
+                                // round: 320-480 MB a round came back as as
+                                // many uploads soon after (run cumul 22:46).
+                                static ROUND_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                                let round = *ROUND_MB.get_or_init(|| {
+                                    std::env::var("VICTORY_EVICT_LESS_ROUND_MB")
+                                        .ok()
+                                        .and_then(|v| v.trim().parse().ok())
+                                        .unwrap_or(128u64)
+                                }) << 20;
+                                let (n, _) =
+                                    host.texture_slots_evict_less(now.saturating_sub(4000), need.min(round), 4096, later);
                                 HEAP_TEXTURES_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
                             }
                         }

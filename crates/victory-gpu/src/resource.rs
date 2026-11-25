@@ -1159,6 +1159,9 @@ struct Hosted {
     /// while the card was full ([`shrink_levels`]). Set under `made`'s lock
     /// when the copy is made, as it stays for that copy's life.
     shrunk: std::sync::atomic::AtomicU32,
+    /// Given up for room (`VICTORY_EVICT_LESS=1`): its next host copy is
+    /// small whatever the room, until made whole again ([`unshrink`]).
+    demoted: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1308,7 +1311,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
         // A small copy while the card is full ([`shrinking`]).
-        let extra = small_extra(&r.desc);
+        let extra = small_extra(&r.desc, r.host.demoted.load(Relaxed));
         r.host.shrunk.store(extra, Relaxed);
         let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
@@ -1455,8 +1458,8 @@ std::thread_local! {
 /// `desc`: the levels it leaves off for being small ([`shrinking`]), also
 /// set for [`host_texture`] on this thread (0 when not making it small).
 #[cfg(windows)]
-fn small_extra(desc: &ResourceDesc) -> u32 {
-    let extra = if SHRINK.get() { shrink_levels(desc, mip_skip(desc)) } else { 0 };
+fn small_extra(desc: &ResourceDesc, demoted: bool) -> u32 {
+    let extra = if SHRINK.get() || demoted { shrink_levels(desc, mip_skip(desc)) } else { 0 };
     EXTRA.set(extra);
     if extra > 0 {
         SHRUNK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1554,6 +1557,22 @@ pub(crate) fn room_need(memory: Option<[u64; 4]>) -> (u64, bool) {
     }
 }
 
+/// Title texture `this` (if it still is one) was given up for room
+/// (`VICTORY_EVICT_LESS=1`): its next host copy is made small, whatever the
+/// room then ([`unshrink`] makes it whole later, a few at a time). Made
+/// whole at once, the textures given up in a round came back as soon as
+/// the card was under its high mark: 200-300 MB uploaded again in a frame
+/// (run cumul 22:46, "textures 306 ms 212 MB").
+#[cfg(windows)]
+pub(crate) fn demote(this: usize) {
+    let all = textures();
+    if all.contains(&this) {
+        // SAFETY: as in `host_copy_info`.
+        let r = unsafe { &*(this as *const Resource) };
+        r.host.demoted.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Takes title texture `this`'s small host copy ([`shrinking`]) away, so
 /// that its next use makes it whole: when the copy is small, no list holds
 /// it and nothing asked for it in the last second (as [`let_go_idle`]: a
@@ -1583,6 +1602,7 @@ pub(crate) fn unshrink(this: This) -> bool {
         // the small copy (its levels are the small copy's).
         crate::texture::unstage(this);
         r.host.shrunk.store(0, Relaxed);
+        r.host.demoted.store(false, Relaxed);
         made.take()
     };
     drop(all);
@@ -2164,6 +2184,7 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             shrunk: std::sync::atomic::AtomicU32::new(0),
+            demoted: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

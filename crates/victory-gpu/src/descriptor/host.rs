@@ -1115,6 +1115,8 @@ impl HostHeap {
             gone.extend(g.slots.into_iter().filter(|&i| self.texture_slot_gone(i)));
             if gone.len() > before {
                 freed += g.bytes;
+                // Back small when its slots are made again.
+                crate::resource::demote(g.texture);
             }
         }
         self.given_up(&gone, later, Some((freed, kept_back)));
