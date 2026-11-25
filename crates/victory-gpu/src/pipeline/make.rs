@@ -345,35 +345,43 @@ impl Drop for Making {
     }
 }
 
-/// Waits, before a worker compiles, while the PC is short of memory and
-/// another worker is compiling: the driver's compiles take hundreds of MB
-/// each, and eight at once with the PC's memory nearly full (29-30 of 33
-/// GB) failed with E_OUTOFMEMORY and then crashed inside the driver's
-/// CreatePipelineState (runs of 2026-11-25 01:49 and 02:13). One worker
-/// always goes on, so pipelines are still made, one at a time.
-/// `VICTORY_PIPELINE_MIN_FREE_MB` (3072): the free physical memory, and
-/// the free commit, below which only one compiles.
+/// Waits, before a worker compiles, until the PC has memory for one more
+/// compile: the driver compiles in our process and a compile takes up to
+/// gigabytes, and eight at once took the game past the PC's 33 GB during
+/// a cold start (34.1 GB, then a crash, 2026-11-25 02:35), or failed with
+/// E_OUTOFMEMORY and crashed inside CreatePipelineState (01:49, 02:13).
+/// As many compile at once as fit in the free memory (physical, and
+/// commit left) above `VICTORY_PIPELINE_MIN_FREE_MB` (4096) at
+/// `VICTORY_PIPELINE_COMPILE_MB` (1536) each; one always goes on, so
+/// pipelines are still made, one at a time.
 fn room_to_make() -> Making {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    static MIN_FREE: OnceLock<u64> = OnceLock::new();
-    let min_free = *MIN_FREE.get_or_init(|| {
-        std::env::var("VICTORY_PIPELINE_MIN_FREE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(3072)
-            << 20
+    static SETTINGS: OnceLock<(u64, u64)> = OnceLock::new();
+    let (min_free, each) = *SETTINGS.get_or_init(|| {
+        let mb = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+                .max(1)
+                << 20
+        };
+        (mb("VICTORY_PIPELINE_MIN_FREE_MB", 4096), mb("VICTORY_PIPELINE_COMPILE_MB", 1536))
     });
-    let short = || {
+    let allowed = || {
         // SAFETY: a zeroed structure with its size set.
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
         // SAFETY: as above.
-        (unsafe { GlobalMemoryStatusEx(&mut m) }) != 0 && (m.ullAvailPhys < min_free || m.ullAvailPageFile < min_free)
+        if (unsafe { GlobalMemoryStatusEx(&mut m) }) == 0 {
+            return u64::MAX;
+        }
+        compiles_that_fit(m.ullAvailPhys.min(m.ullAvailPageFile), min_free, each)
     };
     let mut waited = false;
     loop {
         let making = MAKING_NOW.load(Ordering::Relaxed);
-        if making == 0 || !short() {
+        if making == 0 || making < allowed() {
             if MAKING_NOW.compare_exchange(making, making + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                 if waited {
                     THROTTLED.fetch_add(1, Ordering::Relaxed);
@@ -385,6 +393,13 @@ fn room_to_make() -> Making {
         waited = true;
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// How many compiles may run at once with `free` bytes free: one, and one
+/// more per `each` above `min_free`. (The ones running already hold what
+/// they took, so the free memory counts what is left for more.)
+fn compiles_that_fit(free: u64, min_free: u64, each: u64) -> u64 {
+    1 + free.saturating_sub(min_free) / each
 }
 
 /// On a pipeline worker, after the driver refused a compile for lack of
@@ -429,6 +444,18 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One compile always; one more per 1.5 GB above the 4 GB kept free.
+    #[test]
+    fn compiles_follow_the_free_memory() {
+        const GB: u64 = 1 << 30;
+        let fit = |free: u64| compiles_that_fit(free, 4 * GB, 3 * GB / 2);
+        assert_eq!(fit(0), 1);
+        assert_eq!(fit(4 * GB), 1);
+        assert_eq!(fit(5 * GB), 1);
+        assert_eq!(fit(11 * GB / 2), 2);
+        assert_eq!(fit(10 * GB), 5);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

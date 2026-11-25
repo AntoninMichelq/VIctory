@@ -310,6 +310,30 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// Whether pipelines with the shader `hash` are not compiled at all
+/// (`VICTORY_NO_COMPILE`: shader hashes, comma-separated; empty compiles
+/// every one). By default the screen probes' ray activation,
+/// 39f0e9aeb156a61c (indirect_diffuse_lighting:CS_ScreenProbes_ActivateRays):
+/// 22,000 blocks with joins of 1,900 predecessors inside loops spanning
+/// the whole function. The AMD driver's compile of it ran for minutes and
+/// took the game from 22 to 34 GB in 80 s, then the game ran out of memory
+/// (2026-11-25 02:35); with less free memory it was refused after the same
+/// climb (purple lighting either way, as the probes are missing).
+fn not_compiled(hash: &str) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES
+        .get_or_init(|| {
+            std::env::var("VICTORY_NO_COMPILE")
+                .unwrap_or_else(|_| "39f0e9aeb156a61c".into())
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .iter()
+        .any(|h| h == hash)
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -342,6 +366,9 @@ impl HostPipeline {
                 "only vertex, mesh, pixel and compute stages are translated",
                 shaders,
             );
+        }
+        if shaders.iter().any(|s| not_compiled(&s.hash)) {
+            return refuse("its shader is on VICTORY_NO_COMPILE (the driver's compile of it fills the PC's memory)", shaders);
         }
         let mesh = find("mesh");
         let stages = if let Some(cs) = compute {
