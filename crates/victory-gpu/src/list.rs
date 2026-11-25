@@ -939,11 +939,14 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 /// Whether a copy of one host texture onto itself is left out
-/// ([`copy_resource`]); `VICTORY_SELF_COPY=1` records it as before.
+/// ([`copy_resource`]): only with `VICTORY_SELF_COPY=0`. Off by default: on
+/// the RX 7600 leaving them out brought chrome streaks onto a shirt and
+/// took a window's wire-mesh grid away (runs R3/R3b, 2026-11-25), so what
+/// the recorded copy's state changes do matters there.
 #[cfg(windows)]
 fn skip_self_copies() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SELF_COPY").is_none_or(|v| v != "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELF_COPY").is_some_and(|v| v == "0"))
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
@@ -978,8 +981,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // itself, which the host does not allow (its debug layer: a
             // destination left in the source state) and which changes
             // nothing. Left out (after fxceless/victory-fork a253706), once the
-            // destination is noted as written; `VICTORY_SELF_COPY=1` records
-            // it as before.
+            // destination is noted as written; only with `VICTORY_SELF_COPY=0`
+            // ([`skip_self_copies`]).
             if skip_self_copies() && windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
