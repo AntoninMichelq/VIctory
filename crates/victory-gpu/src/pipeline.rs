@@ -1148,6 +1148,30 @@ pub(crate) fn create_from_words(
                 note_once("an info section without a readable input layout: none");
                 Vec::new()
             });
+        // Diagnostics: with `VICTORY_PRECOMPILED_DUMP=<dir>`, the registers
+        // and info sections of every graphics description made, by its
+        // shaders (`gfx-<vertex>-<pixel>-<n>-registers.bin`, a new `n` for
+        // each different registers section), to check the state decoded.
+        if let Some(dir) = std::env::var_os("VICTORY_PRECOMPILED_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+            for n in 0..16 {
+                let stem = format!("gfx-{}-{}-{n}", vs.hash, ps.hash);
+                let path = dir.join(format!("{stem}-registers.bin"));
+                match std::fs::read(&path) {
+                    Ok(same) if same == bytes => break,
+                    Ok(_) => continue,
+                    Err(_) => {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(&path, &bytes);
+                        if let Some(info) = section(crate::precompiled::Role::Info) {
+                            let _ = std::fs::write(dir.join(format!("{stem}-info.bin")), info);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         let (registers, notes) = crate::precompiled::GraphicsRegisters::decode(&dwords);
         for note in notes {
             note_once(note);
@@ -1521,7 +1545,12 @@ mod pack_diag {
                 layout.iter().any(|l| l.name == e.name && l.index == e.index)
             };
             let summary: Vec<String> = layout.iter().map(|e| format!("{}{} {} @{}", e.name, e.index, e.format, e.offset)).collect();
-            println!("1c8-{n:02} layout {summary:?}");
+            let ps_hash = file("Code(0)")
+                .ok()
+                .and_then(|c| index.find(&c))
+                .and_then(|at| records.iter().find(|r| r.offset == at)?.unpack())
+                .map(|c| blake3::hash(&c).to_hex()[..16].to_owned());
+            println!("1c8-{n:02} shaders {} {ps_hash:?} layout {summary:?}", vs.hash);
             assert!(reads.iter().all(named), "{n}: the vertex shader reads {reads:?}");
             // The host pipeline of the whole description, drawn into one
             // RGBA8 target as triangles and as rectangles.
@@ -1620,7 +1649,7 @@ mod rect_diag {
                 by_hash.insert(hash, c);
             }
         }
-        let targets = crate::precompiled::Targets::new(&[28], 0, 1).drawing(17);
+        let targets = crate::precompiled::Targets::new(&[28], 0, 1);
         let registers = crate::precompiled::GraphicsRegisters::console_defaults();
         for (v, p) in &wanted {
             let (Some(vc), Some(pc)) = (by_hash.get(v), by_hash.get(p)) else {
@@ -1635,16 +1664,19 @@ mod rect_diag {
                 .translated()
                 .map(|t| vertex_inputs(&t.host.dxil))
                 .unwrap_or_default();
-            let g = super::host::GraphicsState::precompiled(&registers, &inputs, &targets);
-            let Some(made) = super::host::HostPipeline::new(&[vs.clone(), ps.clone()], Some(&g)) else {
-                panic!(
-                    "{v}/{p}: no pipeline; translated {} {}",
-                    vs.translated().is_some(),
-                    ps.translated().is_some()
-                );
-            };
-            println!("{v}/{p}: made, rectangle geometry stage {}", made.rects);
-            assert!(made.rects, "{v}/{p}: made without its rectangle geometry stage");
+            for topology in [4, 17] {
+                let targets = targets.drawing(topology);
+                let g = super::host::GraphicsState::precompiled(&registers, &inputs, &targets);
+                let Some(made) = super::host::HostPipeline::new(&[vs.clone(), ps.clone()], Some(&g)) else {
+                    panic!(
+                        "{v}/{p} topology {topology}: no pipeline; translated {} {}",
+                        vs.translated().is_some(),
+                        ps.translated().is_some()
+                    );
+                };
+                println!("{v}/{p} topology {topology}: made, rectangle geometry stage {}", made.rects);
+                assert!(topology != 17 || made.rects, "{v}/{p}: made without its rectangle geometry stage");
+            }
         }
     }
 }

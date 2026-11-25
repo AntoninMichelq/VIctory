@@ -1263,6 +1263,55 @@ mod tests {
         assert_eq!(notes, ["blend factor constant alpha: the blend factor"; 2]);
     }
 
+    /// Registers of descriptions dumped in run 39, against the state the
+    /// title's own pipelines of the same shaders had in run 45 (made by
+    /// another method, with D3D12's state, as its frame listings show).
+    #[test]
+    fn decodes_what_the_titles_own_pipelines_have() {
+        let off = StencilFace::KEEP;
+        // Description 15 (vertex 0602c2384acbb3b2, pixel a78d088fa55aa495):
+        // "depth false; cull 1; blend true src 2 dst 6 op 1 mask 0xf".
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[(at::BLEND_CONTROL, 0xe501_0501)]));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!r.depth.depth_enable && !r.depth.stencil_enable);
+        assert_eq!(
+            (r.depth.front, r.raster.cull, r.write_masks[0]),
+            (off, 1, 0xf)
+        );
+        assert_eq!(
+            (
+                r.blend[0].enable,
+                r.blend[0].src,
+                r.blend[0].dest,
+                r.blend[0].op
+            ),
+            (true, 2, 6, 1)
+        );
+        // Descriptions 20 and 24 (vertex f7f331c8c5b3a0d8, 80cb958cde505e15):
+        // "blend true src 5 dst 6 op 1".
+        let (r, _) = GraphicsRegisters::decode(&registers(&[(at::BLEND_CONTROL, 0xe504_0504)]));
+        assert_eq!(
+            (
+                r.blend[0].enable,
+                r.blend[0].src,
+                r.blend[0].dest,
+                r.blend[0].op
+            ),
+            (true, 5, 6, 1)
+        );
+        // Description 3 (vertex 58d926085fca4999): no depth, no culling,
+        // source alpha over; and its culling twin (0x00201a42): "cull 3
+        // front-ccw true; blend false src 2 dst 1".
+        let (r, _) = GraphicsRegisters::decode(&registers(&[(at::BLEND_CONTROL, 0xe504_0504)]));
+        assert_eq!(
+            (r.depth.depth_enable, r.raster.cull, r.raster.front_ccw),
+            (false, 1, true)
+        );
+        let (r, _) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 0x0020_1a42)]));
+        assert_eq!((r.raster.cull, r.raster.front_ccw), (3, true));
+        assert_eq!(r.blend[0], TargetBlend::OFF);
+    }
+
     #[test]
     fn decodes_the_rasterizer() {
         let (r, _) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 0x0020_1a42)]));

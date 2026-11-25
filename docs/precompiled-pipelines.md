@@ -124,7 +124,10 @@ before.
 ## Graphics registers (first look, 64 descriptions)
 
 `VICTORY_PRECOMPILED_DUMP=<dir>` (diagnostics) saves every section of the
-first 64 descriptions of each method. The graphics registers section is 97
+first 64 descriptions of each method, and the registers and info sections
+of every graphics description made, by its shaders
+(`gfx-<vertex>-<pixel>-<n>-registers.bin` and `-info.bin`, `n` counting
+the different registers sections of one pair). The graphics registers section is 97
 dwords (0x184). Most never change across the 64; the ones that do, read
 against GFX10's public register layouts:
 
@@ -184,6 +187,20 @@ console they come with the targets bound at draw time; a host pipeline
 needs them at creation (`D3D12_RT_FORMAT_ARRAY`, the depth format). So a
 graphics pipeline of this method is made at its draws, keyed by the
 formats bound then (above).
+
+Checked against the title's own pipelines: in run 45 (no 0x1c8 pipeline
+made) the title drew the same shaders with pipelines it made another way,
+with D3D12's state, which its frame listings show. Every dumped
+description whose shaders run 45 drew decodes to the state run 45 shows
+for them (for example description 15, `e5010501`: one / one minus source
+alpha; 20 and 24, `e5040504`: source alpha over; 3: no depth, no culling).
+Two pairs of shaders differed in runs 47/48 and are not among the dumps:
+`e38865315b050ed9`/`62306a1922b106e8` (write mask 0 in run 45, 0xf here)
+and `1ce8ba2fe12072c1`/`4dd4a3d69c1bd8ca` (blending in run 45, none here);
+their registers are to be dumped. The black loading and menu screens of
+runs 47/48 were not the state: the loading pictures and the full-screen
+rectangle pass that composes them were refused for want of an input layout
+(above) and dropped.
 
 ## Open
 
