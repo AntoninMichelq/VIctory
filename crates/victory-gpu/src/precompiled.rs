@@ -47,8 +47,12 @@
 //! title never hands those containers to the known creation methods. So a
 //! description's program is matched to its container by its first bytes,
 //! among the containers of the pack ([`PackIndex`]), and the container is
-//! translated as any other. What the registers, info and map sections hold
-//! beyond that is not read: the container has it in its own form.
+//! translated as any other. Of a graphics description's registers section
+//! the depth, stencil, blend, write mask and rasterizer registers are read
+//! ([`GraphicsRegisters`]); its host pipelines are made per set of targets
+//! drawn into ([`Targets`], [`Variants`]), which the description does not
+//! name. What else the registers, and the info and map sections, hold is
+//! not read: the container has most of it in its own form.
 
 use std::collections::HashMap;
 
@@ -255,6 +259,459 @@ impl PackIndex {
     }
 }
 
+/// Where the graphics registers section keeps what is read of it (dword
+/// positions; docs/precompiled-pipelines.md has the table), read against
+/// GFX10's public register layouts and the 64 descriptions logged.
+mod at {
+    /// `PA_CL_CLIP_CNTL` (`0x00080000` in all 64: DX clip space, near and
+    /// far clipping on).
+    pub const CLIP_CNTL: usize = 39;
+    /// `PA_SU_SC_MODE_CNTL` (`0x00201a40`; `0x00201a42` culls back faces).
+    pub const SC_MODE_CNTL: usize = 40;
+    pub const DEPTH_CONTROL: usize = 46;
+    /// `DB_STENCIL_CONTROL` (`0`, `0x1001`, `0x80080`).
+    pub const STENCIL_CONTROL: usize = 47;
+    pub const STENCIL_REF_MASK: usize = 48;
+    pub const STENCIL_REF_MASK_BF: usize = 49;
+    /// `CB_TARGET_MASK`: four bits (RGBA) a target.
+    pub const TARGET_MASK: usize = 51;
+    /// `CB_BLEND0_CONTROL`, seven more after it.
+    pub const BLEND_CONTROL: usize = 52;
+    /// Dwords a registers section has at least for the above to be read.
+    pub const NEEDED: usize = BLEND_CONTROL + 8;
+}
+
+/// One target's blending, in D3D12's numbers (`D3D12_BLEND`,
+/// `D3D12_BLEND_OP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetBlend {
+    pub enable: bool,
+    pub src: u32,
+    pub dest: u32,
+    pub op: u32,
+    pub src_alpha: u32,
+    pub dest_alpha: u32,
+    pub op_alpha: u32,
+}
+
+impl TargetBlend {
+    /// Blending off: one, zero, add.
+    pub const OFF: Self = Self {
+        enable: false,
+        src: 2,
+        dest: 1,
+        op: 1,
+        src_alpha: 2,
+        dest_alpha: 1,
+        op_alpha: 1,
+    };
+}
+
+/// One face's stencil test, in D3D12's numbers (`D3D12_STENCIL_OP`,
+/// `D3D12_COMPARISON_FUNC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilFace {
+    pub fail: u32,
+    pub depth_fail: u32,
+    pub pass: u32,
+    pub func: u32,
+}
+
+impl StencilFace {
+    /// Keep, keep, keep, always.
+    pub const KEEP: Self = Self {
+        fail: 1,
+        depth_fail: 1,
+        pass: 1,
+        func: 8,
+    };
+}
+
+/// Depth and stencil state, in D3D12's numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthStencil {
+    pub depth_enable: bool,
+    pub depth_write: bool,
+    /// `D3D12_COMPARISON_FUNC`.
+    pub depth_func: u32,
+    pub depth_bounds: bool,
+    pub stencil_enable: bool,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+/// Rasterizer state, in D3D12's numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Raster {
+    /// `D3D12_CULL_MODE`: 1 none, 2 front, 3 back.
+    pub cull: u32,
+    pub front_ccw: bool,
+    pub wireframe: bool,
+    pub depth_clip: bool,
+}
+
+/// The pipeline state a graphics description's registers section holds,
+/// as far as it is read ([`GraphicsRegisters::decode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphicsRegisters {
+    pub blend: [TargetBlend; 8],
+    /// `D3D12_COLOR_WRITE_ENABLE` bits per target.
+    pub write_masks: [u8; 8],
+    pub depth: DepthStencil,
+    pub raster: Raster,
+}
+
+impl GraphicsRegisters {
+    /// The console's reset state, for a section that does not read: no
+    /// blending, every channel written, no depth or stencil test, no
+    /// culling, solid, clipped at near and far.
+    pub fn console_defaults() -> Self {
+        Self {
+            blend: [TargetBlend::OFF; 8],
+            write_masks: [0xf; 8],
+            depth: DepthStencil {
+                depth_enable: false,
+                depth_write: false,
+                depth_func: 8,
+                depth_bounds: false,
+                stencil_enable: false,
+                read_mask: 0xff,
+                write_mask: 0xff,
+                front: StencilFace::KEEP,
+                back: StencilFace::KEEP,
+            },
+            raster: Raster {
+                cull: 1,
+                front_ccw: true,
+                wireframe: false,
+                depth_clip: true,
+            },
+        }
+    }
+
+    /// The state the registers section `dwords` holds, and what of it the
+    /// host cannot have exactly (each a fixed text, for a log line once).
+    /// A section too short to hold the registers read gets
+    /// [`GraphicsRegisters::console_defaults`].
+    /// shortcut: the polygon offset enables (set in every description
+    /// seen) are not read: their offsets are not in the section and the
+    /// pipeline gets no depth bias; alpha to coverage, the sample mask and
+    /// the other dwords keep D3D12's defaults.
+    pub fn decode(dwords: &[u32]) -> (Self, Vec<&'static str>) {
+        let mut notes = Vec::new();
+        let mut r = Self::console_defaults();
+        if dwords.len() < at::NEEDED {
+            notes.push("a graphics registers section too short to read: console defaults");
+            return (r, notes);
+        }
+        let bits = |v: u32, at: u32, n: u32| v >> at & ((1 << n) - 1);
+
+        // DB_DEPTH_CONTROL: 0 stencil, 1 depth, 2 depth write, 3 bounds,
+        // 4-6 depth func, 7 back face stencil, 8-10 stencil func, 20-22
+        // back face stencil func.
+        let dc = dwords[at::DEPTH_CONTROL];
+        // DB_STENCIL_CONTROL: fail, depth pass, depth fail, then the same
+        // for back faces, four bits each.
+        let sc = dwords[at::STENCIL_CONTROL];
+        // DB_STENCILREFMASK: test value, mask, write mask, op value.
+        let refmask = dwords[at::STENCIL_REF_MASK];
+        let refmask_bf = dwords[at::STENCIL_REF_MASK_BF];
+        let face =
+            |ops: u32, func: u32, op_value: u32, notes: &mut Vec<&'static str>| StencilFace {
+                fail: stencil_op(bits(ops, 0, 4), op_value, notes),
+                pass: stencil_op(bits(ops, 4, 4), op_value, notes),
+                depth_fail: stencil_op(bits(ops, 8, 4), op_value, notes),
+                func: func + 1,
+            };
+        let stencil_enable = bits(dc, 0, 1) != 0;
+        let two_sided = bits(dc, 7, 1) != 0;
+        let (front, back) = if stencil_enable {
+            let front = face(sc, bits(dc, 8, 3), bits(refmask, 24, 8), &mut notes);
+            let back = if two_sided {
+                face(
+                    sc >> 12,
+                    bits(dc, 20, 3),
+                    bits(refmask_bf, 24, 8),
+                    &mut notes,
+                )
+            } else {
+                front
+            };
+            if two_sided && bits(refmask, 8, 16) != bits(refmask_bf, 8, 16) {
+                notes.push("back face stencil masks differ from the front's: the front's are used");
+            }
+            (front, back)
+        } else {
+            (StencilFace::KEEP, StencilFace::KEEP)
+        };
+        r.depth = DepthStencil {
+            depth_enable: bits(dc, 1, 1) != 0,
+            depth_write: bits(dc, 2, 1) != 0,
+            depth_func: bits(dc, 4, 3) + 1,
+            depth_bounds: bits(dc, 3, 1) != 0,
+            stencil_enable,
+            read_mask: bits(refmask, 8, 8) as u8,
+            write_mask: bits(refmask, 16, 8) as u8,
+            front,
+            back,
+        };
+
+        // CB_TARGET_MASK, CB_BLENDn_CONTROL: 0-4 colour source, 5-7
+        // colour function, 8-12 colour destination, 16-20, 21-23, 24-28
+        // the same for alpha, 29 separate alpha, 30 enable.
+        let mask = dwords[at::TARGET_MASK];
+        for i in 0..8 {
+            r.write_masks[i] = bits(mask, 4 * i as u32, 4) as u8;
+            let b = dwords[at::BLEND_CONTROL + i];
+            if bits(b, 30, 1) == 0 {
+                continue;
+            }
+            let (src, op, dest) = (bits(b, 0, 5), bits(b, 5, 3), bits(b, 8, 5));
+            let (src_a, op_a, dest_a) = if bits(b, 29, 1) != 0 {
+                (bits(b, 16, 5), bits(b, 21, 3), bits(b, 24, 5))
+            } else {
+                (src, op, dest)
+            };
+            r.blend[i] = TargetBlend {
+                enable: true,
+                src: blend_factor(src, false, &mut notes),
+                dest: blend_factor(dest, false, &mut notes),
+                op: blend_op(op, &mut notes),
+                src_alpha: blend_factor(src_a, true, &mut notes),
+                dest_alpha: blend_factor(dest_a, true, &mut notes),
+                op_alpha: blend_op(op_a, &mut notes),
+            };
+        }
+
+        // PA_SU_SC_MODE_CNTL: 0 cull front, 1 cull back, 2 front face
+        // (0 counter-clockwise: Vulkan's numbering, which RADV writes as
+        // is), 3-4 polygon mode, 5-7 front and 8-10 back polygon type
+        // (0 points, 1 lines, 2 triangles).
+        let sc_mode = dwords[at::SC_MODE_CNTL];
+        r.raster.cull = match bits(sc_mode, 0, 2) {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            _ => {
+                notes.push("both faces culled, which D3D12 cannot: drawn unculled");
+                1
+            }
+        };
+        r.raster.front_ccw = bits(sc_mode, 2, 1) == 0;
+        if bits(sc_mode, 3, 2) != 0 {
+            match bits(sc_mode, 5, 3) {
+                2 => {}
+                1 => r.raster.wireframe = true,
+                _ => notes.push("polygons drawn as points: drawn solid"),
+            }
+            if bits(sc_mode, 5, 3) != bits(sc_mode, 8, 3) {
+                notes.push("front and back polygon modes differ: the front's is used");
+            }
+        }
+        // PA_CL_CLIP_CNTL: 26 near, 27 far clipping off.
+        let clip = dwords[at::CLIP_CNTL];
+        let (near_off, far_off) = (bits(clip, 26, 1) != 0, bits(clip, 27, 1) != 0);
+        r.raster.depth_clip = !(near_off || far_off);
+        if near_off != far_off {
+            notes.push("near or far clipping off but not both: neither is clipped");
+        }
+        (r, notes)
+    }
+}
+
+/// D3D12's `D3D12_BLEND` for GFX10's blend factor `f`; for the alpha
+/// channel (`alpha`) colour factors become their alpha ones, which is what
+/// they are there and all D3D12 takes.
+fn blend_factor(f: u32, alpha: bool, notes: &mut Vec<&'static str>) -> u32 {
+    let (colour, alpha_one) = match f {
+        0 => (1, 1),
+        1 => (2, 2),
+        2 => (3, 5),
+        3 => (4, 6),
+        4 => (5, 5),
+        5 => (6, 6),
+        6 => (7, 7),
+        7 => (8, 8),
+        8 => (9, 7),
+        9 => (10, 8),
+        10 => (11, 11),
+        11 => {
+            notes.push("blend factor both-source-alpha: source alpha");
+            (5, 5)
+        }
+        12 => {
+            notes.push("blend factor both-inverse-source-alpha: inverse source alpha");
+            (6, 6)
+        }
+        13 => (14, 14),
+        14 => (15, 15),
+        15 => (16, 18),
+        16 => (17, 19),
+        17 => (18, 18),
+        18 => (19, 19),
+        19 => {
+            notes.push("blend factor constant alpha: the blend factor");
+            (14, 14)
+        }
+        20 => {
+            notes.push("blend factor inverse constant alpha: the inverse blend factor");
+            (15, 15)
+        }
+        _ => {
+            notes.push("an unknown blend factor: one");
+            (2, 2)
+        }
+    };
+    if alpha { alpha_one } else { colour }
+}
+
+/// D3D12's `D3D12_BLEND_OP` for GFX10's combine function.
+fn blend_op(f: u32, notes: &mut Vec<&'static str>) -> u32 {
+    match f {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 5,
+        4 => 3,
+        _ => {
+            notes.push("an unknown blend function: add");
+            1
+        }
+    }
+}
+
+/// D3D12's `D3D12_STENCIL_OP` for GFX10's stencil op; `op_value` is what
+/// the adding ops add on the console (D3D12's add one), and the
+/// replacing ones take the reference set at draw time on the host.
+fn stencil_op(op: u32, op_value: u32, notes: &mut Vec<&'static str>) -> u32 {
+    let adds = |d3d12: u32, notes: &mut Vec<&'static str>| {
+        if op_value != 1 {
+            notes.push("a stencil op adding other than one: adds one");
+        }
+        d3d12
+    };
+    match op {
+        0 => 1,
+        1 => 2,
+        2 => {
+            notes.push("stencil op ones: replace");
+            3
+        }
+        3 => 3,
+        4 => {
+            notes.push("stencil op replace by the op value: replace by the reference");
+            3
+        }
+        5 => adds(4, notes),
+        6 => adds(5, notes),
+        7 => 6,
+        8 => adds(7, notes),
+        9 => adds(8, notes),
+        _ => {
+            notes.push("a logic stencil op: keep");
+            1
+        }
+    }
+}
+
+/// What a graphics pipeline of method 0x1c8 is made for besides its
+/// description: what the draw that uses it has bound (render target and
+/// depth formats as the host has them, their number, samples) and the
+/// kind of primitive it draws. Each such set gets a host pipeline of its
+/// own ([`Variants`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Targets {
+    /// DXGI formats; past `count` zero.
+    pub formats: [u32; 8],
+    pub count: u8,
+    pub depth: u32,
+    pub samples: u32,
+    /// `D3D12_PRIMITIVE_TOPOLOGY_TYPE`, or the console's rectangles
+    /// ([`RECTANGLES_TYPE`]).
+    pub topology: u32,
+}
+
+/// The console's rectangle list, in its topology numbering.
+const CONSOLE_RECTANGLES: u32 = 17;
+/// The console's rectangles as a pipeline's topology type (what its
+/// stream pipelines name them).
+pub const RECTANGLES_TYPE: u32 = 19;
+
+impl Targets {
+    /// The targets bound: their formats (at most 8 are kept), the depth
+    /// format (0 for none) and the sample count (0 is taken as 1).
+    pub fn new(formats: &[u32], depth: u32, samples: u32) -> Self {
+        let count = formats.len().min(8);
+        let mut f = [0; 8];
+        f[..count].copy_from_slice(&formats[..count]);
+        Self {
+            formats: f,
+            count: count as u8,
+            depth,
+            samples: samples.max(1),
+            topology: 0,
+        }
+    }
+
+    /// The same, drawn with the console's primitive topology `topology`.
+    pub fn drawing(self, topology: u32) -> Self {
+        Self {
+            topology: topology_type(topology),
+            ..self
+        }
+    }
+}
+
+/// The topology type a pipeline needs for the console's primitive
+/// topology `t` (the console's fans, loops and quads draw as triangle
+/// lists on the host; its rectangles get their own type).
+pub fn topology_type(t: u32) -> u32 {
+    match t {
+        1 => 1,
+        2 | 3 | 10 | 11 => 2,
+        CONSOLE_RECTANGLES => RECTANGLES_TYPE,
+        33..=64 => 4,
+        _ => 3,
+    }
+}
+
+/// The variants of one pipeline by what they are drawn with, each made
+/// once and kept while the pipeline lives.
+#[derive(Debug)]
+pub struct Variants<V> {
+    by_targets: std::sync::Mutex<HashMap<Targets, std::sync::Arc<V>>>,
+}
+
+impl<V> Default for Variants<V> {
+    fn default() -> Self {
+        Self {
+            by_targets: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<V> Variants<V> {
+    /// The variant for `targets`, made by `make` if there is none yet;
+    /// and whether it was made now.
+    pub fn get(&self, targets: &Targets, make: impl FnOnce() -> V) -> (std::sync::Arc<V>, bool) {
+        let mut map = self.by_targets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = map.get(targets) {
+            return (v.clone(), false);
+        }
+        let v = std::sync::Arc::new(make());
+        map.insert(*targets, v.clone());
+        (v, true)
+    }
+
+    /// Every variant made so far.
+    pub fn all(&self) -> Vec<std::sync::Arc<V>> {
+        let map = self.by_targets.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +890,246 @@ mod tests {
         more.merge(index);
         assert_eq!(more.find(&program(4, 100)), Some(0x2000));
         assert_eq!(more.find(&padded), Some(0x100));
+    }
+
+    /// A graphics registers section of 97 dwords as most descriptions
+    /// logged have it, with `set` (position, value) put in.
+    fn registers(set: &[(usize, u32)]) -> Vec<u32> {
+        let mut r = vec![0u32; 97];
+        r[at::CLIP_CNTL] = 0x0008_0000;
+        r[at::SC_MODE_CNTL] = 0x0020_1a40;
+        r[at::DEPTH_CONTROL] = 0x0070_07f0;
+        r[at::STENCIL_REF_MASK] = 0x0100_ff00;
+        r[at::STENCIL_REF_MASK_BF] = 0x0100_ff00;
+        r[at::TARGET_MASK] = 0xffff_ffff;
+        for b in &mut r[at::BLEND_CONTROL..at::BLEND_CONTROL + 8] {
+            *b = 0x8000_0000;
+        }
+        for &(at, v) in set {
+            r[at] = v;
+        }
+        r
+    }
+
+    #[test]
+    fn decodes_the_common_description() {
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[]));
+        assert!(notes.is_empty(), "{notes:?}");
+        // No depth or stencil test, no blending, all written, no culling.
+        let defaults = GraphicsRegisters::console_defaults();
+        assert_eq!(
+            (r.blend, r.write_masks, r.raster),
+            (defaults.blend, defaults.write_masks, defaults.raster)
+        );
+        assert!(!r.depth.depth_enable && !r.depth.stencil_enable && !r.depth.depth_bounds);
+        assert_eq!(
+            (r.depth.front, r.depth.back),
+            (StencilFace::KEEP, StencilFace::KEEP)
+        );
+    }
+
+    #[test]
+    fn decodes_depth_and_stencil() {
+        // Reverse depth test, no write (0x007007e2).
+        let (r, _) = GraphicsRegisters::decode(&registers(&[(at::DEPTH_CONTROL, 0x0070_07e2)]));
+        assert!(r.depth.depth_enable && !r.depth.depth_write && !r.depth.stencil_enable);
+        assert_eq!(r.depth.depth_func, 7, "greater or equal");
+        // Depth test and write always, stencil equal (0x007002f7).
+        let (r, _) = GraphicsRegisters::decode(&registers(&[
+            (at::DEPTH_CONTROL, 0x0070_02f7),
+            (at::STENCIL_REF_MASK, 0x0100_0700),
+        ]));
+        assert!(r.depth.depth_enable && r.depth.depth_write && r.depth.stencil_enable);
+        assert_eq!((r.depth.depth_func, r.depth.front.func), (8, 3));
+        assert_eq!((r.depth.read_mask, r.depth.write_mask), (0x07, 0));
+        // Back faces as their own: always.
+        assert_eq!(r.depth.back.func, 8);
+        // Stencil equal, add one wrapping on pass, both faces (description
+        // 56: 0x002002f1, 0x00080080, 0x01ffff00).
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[
+            (at::DEPTH_CONTROL, 0x0020_02f1),
+            (at::STENCIL_CONTROL, 0x0008_0080),
+            (at::STENCIL_REF_MASK, 0x01ff_ff00),
+            (at::STENCIL_REF_MASK_BF, 0x01ff_ff00),
+        ]));
+        assert!(notes.is_empty(), "{notes:?}");
+        let face = StencilFace {
+            fail: 1,
+            depth_fail: 1,
+            pass: 7,
+            func: 3,
+        };
+        assert_eq!((r.depth.front, r.depth.back), (face, face));
+        assert!(!r.depth.depth_enable);
+        // Zero on fail (description 8: 0x00200291, 0x00001001, 0x01202800).
+        let (r, _) = GraphicsRegisters::decode(&registers(&[
+            (at::DEPTH_CONTROL, 0x0020_0291),
+            (at::STENCIL_CONTROL, 0x0000_1001),
+            (at::STENCIL_REF_MASK, 0x0120_2800),
+            (at::STENCIL_REF_MASK_BF, 0x0120_2800),
+        ]));
+        assert_eq!(
+            r.depth.front,
+            StencilFace {
+                fail: 2,
+                depth_fail: 1,
+                pass: 1,
+                func: 3
+            }
+        );
+        assert_eq!((r.depth.read_mask, r.depth.write_mask), (0x28, 0x20));
+        // Depth bounds; a stencil op D3D12 lacks is noted.
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[
+            (at::DEPTH_CONTROL, 0x0000_000b),
+            (at::STENCIL_CONTROL, 0x0000_000a),
+        ]));
+        assert!(r.depth.depth_bounds);
+        assert_eq!(r.depth.front.fail, 1);
+        assert_eq!(notes, ["a logic stencil op: keep"]);
+    }
+
+    #[test]
+    fn decodes_blending_and_write_masks() {
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[
+            // Source alpha over, separate alpha the same.
+            (at::BLEND_CONTROL, 0xe504_0504),
+            // Additive: source alpha plus one; alpha zero plus one.
+            (at::BLEND_CONTROL + 1, 0xe100_0104),
+            // Destination colour times source colour, not separate: the
+            // alpha factors become alpha ones; reverse subtract.
+            (at::BLEND_CONTROL + 2, 0x4000_0882),
+            // Constant alpha (noted).
+            (at::BLEND_CONTROL + 3, 0x4000_0113),
+            // RGB to target 0, nothing to target 1, all to the rest.
+            (at::TARGET_MASK, 0xffff_ff07),
+        ]));
+        let over = TargetBlend {
+            enable: true,
+            src: 5,
+            dest: 6,
+            op: 1,
+            src_alpha: 5,
+            dest_alpha: 6,
+            op_alpha: 1,
+        };
+        assert_eq!(r.blend[0], over);
+        let add = TargetBlend {
+            enable: true,
+            src: 5,
+            dest: 2,
+            op: 1,
+            src_alpha: 1,
+            dest_alpha: 2,
+            op_alpha: 1,
+        };
+        assert_eq!(r.blend[1], add);
+        let mul = TargetBlend {
+            enable: true,
+            src: 3,
+            dest: 9,
+            op: 3,
+            src_alpha: 5,
+            dest_alpha: 7,
+            op_alpha: 3,
+        };
+        assert_eq!(r.blend[2], mul);
+        assert_eq!((r.blend[3].src, r.blend[3].dest), (14, 2));
+        assert_eq!(r.blend[4], TargetBlend::OFF);
+        assert_eq!(r.write_masks, [7, 0, 0xf, 0xf, 0xf, 0xf, 0xf, 0xf]);
+        assert_eq!(notes, ["blend factor constant alpha: the blend factor"; 2]);
+    }
+
+    #[test]
+    fn decodes_the_rasterizer() {
+        let (r, _) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 0x0020_1a42)]));
+        assert_eq!(
+            r.raster,
+            Raster {
+                cull: 3,
+                front_ccw: true,
+                wireframe: false,
+                depth_clip: true
+            }
+        );
+        // Front culled, clockwise front, lines, no depth clipping.
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[
+            (at::SC_MODE_CNTL, 0x0000_012d),
+            (at::CLIP_CNTL, 0x0c08_0000),
+        ]));
+        assert_eq!(
+            r.raster,
+            Raster {
+                cull: 2,
+                front_ccw: false,
+                wireframe: true,
+                depth_clip: false
+            }
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let (r, notes) = GraphicsRegisters::decode(&registers(&[(at::SC_MODE_CNTL, 3)]));
+        assert_eq!(r.raster.cull, 1);
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn a_short_section_gets_console_defaults() {
+        let (r, notes) = GraphicsRegisters::decode(&[0x0070_02f7; 50]);
+        assert_eq!(r, GraphicsRegisters::console_defaults());
+        assert_eq!(notes.len(), 1);
+        // The longer sections (99 dwords) read the same.
+        let mut long = registers(&[(at::DEPTH_CONTROL, 0x0070_07e2)]);
+        long.extend([0x401, 0x402]);
+        assert!(GraphicsRegisters::decode(&long).0.depth.depth_enable);
+    }
+
+    #[test]
+    fn targets_key_what_a_pipeline_is_made_for() {
+        let a = Targets::new(&[28, 10], 40, 1).drawing(4);
+        assert_eq!(
+            (a.count, a.formats, a.topology),
+            (2, [28, 10, 0, 0, 0, 0, 0, 0], 3)
+        );
+        // Strips and lists, fans and quads: the same pipeline.
+        assert_eq!(a, Targets::new(&[28, 10], 40, 0).drawing(5));
+        assert_eq!(a, Targets::new(&[28, 10], 40, 1).drawing(19));
+        // Anything else bound: another one.
+        for other in [
+            Targets::new(&[28], 40, 1).drawing(4),
+            Targets::new(&[28, 10, 0], 40, 1).drawing(4),
+            Targets::new(&[10, 28], 40, 1).drawing(4),
+            Targets::new(&[28, 10], 0, 1).drawing(4),
+            Targets::new(&[28, 10], 40, 4).drawing(4),
+            Targets::new(&[28, 10], 40, 1).drawing(2),
+            Targets::new(&[28, 10], 40, 1).drawing(17),
+        ] {
+            assert_ne!(a, other);
+        }
+        assert_eq!(Targets::new(&[1; 9], 0, 1).count, 8);
+        assert_eq!(
+            Targets::new(&[], 0, 1).drawing(17).topology,
+            RECTANGLES_TYPE
+        );
+        assert_eq!(topology_type(1), 1);
+        assert_eq!(topology_type(36), 4);
+    }
+
+    #[test]
+    fn variants_are_made_once_per_targets() {
+        let v: Variants<u32> = Variants::default();
+        let a = Targets::new(&[28], 0, 1).drawing(4);
+        let b = Targets::new(&[10], 0, 1).drawing(4);
+        let mut made = 0;
+        let mut make = || {
+            made += 1;
+            made
+        };
+        let (first, new) = v.get(&a, &mut make);
+        assert!(new);
+        let (again, new) = v.get(&a, &mut make);
+        assert!(!new && std::sync::Arc::ptr_eq(&first, &again));
+        let (other, new) = v.get(&b, &mut make);
+        assert!(new);
+        assert_eq!((*first, *other), (1, 2));
+        assert_eq!(v.all().len(), 2);
     }
 }

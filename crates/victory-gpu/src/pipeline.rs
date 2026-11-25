@@ -422,6 +422,19 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A graphics pipeline of method 0x1c8 ([`create_from_words`]): its
+    /// host pipelines are made per set of targets drawn into, not `host`.
+    #[cfg(windows)]
+    precompiled: Option<Box<Precompiled>>,
+}
+
+/// A graphics pipeline described by its precompiled parts: the state its
+/// registers section holds, and a host pipeline per set of targets and
+/// topology type it is drawn with (the description names neither).
+#[cfg(windows)]
+struct Precompiled {
+    registers: crate::precompiled::GraphicsRegisters,
+    variants: crate::precompiled::Variants<make::Pending>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -449,15 +462,33 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
+/// The host pipeline of a title pipeline drawn into `targets` (which only
+/// precompiled graphics pipelines are made for, see [`Precompiled`]);
+/// `None` if one of its shaders does not translate, the host refuses it,
+/// or it is still being made (its first use starts that, see [`make`]).
 #[cfg(windows)]
-pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+pub(crate) fn host_pipeline<'a>(
+    this: This,
+    targets: &crate::precompiled::Targets,
+) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    let Some(pre) = &p.precompiled else {
+        return make::ready(&p.host);
+    };
+    let (variant, new) = pre.variants.get(targets, || {
+        let state = host::GraphicsState::precompiled(&pre.registers, targets);
+        make::Pending::new(p.shaders.clone(), Some(Box::new(state)))
+    });
+    if new {
+        tracing::info!(pipeline = ?this, shaders = %make::names(&variant), ?targets, "precompiled graphics pipeline: a host pipeline for these targets");
+    }
+    let made = make::ready(&variant)?;
+    // SAFETY: `pre.variants` keeps the variant while the pipeline lives,
+    // as `p.host` is kept for the others.
+    Some(unsafe { &*std::ptr::from_ref(made) })
 }
 
 /// The host pipeline of a title pipeline with its vertex shader translated
@@ -469,8 +500,12 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 pub(crate) fn flat_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     type Made = HashMap<usize, (Arc<make::Pending>, Option<&'static host::HostPipeline>)>;
     static MADE: Mutex<Option<Made>> = Mutex::new(None);
-    let base = host_pipeline(this)?;
     let p = pipeline(this);
+    // A precompiled pipeline's state is per set of targets: none drawn flat.
+    if p.precompiled.is_some() {
+        return None;
+    }
+    let base = host_pipeline(this, &crate::precompiled::Targets::default())?;
     let key = Arc::as_ptr(&p.host) as usize;
     if let Some((_, made)) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
         return *made;
@@ -591,7 +626,10 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| match &p.precompiled {
+                Some(pre) => pre.variants.all().iter().find_map(|v| make::missing(v)),
+                None => make::missing(&p.host),
+            })
     };
     if let Some(why) = why {
         note_why(why);
@@ -724,12 +762,19 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] precompiled: Option<Box<Precompiled>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    // A precompiled pipeline's host pipelines are its variants'; this one
+    // stays empty (nothing to start early).
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = Arc::new(if precompiled.is_some() {
+        make::Pending::new(Vec::new(), None)
+    } else {
+        make::Pending::new(shaders.clone(), graphics)
+    });
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -748,6 +793,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        precompiled,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -771,6 +818,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        None,
         iid,
         out,
     )
@@ -789,6 +838,8 @@ pub(crate) extern "system" fn create_compute(
     };
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
+        #[cfg(windows)]
+        None,
         #[cfg(windows)]
         None,
         iid,
@@ -985,11 +1036,14 @@ mod pack {
 /// GFX10 code whose container we know ([`by_code`]; `read` reads title
 /// memory through the kernel, neither pointer is known to be mapped). A single compute shader is made into a compute
 /// pipeline as [`create_compute`] makes one, which reads nothing of its
-/// description but the shader either; anything else is left (`None`), and
-/// the stages found are returned for the log.
-/// shortcut: what else the description holds (registers, info and maps,
-/// which the container has in its own form) is ignored; graphics
-/// descriptions are not made, their pipeline state not being decoded.
+/// description but the shader either; a vertex and a pixel shader of a
+/// graphics description (with `VICTORY_SHADER_PACK` set) into a pipeline
+/// whose host pipelines are made at its draws, its state read from the
+/// registers section ([`Precompiled`]); anything else is left (`None`),
+/// and the stages found are returned for the log.
+/// shortcut: the info and map sections (which the container has in its
+/// own form) are ignored, and what of the registers section
+/// [`crate::precompiled::GraphicsRegisters`] does not read.
 #[cfg(windows)]
 pub(crate) fn create_from_words(
     slot: usize,
@@ -1061,9 +1115,52 @@ pub(crate) fn create_from_words(
     if let [cs] = found.as_slice()
         && cs.stage == "compute"
     {
-        return (Some(hand_out(found.clone(), None, iid, out)), stages);
+        return (Some(hand_out(found.clone(), None, None, iid, out)), stages);
+    }
+    // A vertex and a pixel program of a graphics description, with the
+    // shader pack named: a pipeline whose host pipelines are made at its
+    // draws, for the targets bound then ([`Precompiled`]).
+    if slot == crate::precompiled::GRAPHICS_SLOT
+        && std::env::var_os("VICTORY_SHADER_PACK").is_some()
+        && let Some(d) = &parsed
+        && let (Some(vs), Some(ps)) = (
+            found.iter().find(|s| s.stage == "vertex"),
+            found.iter().find(|s| s.stage == "pixel"),
+        )
+        && found.len() == 2
+    {
+        let mut dwords = Vec::new();
+        if let Some(r) = d.sections.iter().find(|s| s.role == crate::precompiled::Role::Registers)
+            && r.size <= 0x1000
+        {
+            let mut bytes = vec![0u8; r.size as usize];
+            if read(r.address as usize, &mut bytes) {
+                dwords = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            }
+        }
+        let (registers, notes) = crate::precompiled::GraphicsRegisters::decode(&dwords);
+        for note in notes {
+            note_once(note);
+        }
+        let shaders = vec![vs.clone(), ps.clone()];
+        let precompiled = Box::new(Precompiled {
+            registers,
+            variants: Default::default(),
+        });
+        return (Some(hand_out(shaders, None, Some(precompiled), iid, out)), stages);
     }
     (None, stages)
+}
+
+/// Logs what the host cannot have of a precompiled graphics pipeline's
+/// state, once for each kind of thing.
+#[cfg(windows)]
+fn note_once(note: &'static str) {
+    static SEEN: Mutex<Option<std::collections::HashSet<&'static str>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(note) {
+        tracing::warn!(note, "precompiled graphics pipeline state the host has otherwise (logged once)");
+    }
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -1148,6 +1245,8 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(windows)]
+        None,
         iid,
         out,
     )

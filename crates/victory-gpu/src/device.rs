@@ -381,7 +381,9 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// signature, then the registers, info, code and map sections of each
 /// program ([`crate::precompiled`]). A compute pipeline is made when its
 /// program's container is known (given by the title, or found in the
-/// shader pack named by `VICTORY_SHADER_PACK`); the others fail as they
+/// shader pack named by `VICTORY_SHADER_PACK`), and with that pack named a
+/// graphics one when both its programs' are (its host pipelines made at
+/// its draws, for the targets bound); the others fail as they
 /// always did, with `out` null, and the first ones log the description's
 /// words and what its first word points at.
 /// shortcut: not implemented. Answering `S_OK` here without making the
@@ -400,9 +402,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         unsafe { *out = std::ptr::null() };
     }
     // The shader containers among the description's first 32 words: a
-    // compute shader alone is made into a pipeline
-    // (`pipeline::create_from_words`). `VICTORY_UNKNOWN_PIPELINES=0` leaves
-    // them all unmade, as before.
+    // compute shader alone, or a vertex and a pixel shader, are made into a
+    // pipeline (`pipeline::create_from_words`). `VICTORY_UNKNOWN_PIPELINES=0`
+    // leaves them all unmade, as before.
     #[cfg(windows)]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

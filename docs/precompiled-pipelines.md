@@ -94,10 +94,23 @@ its time), and find each description's
 program there when the title has not given us its container. A compute
 description whose program is found is made into a compute pipeline as
 `create_compute` makes one (the root signature is bound at dispatch, as for
-other pipelines). Graphics descriptions are still not made: their pipeline
-state (blend, depth, raster, render target formats, input layout) is in the
-registers and info sections, which are not decoded; the stages found are
-logged. `VICTORY_UNKNOWN_PIPELINES=0` leaves both methods failing, as before.
+other pipelines).
+
+A graphics description whose vertex and pixel programs are both found (and
+only with `VICTORY_SHADER_PACK` set) gets a pipeline object at once, whose
+host pipelines are made at its draws (`pipeline::Precompiled`): one per set
+of what the draw has bound, the render target formats as the host has them
+(the views' formats, else their textures'), their number, the depth format,
+the sample count, and the topology type of the topology set (rectangles
+their own; `precompiled::Targets`). Another set met later gets a host
+pipeline of its own; each is made by the pipeline workers as any other
+(`make::Pending`), so a first draw may be dropped while it is made. The
+state comes from the registers section as the table below reads it
+(`precompiled::GraphicsRegisters::decode`); what D3D12 cannot express
+exactly is logged once per kind ("precompiled graphics pipeline state the
+host has otherwise"). Descriptions not made log the stages found, as
+before. `VICTORY_UNKNOWN_PIPELINES=0` leaves both methods failing, as
+before.
 
 ## Graphics registers (first look, 64 descriptions)
 
@@ -110,25 +123,43 @@ against GFX10's public register layouts:
 |--------|-------------|---------|
 | 14, 15 | `0x082c034x`, `0x12`/`0x14`/`0x18` | `SPI_SHADER_PGM_RSRC1/2` of the pixel program (VGPR/SGPR blocks, float mode `0xc0`, user SGPRs) |
 | 19, 20 | `0x022c[c]34x`, same | the same for the vertex program |
-| 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL`: `0x007007f0` = no depth test, no stencil; `0x2f7` = stencil, depth test and write |
-| 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (test value, mask `0xff`, write mask, op value) |
-| 51 | `0xffffffff` / `0` | a colour write mask over the eight targets (`CB_TARGET_MASK`-like) |
-| 52-59 | `0x80000000` (23), `0xe5040504` (25), ... | `CB_BLEND0..7_CONTROL`: bit 30 enable, bit 31 no ROP3; `0xe5040504` = source alpha / one minus source alpha, separate alpha the same |
-| 64-71 | `0x06000600` (23), `0x01540154` (25), ... | `SX_MRT0..7_BLEND_OPT`, matching dwords 52-59 (`6` = blending off) |
-| 63 | `0` / `0x33333333` | likely `SPI_SHADER_COL_FORMAT` (4 bits a target) |
-| 74 | `0x19fc0130` (47), `...01c0`, `...0120` | not identified (rasterizer or interpolation control) |
-| 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup) |
+| 31 | `0x00cc0010` (all) | `CB_COLOR_CONTROL`: normal mode, ROP3 copy (not read) |
+| 39 | `0x00080000` (all) | `PA_CL_CLIP_CNTL`: DX clip space; bits 26/27 (near/far clipping off) read as `DepthClipEnable` |
+| 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bits 11/12 polygon offset on (not read: the offsets are not in the section) |
+| 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL` (read): stencil, depth, depth write, depth bounds, depth func (bits 4-6), two-sided stencil (7), stencil funcs (8-10, 20-22); `0x007007f0` = no depth test, no stencil; `0x7e2` = greater-or-equal test, no write |
+| 47 | `0` (62), `0x1001`, `0x80080` | `DB_STENCIL_CONTROL` (read): fail, depth-pass, depth-fail ops, front then back, 4 bits each (`0x80080` = add one wrapping on pass) |
+| 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (read: mask, write mask; the test value is the draw's reference on the host; op value 1 = D3D12's increments) |
+| 51 | `0xffffffff` / `0` | `CB_TARGET_MASK` (read): 4 bits (RGBA) a target |
+| 52-59 | `0x80000000` (23), `0xe5040504` (25), ... | `CB_BLEND0..7_CONTROL` (read): colour source, function, destination (bits 0-4, 5-7, 8-12), the same for alpha (16-28), bit 29 separate alpha, bit 30 enable, bit 31 no ROP3; `0xe5040504` = source alpha / one minus source alpha |
+| 64-71 | `0x06000600` (23), `0x01540154` (25), ... | `SX_MRT0..7_BLEND_OPT`, matching dwords 52-59 (`6` = blending off; not read) |
+| 63 | `0` / `0x33333333` | not identified (0 where blending is on, `0x33333333` where it is off) |
+| 74 | `0x19fc0130` (47), `...01c0`, `...0120` | likely `DB_SHADER_CONTROL`: Z order in bits 4-5 (late Z with kill, bit 6, in `0x1c0`); nothing D3D12 needs |
+| 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
+
+What the host pipeline gets beyond these: no input layout (none is in the
+description; see Open), sample mask all, no depth bias, no alpha to
+coverage, D3D12's nearest for what has no exact equal (constant alpha
+blend factors as the blend factor, stencil ops `ONES` and
+replace-by-op-value as replace, logic stencil ops as keep, both faces
+culled as none). A registers section shorter than 60 dwords or unreadable
+gets the console's reset state (no blending, all written, no depth or
+stencil test, no culling, solid, clipped), logged once.
 
 **No render target or depth formats are in the description.** On the
 console they come with the targets bound at draw time; a host pipeline
 needs them at creation (`D3D12_RT_FORMAT_ARRAY`, the depth format). So a
-graphics pipeline of this method has to be made at its first draw, keyed
-by the formats bound then (and remade for other formats), with blend,
-depth-stencil and write masks taken from the dwords above and the
-rasterizer from the console defaults until dword 74 is read.
+graphics pipeline of this method is made at its draws, keyed by the
+formats bound then (above).
 
 ## Open
 
-- Making graphics pipelines at first draw from the bound formats (above).
-- Dwords 74 and 92-96 of the graphics registers, and the info section.
+- Not run in the game yet. Whether the front face reading (bit 2 of dword
+  40) is right shows in the 10 of 64 descriptions that cull back faces.
+- The info section (0x50-0xbc bytes) holds the names of the interface
+  between the programs (`POSITION`, `COLOR`, `TEXCOORD`, ...); whether a
+  vertex program reads vertex inputs that need an input layout is not
+  known. The host pipeline has none.
+- Dwords 63 and 92-96 of the graphics registers.
+- Host pipelines of precompiled pipelines are not started early in later
+  runs (their variants appear only at draws).
 - Two of the logged program heads were not found in `shaders.rpf`.

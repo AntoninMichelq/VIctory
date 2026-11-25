@@ -204,6 +204,72 @@ impl GraphicsState {
         self.depth_bounds && self.depth_format != DXGI_FORMAT_UNKNOWN
     }
 
+    /// The state of a precompiled graphics pipeline ([`crate::precompiled`])
+    /// drawn into `t`: what its registers section holds (`r`), the targets,
+    /// samples and topology type of the draw, and D3D12's defaults for the
+    /// rest (no input layout, sample mask all, no depth bias, no alpha to
+    /// coverage).
+    pub(crate) fn precompiled(
+        r: &crate::precompiled::GraphicsRegisters,
+        t: &crate::precompiled::Targets,
+    ) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, target) in g.blend.RenderTarget.iter_mut().enumerate() {
+            let b = &r.blend[i];
+            *target = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: b.enable.into(),
+                SrcBlend: D3D12_BLEND(b.src as i32),
+                DestBlend: D3D12_BLEND(b.dest as i32),
+                BlendOp: D3D12_BLEND_OP(b.op as i32),
+                SrcBlendAlpha: D3D12_BLEND(b.src_alpha as i32),
+                DestBlendAlpha: D3D12_BLEND(b.dest_alpha as i32),
+                BlendOpAlpha: D3D12_BLEND_OP(b.op_alpha as i32),
+                RenderTargetWriteMask: r.write_masks[i],
+                ..*target
+            };
+        }
+        g.rasterizer.CullMode = D3D12_CULL_MODE(r.raster.cull as i32);
+        g.rasterizer.FrontCounterClockwise = r.raster.front_ccw.into();
+        g.rasterizer.DepthClipEnable = r.raster.depth_clip.into();
+        if r.raster.wireframe {
+            g.rasterizer.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        }
+        let d = &r.depth;
+        let face = |f: &crate::precompiled::StencilFace| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP(f.fail as i32),
+            StencilDepthFailOp: D3D12_STENCIL_OP(f.depth_fail as i32),
+            StencilPassOp: D3D12_STENCIL_OP(f.pass as i32),
+            StencilFunc: D3D12_COMPARISON_FUNC(f.func as i32),
+        };
+        g.depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: d.depth_enable.into(),
+            DepthWriteMask: if d.depth_write {
+                D3D12_DEPTH_WRITE_MASK_ALL
+            } else {
+                D3D12_DEPTH_WRITE_MASK_ZERO
+            },
+            DepthFunc: D3D12_COMPARISON_FUNC(d.depth_func as i32),
+            StencilEnable: d.stencil_enable.into(),
+            StencilReadMask: d.read_mask,
+            StencilWriteMask: d.write_mask,
+            FrontFace: face(&d.front),
+            BackFace: face(&d.back),
+        };
+        g.depth_bounds = d.depth_bounds;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(t.topology as i32);
+        g.targets.NumRenderTargets = u32::from(t.count);
+        for (f, &format) in g.targets.RTFormats.iter_mut().zip(&t.formats) {
+            *f = DXGI_FORMAT(format as i32);
+        }
+        g.depth_format = DXGI_FORMAT(t.depth as i32);
+        g.samples = DXGI_SAMPLE_DESC {
+            Count: t.samples.max(1),
+            Quality: 0,
+        };
+        g
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     /// The title's blend description as D3D12 takes it: no blending into
@@ -327,6 +393,8 @@ pub(crate) struct Input {
 
 /// The console's own primitive topology types.
 const RECTANGLES: i32 = 19;
+// What precompiled pipelines drawn with rectangles are made with.
+const _: () = assert!(RECTANGLES as u32 == crate::precompiled::RECTANGLES_TYPE);
 const QUADS: i32 = 32;
 
 /// Whether the title's root SRVs are bound as one-view tables of the
