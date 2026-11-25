@@ -4449,6 +4449,49 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a lane read that stays in the quad goes through quad reads
+    /// ([`Self::quad_pick`]) rather than a wave read: in mesh programs, and
+    /// in pixel programs, where a wave read of a helper lane is undefined
+    /// (helper lanes are not active lanes for wave operations), while the
+    /// console's quad swizzles read them. The title's G-buffer programs take
+    /// normal derivatives that way (`ds_swizzle` quad modes): with wave reads
+    /// every quad on a triangle's edge read garbage from its helper lanes,
+    /// which drew the triangle edges as thin lines in the normals target.
+    fn quad_reads(&self, quad: bool) -> bool {
+        quad && (self.s.mesh.is_some() || self.s.pixel)
+    }
+
+    /// `x` of the lane `perm` names for this lane's place in its quad (two
+    /// bits per place, place 0 lowest), as one quad operation when the
+    /// pattern is a swap or a broadcast, else through [`Self::quad_pick`].
+    fn quad_perm(&mut self, x: V, perm: u8) -> V {
+        let c = self.cur;
+        let place = |k: u8| perm >> (2 * k) & 3;
+        if (0..4).all(|k| place(k) == k) {
+            return x;
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        if (1..4).all(|k| place(k) == place(0)) {
+            let at = self.s.m.i32(u32::from(place(0)));
+            return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, self.s.t.i32, 122, &[x, at]);
+        }
+        // QuadOp: across X (lane ^ 1), across Y (^ 2), diagonal (^ 3)
+        if let Some(swap) = (1..4u8).find(|&m| (0..4).all(|k| place(k) == k ^ m)) {
+            let kind = self.s.m.i8(swap - 1);
+            return self.s.op(c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, kind]);
+        }
+        let lane = self.lane_index();
+        let (three, not3, one) = (self.s.m.i32(3), self.s.m.i32(!3), self.s.m.i32(1));
+        let p = self.s.m.bin(c, Bin::And, lane, three);
+        let sh = self.s.m.bin(c, Bin::Shl, p, one);
+        let pattern = self.s.m.i32(u32::from(perm));
+        let pick = self.s.m.bin(c, Bin::LShr, pattern, sh);
+        let pick = self.s.m.bin(c, Bin::And, pick, three);
+        let base = self.s.m.bin(c, Bin::And, lane, not3);
+        let src = self.s.m.bin(c, Bin::Or, base, pick);
+        self.quad_pick(x, src)
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4567,8 +4610,10 @@ impl<'a> Lower<'a> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            // Pixel: so do they, because wave reads skip helper lanes
+            // ([`Self::quad_reads`]).
+            let by_quad = self.quad_reads(quad);
+            if !(by_quad && self.s.mesh.is_some()) {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -4593,7 +4638,9 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if by_quad && offset & 0x8000 != 0 {
+                self.quad_perm(x, (offset & 0xFF) as u8)
+            } else if by_quad {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6830,8 +6877,8 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        let by_quad = self.quad_reads(quad);
+        if !(by_quad && self.s.mesh.is_some()) {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -6909,7 +6956,9 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if let (true, Dpp::Row { ctrl: perm @ 0..=0xFF, .. }) = (by_quad, dpp) {
+            self.quad_perm(x, perm as u8)
+        } else if by_quad {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
