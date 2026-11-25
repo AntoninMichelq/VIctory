@@ -1224,8 +1224,8 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// For a title texture staged for upload whose memory is mapped in part (a
 /// texture streaming in: its smaller levels lie first in its memory and
 /// arrive first): the most detailed level from which every level down is
-/// all there, in every slice. `None` when level 0 is there too, when no
-/// level is, or for thick (3D) layouts. The levels above it were uploaded
+/// all there, in every slice; `u32::MAX` when no level is. `None` when
+/// level 0 is there too, or for thick (3D) layouts. The levels above it were uploaded
 /// from unmapped memory, which reads as zeros: black colour and normals of
 /// (-1, -1), drawn as dark, chrome-streaked characters and black posters.
 pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
@@ -1235,7 +1235,7 @@ pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
     };
     let layout = &s.layout;
     let n = layout.mips.len();
-    if n <= 1 || layout.thick {
+    if layout.thick {
         return None;
     }
     // Where each level's blocks start; a level ends where the next starts.
@@ -1252,9 +1252,11 @@ pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
             (mip.offset, end_of(mip.offset))
         };
         let len = to.saturating_sub(from);
+        // Its last page too: blocks are asked of by their first page
+        // ([`mapped_bytes`]).
         (0..u64::from(layout.slices.max(1))).all(|slice| {
             let at = s.memory.wrapping_add((slice * layout.slice_size + from) as usize);
-            len == 0 || mapped_bytes(at, len as usize) == len
+            len == 0 || (mapped_bytes(at, len as usize) == len && committed(at.wrapping_add(len as usize - 1), 1))
         })
     };
     let mut first = n;
@@ -1264,7 +1266,11 @@ pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
         }
         first = i;
     }
-    (first > 0 && first < n).then_some(first as u32)
+    match first {
+        0 => None,
+        f if f == n => Some(u32::MAX),
+        f => Some(f as u32),
+    }
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be

@@ -408,10 +408,6 @@ fn evict_less() -> Option<u64> {
 /// Slots made again with a lowest level of detail (a texture uploaded in
 /// part) or without it again, since the start ([`partly_clamp`]).
 pub(crate) static HEAP_TEXTURES_CLAMPED: AtomicU64 = AtomicU64::new(0);
-/// Title slots whose views sample no level above the first one all there,
-/// by slot: the title texture and that level.
-static PARTLY_CLAMPED: std::sync::Mutex<std::collections::BTreeMap<u32, (usize, u32)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// `VICTORY_PARTLY_CLAMP` (on; `=0` off): a texture streaming in that was
 /// uploaded in part is sampled only from its first level all there
@@ -1899,36 +1895,26 @@ impl State {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
             }
             // Uploaded in part: the levels not there yet are not sampled
-            // (they read zeros); all of them again once it is whole. Before
+            // (they read zeros), none at all if no level is all there (the
+            // grey stand-in); all of them again once it is whole. Before
             // the tabled case below, which the clamp concerns as much (it
-            // stayed on for good there once the texture was whole), and by
-            // texture: a slot written with another texture since is made
-            // again too.
-            if partly_clamp() {
+            // stayed on for good there once the texture was whole). The
+            // level is kept with the slot and its record
+            // (`HostHeap::remake_from_level`): a slot given up and made
+            // again keeps it, one written since drops it.
+            if partly_clamp()
+                && let Some(handle) = heap.handle(index)
+            {
                 let least = if partly.is_some() { crate::texture::first_whole_level(resource).unwrap_or(0) } else { 0 };
-                let mut clamped = PARTLY_CLAMPED.lock().unwrap_or_else(|e| e.into_inner());
-                let before = clamped.get(&index).copied();
-                let changed = match before {
-                    Some((texture, level)) => texture != resource as usize || level != least,
-                    None => least != 0,
-                };
-                if changed {
-                    if least == 0 {
-                        clamped.remove(&index);
-                    } else {
-                        clamped.insert(index, (resource as usize, least));
-                    }
-                    drop(clamped);
-                    if let Some(handle) = heap.handle(index) {
-                        host.remake_from_level(index, handle, least);
-                        let n = HEAP_TEXTURES_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            tracing::info!(
-                                remade = n,
-                                level = least,
-                                "texture slots uploaded in part remade to sample only the levels there (VICTORY_PARTLY_CLAMP=0 turns this off)"
-                            );
-                        }
+                if least != host.slot_least(index, handle) {
+                    host.remake_from_level(index, handle, least);
+                    let n = HEAP_TEXTURES_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!(
+                            remade = n,
+                            level = least,
+                            "texture slots uploaded in part remade to sample only the levels there (VICTORY_PARTLY_CLAMP=0 turns this off)"
+                        );
                     }
                 }
             }

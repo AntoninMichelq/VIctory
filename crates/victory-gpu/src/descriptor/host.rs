@@ -1488,24 +1488,46 @@ impl HostHeap {
         }
     }
 
+    /// Makes title slot `index` (handle `handle`) again with views that
+    /// sample no level more detailed than `level` (0: all levels;
+    /// `u32::MAX`: none is there, the slot shows the grey stand-in), for a
+    /// texture streaming in that was uploaded in part
+    /// (`crate::texture::first_whole_level`). The level is kept with the
+    /// slot and the record it shows ([`LEAST`]): every making of the slot
+    /// from that record keeps it (a slot given up and made again, a
+    /// thread making it meanwhile), and a record written since drops it.
+    pub(crate) fn remake_from_level(&self, index: u32, handle: u64, level: u32) -> Option<View> {
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut least = LEAST.lock().unwrap_or_else(|e| e.into_inner());
+            let at = (std::ptr::from_ref(self) as usize, index);
+            if level == 0 {
+                least.remove(&at);
+            } else {
+                least.insert(at, (slot_key(handle), level));
+            }
+            drop(least);
+            if let Some(key) = made.get_mut(index as usize) {
+                *key = 0;
+            }
+        }
+        self.mirror(index, handle, true)
+    }
+
+    /// The level title slot `index` (handle `handle`) is kept from
+    /// ([`HostHeap::remake_from_level`]) for the record there now; 0: none.
+    pub(crate) fn slot_least(&self, index: u32, handle: u64) -> u32 {
+        let least = LEAST.lock().unwrap_or_else(|e| e.into_inner());
+        match least.get(&(std::ptr::from_ref(self) as usize, index)) {
+            Some(&(key, level)) if key == slot_key(handle) => level,
+            _ => 0,
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    /// Makes title slot `index` (handle `handle`) again with views that
-    /// sample no level more detailed than `level` (0: all levels), for a
-    /// texture streaming in that was uploaded in part
-    /// (`crate::texture::first_whole_level`).
-    pub(crate) fn remake_from_level(&self, index: u32, handle: u64, level: u32) -> Option<View> {
-        if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
-            *key = 0;
-        }
-        LEAST_LEVEL.set(level);
-        let view = self.mirror(index, handle, true);
-        LEAST_LEVEL.set(0);
-        view
-    }
-
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1574,12 +1596,34 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
+            // The level a texture uploaded in part is kept from, for this
+            // record; another record written since drops it.
+            let least = {
+                let mut least = LEAST.lock().unwrap_or_else(|e| e.into_inner());
+                let at = (std::ptr::from_ref(self) as usize, index);
+                match least.get(&at) {
+                    Some(&(k, level)) if k == key => level,
+                    Some(_) => {
+                        least.remove(&at);
+                        0
+                    }
+                    None => 0,
+                }
+            };
+            LEAST_MISSED.set(false);
+            let kept = if later || least == u32::MAX {
                 None
             } else {
-                make(&view, self.cpu(index))
+                LEAST_LEVEL.set(least);
+                let kept = make(&view, self.cpu(index));
+                LEAST_LEVEL.set(0);
+                kept
             };
-            if kept.is_none() && !self.sampler && !(later && wait_grey() && grey_for(&view, self.cpu(index))) {
+            // No level of it there (or none the view names): grey, as a
+            // slot that waits.
+            let missing = least == u32::MAX || LEAST_MISSED.get();
+            let grey = (later && wait_grey()) || (missing && (wait_grey() || evict_grey()));
+            if kept.is_none() && !self.sampler && !(grey && grey_for(&view, self.cpu(index))) {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
@@ -1628,20 +1672,54 @@ std::thread_local! {
     /// The most detailed level views made on this thread may sample
     /// ([`HostHeap::remake_from_level`]); 0: any.
     static LEAST_LEVEL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The view last made on this thread names no level from
+    /// `LEAST_LEVEL` down: it was not made ([`least_level`]).
+    static LEAST_MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Raises a texture view's lowest level of detail to at least `level`.
-fn least_level(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, level: f32) {
+/// Levels title slots are kept from ([`HostHeap::remake_from_level`]), by
+/// heap and slot: the record's key (generation and index) and the level.
+static LEAST: Mutex<std::collections::BTreeMap<(usize, u32), (u64, u32)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The key of the record a title slot holds at `handle`, as
+/// [`HostHeap::mirror`] makes it.
+fn slot_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    u64::from(generation) << 32 | u64::from(i)
+}
+
+/// Raises a texture view's lowest level of detail to at least `level`;
+/// false (nothing changed) if the view names no level from there down
+/// (a clamp past its last level reads nothing).
+fn least_level(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, level: f32) -> bool {
     // SAFETY: the union member the view's dimension names.
     unsafe {
-        let clamp = match desc.ViewDimension {
-            D3D12_SRV_DIMENSION_TEXTURE2D => &mut desc.Anonymous.Texture2D.ResourceMinLODClamp,
-            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => &mut desc.Anonymous.Texture2DArray.ResourceMinLODClamp,
-            D3D12_SRV_DIMENSION_TEXTURECUBE => &mut desc.Anonymous.TextureCube.ResourceMinLODClamp,
-            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => &mut desc.Anonymous.TextureCubeArray.ResourceMinLODClamp,
-            _ => return,
+        let (most, levels, clamp) = match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                (t.MostDetailedMip, t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                (t.MostDetailedMip, t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                (t.MostDetailedMip, t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                (t.MostDetailedMip, t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            _ => return true,
         };
+        // Levels count u32::MAX: all from the first down.
+        if levels != u32::MAX && level >= (most.saturating_add(levels)) as f32 {
+            return false;
+        }
         *clamp = clamp.max(level);
+        true
     }
 }
 
@@ -2225,8 +2303,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let least = LEAST_LEVEL.get();
                 if least > skip
                     && let Some(d) = desc.as_mut()
+                    && !least_level(d, (least - skip) as f32)
                 {
-                    least_level(d, (least - skip) as f32);
+                    LEAST_MISSED.set(true);
+                    return None;
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
