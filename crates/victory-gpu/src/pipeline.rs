@@ -1126,6 +1126,7 @@ pub(crate) fn create_from_words(
     // draws, for the targets bound then ([`Precompiled`]).
     if slot == crate::precompiled::GRAPHICS_SLOT
         && std::env::var_os("VICTORY_SHADER_PACK").is_some()
+        && precompiled_graphics()
         && let Some(d) = &parsed
         && let (Some(vs), Some(ps)) = (
             found.iter().find(|s| s.stage == "vertex"),
@@ -1160,6 +1161,21 @@ pub(crate) fn create_from_words(
         return (Some(hand_out(shaders, None, Some(precompiled), iid, out)), stages);
     }
     (None, stages)
+}
+
+/// Whether graphics pipelines of method 0x1c8 are made (with the shader
+/// pack named); `VICTORY_PRECOMPILED_GRAPHICS=0` leaves them unmade, as
+/// before they were, and keeps the compute ones of 0x218.
+#[cfg(windows)]
+fn precompiled_graphics() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRECOMPILED_GRAPHICS").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("VICTORY_PRECOMPILED_GRAPHICS=0: precompiled graphics pipelines are left unmade");
+        }
+        on
+    })
 }
 
 /// Logs what the host cannot have of a precompiled graphics pipeline's

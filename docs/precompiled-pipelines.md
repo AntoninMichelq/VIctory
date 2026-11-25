@@ -105,7 +105,8 @@ description whose program is found is made into a compute pipeline as
 other pipelines).
 
 A graphics description whose vertex and pixel programs are both found (and
-only with `VICTORY_SHADER_PACK` set) gets a pipeline object at once, whose
+only with `VICTORY_SHADER_PACK` set; `VICTORY_PRECOMPILED_GRAPHICS=0`
+leaves them unmade and keeps the compute ones) gets a pipeline object at once, whose
 host pipelines are made at its draws (`pipeline::Precompiled`): one per set
 of what the draw has bound, the render target formats as the host has them
 (the views' formats, else their textures'), their number, the depth format,
