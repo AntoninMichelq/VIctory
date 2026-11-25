@@ -29,14 +29,14 @@ profile, in the prison at the start of the game.
 
 | | Result |
 |---|---|
-| Frame rate in the world | about 6.3 fps, with the game's AMD FSR upscaling from 1080p to 4K |
-| Memory | about 20.7 GB of RAM, steady over a 10-minute run |
+| Frame rate in the world | about 6.2-6.4 fps, with the game's AMD FSR upscaling from 1080p to 4K |
+| Memory | about 21 GB of RAM, steady over a 10-minute run |
 | Loading | about one minute to reach the world once shaders are cached; the very first run spends a long time preparing shaders (white screen) |
 | Stability | no driver crash or device loss in a 10-minute test run |
 | Picture | lit prison: buildings, cells, characters with hair and skin, sky; the stray triangle lines, the purple fog and the black skin are fixed |
 
 Settings used: `VICTORY_FFX_SCALE=0.5` (FSR), `VICTORY_TEXTURE_HALF=2`,
-`VICTORY_STAGING_POOL_MB=1024`, `VICTORY_VRAM_HYSTERESIS=85,75`.
+`VICTORY_STAGING_POOL_MB=1024`, `VICTORY_VRAM_HYSTERESIS=85,75`, `VICTORY_AMBIENT=off`.
 
 Known issues: textures can arrive late and walls stay flat-coloured for a moment, and
 some objects stream in late. On top of the upstream fork, this branch adds
