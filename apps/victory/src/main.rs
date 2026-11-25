@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prewarm;
 mod run;
 mod shader;
 #[cfg(windows)]
@@ -107,6 +108,25 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Pre-warm a cache's translated shaders and host pipeline library
+    /// (`host-pipelines.bin`) without starting the title.
+    Prewarm {
+        /// Cache folder (`VICTORY_CACHE_DIR` layout: `shaders/` and `pipelines/`).
+        #[arg(long)]
+        cache: PathBuf,
+        /// Folder(s) of console shader containers (`.bin`/`.cdxil`) to translate
+        /// missing shaders from (defaults to `_work\prison\shaders` if present).
+        #[arg(long)]
+        shaders: Vec<PathBuf>,
+        /// Optional source cache or `pipelines/` folder to seed
+        /// `early-pipelines.txt` and `early-recipes.bin` from.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Worker threads (default: half logical cores, 2 to 8, or
+        /// `VICTORY_PIPELINE_WORKERS`).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -173,6 +193,12 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Prewarm {
+            cache,
+            shaders,
+            from,
+            jobs,
+        } => prewarm::run(cache, shaders, from, jobs),
         Command::Config => show_config(),
     }
 }

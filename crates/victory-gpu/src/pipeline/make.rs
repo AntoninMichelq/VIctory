@@ -141,7 +141,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+        super::library::note_used(&p.key, &p.shaders, p.graphics.as_deref());
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -393,7 +393,7 @@ fn workers() -> bool {
 static MAKING_NOW: AtomicU64 = AtomicU64::new(0);
 
 /// Held while a worker compiles: counts it in [`MAKING_NOW`].
-struct Making;
+pub(crate) struct Making;
 
 impl Drop for Making {
     fn drop(&mut self) {
@@ -410,7 +410,7 @@ impl Drop for Making {
 /// commit left) above `VICTORY_PIPELINE_MIN_FREE_MB` (4096) at
 /// `VICTORY_PIPELINE_COMPILE_MB` (1536) each; one always goes on, so
 /// pipelines are still made, one at a time.
-fn room_to_make() -> Making {
+pub(crate) fn room_to_make() -> Making {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     static SETTINGS: OnceLock<(u64, u64)> = OnceLock::new();
     let (min_free, each) = *SETTINGS.get_or_init(|| {

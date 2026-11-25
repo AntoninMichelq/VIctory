@@ -101,7 +101,7 @@ pub(crate) fn kept() -> [u64; 7] {
 }
 
 /// The shared container for `bytes`.
-fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+pub(crate) fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -921,6 +921,10 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub mod prewarm;
+#[cfg(windows)]
+mod recipe;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
