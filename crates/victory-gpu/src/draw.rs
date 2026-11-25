@@ -1920,6 +1920,61 @@ impl State {
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
+    /// `VICTORY_ARGS_PEEK=<hash prefix>,...`: the arguments (clamped, as
+    /// the card reads them) of the indirect commands whose pipeline names
+    /// one of those shaders, read back once the list has run and logged
+    /// with the command (its targets' sizes too), at most 40 times in all.
+    #[cfg(feature = "diagnostics")]
+    fn peek_args(&self, list: &HostList, bounded: &ID3D12Resource, at: u64, stride: u32, max: u32, kind: u32) {
+        static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let wanted = WANTED.get_or_init(|| {
+            std::env::var("VICTORY_ARGS_PEEK")
+                .unwrap_or_default()
+                .split(',')
+                .map(|h| h.trim().to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        });
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        if !wanted.iter().any(|w| p.name.contains(w.as_str())) {
+            return;
+        }
+        static PEEKS: AtomicU64 = AtomicU64::new(0);
+        if PEEKS.fetch_add(1, Ordering::Relaxed) >= 40 {
+            return;
+        }
+        let records = max.clamp(1, 4) as usize;
+        let row = stride as usize * records;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some(readback) = host.read_back_buffer(row.next_multiple_of(256) as u64) else {
+            return;
+        };
+        // Where the bytes land: ours, never freed (40 peeks at most).
+        let dst: &'static mut [u8] = Box::leak(vec![0u8; row].into_boxed_slice());
+        let dst_at = dst.as_mut_ptr();
+        // SAFETY: an open list; the scratch buffer (COMMON after `done`,
+        // promoted to a copy source) and the readback buffer are live.
+        unsafe { list.list.CopyBufferRegion(&readback, 0, bounded, at, row as u64) };
+        list.defer_read_back(readback, dst_at, [row, 1, row]);
+        let text = self.op_text(format!("indirect kind {kind} max {max}"), kind == 2);
+        let address = dst_at as usize;
+        std::thread::spawn(move || {
+            // The list runs within a few frames: the bytes are there by then.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            // SAFETY: the leaked buffer above, `row` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, row) };
+            let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            tracing::warn!("indirect arguments peeked (VICTORY_ARGS_PEEK), stride {stride}: {words:?} for {text}");
+        });
+    }
+
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -2753,6 +2808,8 @@ impl State {
             self.mesh_scissor(list, false);
         }
         crate::indirect::done(list, &bounded);
+        #[cfg(feature = "diagnostics")]
+        self.peek_args(list, &bounded, at, stride, max, kind);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
