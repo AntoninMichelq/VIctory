@@ -432,11 +432,11 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    if !m.heaps.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(e) = m.heaps.entry(key) {
         // Held for the heap's life: not given back with a list's slots.
         let base = heap.dynamic(COPIES + 1)?;
         heap.null_raw_uav_at(base);
-        m.heaps.insert(key, (base, Vec::new()));
+        e.insert((base, Vec::new()));
     }
     let Memory { heaps, copies, .. } = &mut *m;
     let (base, views) = heaps.get_mut(&key)?;

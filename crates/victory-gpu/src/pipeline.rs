@@ -283,7 +283,7 @@ pub(crate) fn merged_halves(vs: &Arc<Shader>, gs: &Arc<Shader>) -> Option<(Arc<S
                     stores: program.as_ref().is_none_or(stores),
                     // The ES half's jump into the GS half is the merged
                     // stage's own; only its flat and global stores count.
-                    raw_stores: program.as_ref().is_none_or(|p| flat_stores(p)),
+                    raw_stores: program.as_ref().is_none_or(flat_stores),
                     used: program.map(|p| p.used).unwrap_or_default(),
                 })),
             })
