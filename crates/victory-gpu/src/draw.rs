@@ -1697,6 +1697,26 @@ impl State {
         };
         let mut evicted = false;
         let mut refused = 0;
+        // Small copies made while the card was full are made whole again
+        // once it has room (at most once a second, up to the low mark).
+        if less.is_some() && room && PASS_BUDGET.get().is_none() {
+            static LAST_UP: AtomicU64 = AtomicU64::new(0);
+            let (now, last) = (crate::host::now_ms(), LAST_UP.load(Ordering::Relaxed));
+            if now.saturating_sub(last) >= 1000
+                && LAST_UP.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                // At most `VICTORY_EVICT_LESS_UP_MB` (64) a second: each is
+                // uploaded again whole.
+                static UP_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let cap = *UP_MB.get_or_init(|| {
+                    std::env::var("VICTORY_EVICT_LESS_UP_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64u64)
+                }) << 20;
+                let up = crate::resource::room_up(memory).min(cap);
+                if up > 0 {
+                    host.texture_slots_upgrade(up, 256);
+                }
+            }
+        }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1832,7 +1852,18 @@ impl State {
                                 // Queued again by when their copies went.
                                 let frame_ms = FRAME_MS.load(Ordering::Relaxed).max(16);
                                 let later = ((every + 1500) / frame_ms).clamp(30, 1000);
-                                let (n, _) = host.texture_slots_evict_less(now.saturating_sub(4000), need, 4096, later);
+                                // At most `VICTORY_EVICT_LESS_ROUND_MB` (128) a
+                                // round: 320-480 MB a round came back as as
+                                // many uploads soon after (run cumul 22:46).
+                                static ROUND_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                                let round = *ROUND_MB.get_or_init(|| {
+                                    std::env::var("VICTORY_EVICT_LESS_ROUND_MB")
+                                        .ok()
+                                        .and_then(|v| v.trim().parse().ok())
+                                        .unwrap_or(128u64)
+                                }) << 20;
+                                let (n, _) =
+                                    host.texture_slots_evict_less(now.saturating_sub(4000), need.min(round), 4096, later);
                                 HEAP_TEXTURES_EVICTED.fetch_add(n as u64, Ordering::Relaxed);
                             }
                         }
@@ -1849,6 +1880,7 @@ impl State {
             // A small copy while the card is full (`VICTORY_EVICT_LESS=1`).
             let small = !room;
             crate::resource::shrinking(small);
+            let shrunk_before = crate::resource::SHRUNK.load(Ordering::Relaxed);
             let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1860,7 +1892,7 @@ impl State {
                     continue;
                 }
             };
-            if small && crate::resource::shrunk_levels(resource) > 0 {
+            if small && crate::resource::SHRUNK.load(Ordering::Relaxed) > shrunk_before {
                 let n = HEAP_TEXTURES_SMALL.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::info!(

@@ -447,6 +447,26 @@ impl TextureQueue {
     }
 }
 
+/// Slots the pass made that hold the same host copy
+/// ([`HostHeap::resident_groups`]).
+struct ResidentGroup {
+    slots: Vec<u32>,
+    /// When the oldest of them was made (ms).
+    at: u64,
+    /// The title texture the copy is of.
+    texture: usize,
+    /// When the copy was last asked for (`crate::host::moment`), its bytes,
+    /// the levels it leaves off for being small.
+    used: u64,
+    bytes: u64,
+    shrunk: u32,
+    /// No other holder than these slots.
+    alone: bool,
+}
+
+/// Small copies made whole again ([`HostHeap::texture_slots_upgrade`]).
+static UPGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether `view` is of a texture the title may fill itself: a texture it
 /// placed in memory, or a texture object.
 pub(crate) fn is_texture_view(view: &View) -> bool {
@@ -960,26 +980,15 @@ impl HostHeap {
         }
     }
 
-    /// [`HostHeap::texture_slots_evict`] under `VICTORY_EVICT_LESS=1`:
-    /// gives up only slots whose giving up frees card memory, and only as
-    /// many as free `need` bytes (or `most` slots). A slot is let go with
-    /// the other slots made by the pass before `before` ms that hold the
-    /// same host copy, and only if no other slot holds it: a copy a table,
-    /// a newer slot or a list still names is not let go
-    /// (`crate::resource::let_go_idle`), and giving up its slot only made
-    /// it grey or black while the card stayed as full (256 slots a pass,
-    /// 33,000-65,000 in five minutes in the common room). Small copies
-    /// (`crate::resource::shrinking`) stay: they free little and are what
-    /// slots show while the card is full. The least lately used copies go
-    /// first (`crate::resource::host_copy_info`), then the oldest made.
-    /// Slots given up are queued again `later` frames on, by when their copy
-    /// was let go: the pass then makes them small while the card is full.
-    /// Returns the slots given up and the bytes they free.
-    pub(crate) fn texture_slots_evict_less(&self, before: u64, need: u64, most: usize, later: u64) -> (usize, u64) {
+    /// The slots the pass made before `before` ms, by the host copy each
+    /// holds now ([`ResidentGroup`]). Each group's title texture is the one
+    /// of its slots' whose host copy it is: a slot written with another
+    /// texture since it was made is put right (its record named the old
+    /// one, and the whole group was kept back for it), and slots holding
+    /// nothing, or a copy of none of the textures recorded, leave the
+    /// record. Also returns how many slots were in groups kept back so.
+    fn resident_groups(&self, before: u64) -> (Vec<ResidentGroup>, u64) {
         use windows::core::Interface;
-        if need == 0 {
-            return (0, 0);
-        }
         let candidates: Vec<(u32, u64, usize)> = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             textures
@@ -990,61 +999,183 @@ impl HostHeap {
                 .collect()
         };
         if candidates.is_empty() {
-            return (0, 0);
+            return (Vec::new(), 0);
         }
-        // By the host copy each holds: (slots, oldest made, title texture,
-        // the copy).
-        type Group = (Vec<u32>, u64, usize, ID3D12Resource);
-        let mut groups: std::collections::HashMap<usize, Group> = std::collections::HashMap::new();
-        let mut holding_nothing = Vec::new();
+        // By the copy each holds: slots, oldest made, the title textures
+        // recorded for them, the copy.
+        type Held = (Vec<u32>, u64, Vec<usize>, ID3D12Resource);
+        let mut held: std::collections::HashMap<usize, Held> = std::collections::HashMap::new();
+        let mut leave = Vec::new();
         {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             for (i, at, texture) in candidates {
                 let Some(Some(copy)) = kept.get(i as usize) else {
-                    holding_nothing.push(i);
+                    leave.push(i);
                     continue;
                 };
-                let g = groups
+                let g = held
                     .entry(copy.as_raw() as usize)
-                    .or_insert_with(|| (Vec::new(), at, texture, copy.clone()));
+                    .or_insert_with(|| (Vec::new(), at, Vec::new(), copy.clone()));
                 g.0.push(i);
                 g.1 = g.1.min(at);
+                if !g.2.contains(&texture) {
+                    g.2.push(texture);
+                }
             }
         }
-        let titles: Vec<usize> = groups.values().map(|g| g.2).collect();
-        let infos = crate::resource::host_copy_info(&titles);
-        let mut kept_back = 0u64;
-        // (last asked for, oldest made, bytes, slots)
-        let mut order: Vec<(u64, u64, u64, Vec<u32>)> = Vec::new();
-        for ((raw, (slots, at, _, copy)), info) in groups.into_iter().zip(infos) {
+        let mut titles: Vec<usize> = held.values().flat_map(|g| g.2.iter().copied()).collect();
+        titles.sort_unstable();
+        titles.dedup();
+        let infos: std::collections::HashMap<usize, (u64, u64, u32, usize)> = titles
+            .iter()
+            .copied()
+            .zip(crate::resource::host_copy_info(&titles))
+            .filter_map(|(t, info)| Some((t, info?)))
+            .collect();
+        let (mut groups, mut kept_back, mut fix) = (Vec::new(), 0u64, Vec::new());
+        for (raw, (slots, at, textures, copy)) in held {
             // The copy itself holds one reference, each slot one, and the
-            // clone taken here one: any more is a holder the pass does
-            // not let go of.
+            // clone taken here one: any more is a holder the pass does not
+            // let go of.
             let alone = crate::host::references(&copy) as usize == 2 + slots.len();
             drop(copy);
-            match info {
-                Some((used, bytes, 0, texture)) if texture == raw && alone => order.push((used, at, bytes, slots)),
-                _ => kept_back += slots.len() as u64,
+            let found = textures
+                .iter()
+                .find_map(|t| infos.get(t).filter(|info| info.3 == raw).map(|&info| (*t, info)));
+            match found {
+                Some((texture, (used, bytes, shrunk, _))) => {
+                    if textures.len() > 1 {
+                        fix.extend(slots.iter().map(|&i| (i, texture)));
+                    }
+                    groups.push(ResidentGroup { slots, at, texture, used, bytes, shrunk, alone });
+                }
+                None => {
+                    kept_back += slots.len() as u64;
+                    leave.extend(slots);
+                }
             }
         }
-        order.sort_unstable_by_key(|&(used, at, ..)| (used, at));
-        let (mut chosen, mut freed) = (Vec::new(), 0u64);
-        for (_, _, bytes, slots) in order {
-            if freed >= need || chosen.len() >= most {
+        if !leave.is_empty() || !fix.is_empty() {
+            let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for i in &leave {
+                q.resident.remove(i);
+            }
+            for (i, texture) in fix {
+                if let Some(entry) = q.resident.get_mut(&i) {
+                    entry.1 = texture;
+                }
+            }
+        }
+        (groups, kept_back)
+    }
+
+    /// [`HostHeap::texture_slots_evict`] under `VICTORY_EVICT_LESS=1`:
+    /// gives up only slots whose giving up frees card memory, and only as
+    /// many as free `need` bytes (or `most` slots). A slot is let go with
+    /// the other slots made by the pass before `before` ms that hold the
+    /// same host copy, and only if no other slot holds it: a copy a table,
+    /// a newer slot or a list still names is not let go
+    /// (`crate::resource::let_go_idle`), and giving up its slot only made
+    /// it grey or black while the card stayed as full (256 slots a pass,
+    /// 33,000-65,000 in five minutes in the common room). Small copies
+    /// (`crate::resource::shrinking`) stay: they free little, are what
+    /// slots show while the card is full, and are made whole again when
+    /// there is room ([`HostHeap::texture_slots_upgrade`]). The least
+    /// lately used copies go first (`crate::resource::host_copy_info`),
+    /// then the oldest made. Slots given up are queued again `later`
+    /// frames on, by when their copy was let go: the pass then makes them
+    /// small while the card is full. Returns the slots given up and the
+    /// bytes their copies hold (freed once let go).
+    pub(crate) fn texture_slots_evict_less(&self, before: u64, need: u64, most: usize, later: u64) -> (usize, u64) {
+        if need == 0 {
+            return (0, 0);
+        }
+        let (groups, mut kept_back) = self.resident_groups(before);
+        let mut order: Vec<ResidentGroup> = Vec::new();
+        for g in groups {
+            if g.shrunk == 0 && g.alone {
+                order.push(g);
+            } else {
+                kept_back += g.slots.len() as u64;
+            }
+        }
+        order.sort_unstable_by_key(|g| (g.used, g.at));
+        let (mut gone, mut freed) = (Vec::new(), 0u64);
+        for g in order {
+            if freed >= need || gone.len() >= most {
                 break;
             }
-            freed += bytes;
-            chosen.extend(slots);
-        }
-        {
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for i in holding_nothing.iter().chain(&chosen) {
-                textures.resident.remove(i);
+            {
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for i in &g.slots {
+                    textures.resident.remove(i);
+                }
+            }
+            let before = gone.len();
+            gone.extend(g.slots.into_iter().filter(|&i| self.texture_slot_gone(i)));
+            if gone.len() > before {
+                freed += g.bytes;
+                // Back small when its slots are made again.
+                crate::resource::demote(g.texture);
             }
         }
-        let gone: Vec<u32> = chosen.into_iter().filter(|&i| self.texture_slot_gone(i)).collect();
         self.given_up(&gone, later, Some((freed, kept_back)));
         (gone.len(), freed)
+    }
+
+    /// Under `VICTORY_EVICT_LESS=1`, while the card has room: the small
+    /// copies the pass made while it was full
+    /// (`crate::resource::shrinking`) are made whole again, the most lately
+    /// used first, until `room` bytes (their whole size, estimated) or
+    /// `most` textures: each loses its small copy
+    /// (`crate::resource::unshrink`), and its slots are made again from
+    /// the next pass on, as when first written (they show the small copy
+    /// until then: no slot is left with nothing). Without it a texture made
+    /// small at a peak stayed small for its life. Returns the textures made
+    /// whole again.
+    pub(crate) fn texture_slots_upgrade(&self, room: u64, most: usize) -> usize {
+        let (groups, _) = self.resident_groups(u64::MAX);
+        let mut small: Vec<ResidentGroup> = groups.into_iter().filter(|g| g.shrunk > 0).collect();
+        small.sort_unstable_by_key(|g| std::cmp::Reverse(g.used));
+        let frame = crate::frame::current();
+        let (mut done, mut spent) = (0usize, 0u64);
+        for g in small {
+            // A level less is a quarter of the bytes.
+            let whole = g.bytes.saturating_mul(1u64 << (2 * g.shrunk.min(16)));
+            if done >= most || spent.saturating_add(whole) > room {
+                break;
+            }
+            if !crate::resource::unshrink(g.texture as crate::object::This) {
+                continue;
+            }
+            spent += whole;
+            done += 1;
+            // Made again by the pass: the slot keeps showing the small copy
+            // until then.
+            {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                for &i in &g.slots {
+                    if let Some(key) = made.get_mut(i as usize) {
+                        *key = 0;
+                    }
+                }
+            }
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for i in g.slots {
+                textures.resident.remove(&i);
+                textures.written(i, frame, frame, false);
+            }
+        }
+        if done > 0 {
+            let n = UPGRADED.fetch_add(done as u64, std::sync::atomic::Ordering::Relaxed) + done as u64;
+            if n.ilog2() != (n - done as u64).max(1).ilog2() || n == done as u64 {
+                tracing::info!(
+                    made_whole = n,
+                    "small texture copies made whole again now that the card has room (VICTORY_EVICT_LESS=1)"
+                );
+            }
+        }
+        done
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
