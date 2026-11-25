@@ -18,6 +18,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod tour_hooks;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
