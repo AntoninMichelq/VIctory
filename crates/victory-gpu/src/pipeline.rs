@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// The program that resolves the indirect diffuse light
+    /// (`crate::ambient::PROGRAM`), which the ambient light follows.
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -110,6 +114,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -228,6 +236,7 @@ pub(crate) fn merged_halves(vs: &Arc<Shader>, gs: &Arc<Shader>) -> Option<(Arc<S
                 stage,
                 hash: format!("{}.{stage}", of.hash),
                 container: of.container.clone(),
+                resolves_light: false,
                 translated: OnceLock::from(Some(Translated {
                     host,
                     stores: program.as_ref().is_none_or(stores),

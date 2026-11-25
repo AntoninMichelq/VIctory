@@ -1800,6 +1800,47 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // After the program that resolves the indirect light: the ambient
+        // light in its place (`crate::ambient`); the title's bindings go
+        // back on the list before its next command.
+        if self.ambient(list, p) {
+            self.host_state_lost();
+        }
+    }
+
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves that. Whether our bindings replaced the title's.
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(crate::descriptor::View::Unordered(r, ..)) => r,
+            other => {
+                once!(
+                    view = ?other.map(|v| std::mem::discriminant(&v)),
+                    "no ambient light: the light resolve's output is not a plain image view here"
+                );
+                return false;
+            }
+        };
+        if light == 0 {
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(crate::descriptor::View::Shader(r, _)) if r != 0 => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// Counts a draw; one whose shaders store to memory may have written
