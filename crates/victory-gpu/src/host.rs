@@ -1756,6 +1756,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Card copies made between host copies of the same title memory
+    /// ([`HostList::copy_aliased`]): (reader, write step, from, to).
+    aliased: std::collections::HashSet<(usize, usize, usize, usize)>,
+    /// Copies those card copies wrote, alive until the list is reset.
+    held: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2252,6 +2257,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// `VICTORY_ALIAS_COPIES` (on; `=0` off): [`HostList::copy_aliased`].
+fn alias_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Bytes copied on the card by [`HostList::copy_aliased`].
+static ALIAS_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Two host copies of the same title memory (a title buffer inside
 /// another, aliased buffers, a window beside a buffer): shaders write one,
 /// and a submission refreshes the other from title memory.
@@ -2272,18 +2286,22 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SETTLE").is_none_or(|v| v != "0"));
     let flights: Vec<(usize, usize)> = if behind { line().written.clone() } else { Vec::new() };
     // This submission's writes so far, by copy: (copy, from, to).
-    let mut own: Vec<(usize, usize, usize, (u64, u64))> = Vec::new();
+    // (In the same list the writes are copied on the card when the copy is
+    // refreshed after them: [`HostList::copy_aliased`]; only other lists'
+    // count.)
+    let copied = alias_copies();
+    let mut own: Vec<(usize, usize, usize, (u64, u64), usize)> = Vec::new();
     let mut settle = false;
-    for list in runs {
+    for (n, list) in runs.iter().enumerate() {
         for step in &list.deferred().copies {
             match step {
                 Step::GpuWrite(shadow, address, len) => {
-                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
+                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span(), n));
                 }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let me = Arc::as_ptr(shadow) as usize;
-                    if let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
+                    if let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from && !(copied && w.4 == n)) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
@@ -5160,6 +5178,81 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+        if alias_copies() {
+            self.copy_aliased(&mut deferred, shadow, address, len);
+        }
+    }
+
+    /// Another host copy of the same title memory that this list's shaders
+    /// wrote earlier (a title buffer inside a window, aliased buffers): the
+    /// refresh takes title memory before the list runs, so the bytes those
+    /// shaders write would reach `shadow` only after the copy-back, a frame
+    /// or more late. They are copied on the card now instead, in the list's
+    /// order: after the writes, before what reads `shadow`
+    /// ([`aliased_under_flights`] counts what is left).
+    fn copy_aliased(&self, deferred: &mut Deferred, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        use std::sync::Arc;
+        let me = Arc::as_ptr(shadow) as usize;
+        let (start, size) = shadow.span();
+        let (lo, hi) = (address.max(start as usize), (address + len).min((start + size) as usize));
+        if lo >= hi {
+            return;
+        }
+        let mut copies: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        for (index, step) in deferred.copies.iter().enumerate() {
+            let Step::GpuWrite(writer, a, l) = step else {
+                continue;
+            };
+            let them = Arc::as_ptr(writer) as usize;
+            let (ws, wl) = writer.span();
+            let (from, to) = ((*a).max(lo).max(ws as usize), (*a + *l).min(hi).min((ws + wl) as usize));
+            if them == me || from >= to {
+                continue;
+            }
+            // Once per write step and reader range.
+            if !deferred.aliased.insert((me, index, from, to)) {
+                continue;
+            }
+            copies.push((writer.clone(), from, to));
+        }
+        if copies.is_empty() {
+            return;
+        }
+        let mut barrier = [D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        }];
+        // SAFETY: an open list; both copies live until the list is reset (its
+        // steps hold them) and the ranges lie in both.
+        unsafe {
+            self.list.ResourceBarrier(&barrier);
+            for (writer, from, to) in &copies {
+                self.list.CopyBufferRegion(
+                    &shadow.buffer,
+                    shadow.offset(*from as u64),
+                    &writer.buffer,
+                    writer.offset(*from as u64),
+                    (*to - *from) as u64,
+                );
+                ALIAS_COPIED.fetch_add((*to - *from) as u64, Ordering::Relaxed);
+            }
+            self.list.ResourceBarrier(&barrier);
+        }
+        // SAFETY: the barrier's union holds a ManuallyDrop of None.
+        unsafe { std::mem::ManuallyDrop::drop(&mut barrier[0].Anonymous.UAV) };
+        deferred.held.push(shadow.clone());
+        static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TIMES.fetch_add(copies.len() as u64, Ordering::Relaxed);
+        if n == 0 || n / 10_000 != (n + copies.len() as u64) / 10_000 {
+            tracing::info!(
+                copies = n + copies.len() as u64,
+                mb = ALIAS_COPIED.load(Ordering::Relaxed) >> 20,
+                "card copies between host copies of the same title memory, after the writes in the list (VICTORY_ALIAS_COPIES=0 turns them off)"
+            );
         }
     }
 
