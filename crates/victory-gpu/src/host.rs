@@ -2511,22 +2511,22 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SETTLE").is_none_or(|v| v != "0"));
     let flights: Vec<(usize, usize)> = if behind { line().written.clone() } else { Vec::new() };
     // This submission's writes so far, by copy: (copy, from, to).
-    // (In the same list the writes are copied on the card when the copy is
-    // refreshed after them: [`HostList::copy_aliased`]; only other lists'
-    // count.)
+    // (With `VICTORY_ALIAS_COPIES` on they are copied on the card: in the
+    // same list by [`HostList::copy_aliased`], from earlier lists by
+    // [`cross_list_copies`]; then only flights count.)
     let copied = alias_copies();
-    let mut own: Vec<(usize, usize, usize, (u64, u64), usize)> = Vec::new();
+    let mut own: Vec<(usize, usize, usize, (u64, u64))> = Vec::new();
     let mut settle = false;
-    for (n, list) in runs.iter().enumerate() {
+    for list in runs {
         for step in &list.deferred().copies {
             match step {
                 Step::GpuWrite(shadow, address, len) => {
-                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span(), n));
+                    own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
                 }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let me = Arc::as_ptr(shadow) as usize;
-                    if let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from && !(copied && w.4 == n)) {
+                    if let Some(w) = own.iter().find(|w| !copied && w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
@@ -2554,6 +2554,113 @@ fn alias_note(flight: bool, reader: (u64, u64), range: (usize, usize), writer: O
             range = format_args!("{:#x}+{:#x}", range.0, range.1 - range.0),
             writer = format_args!("{}", writer.map_or("-".to_owned(), |w| format!("{:#x}+{:#x}", w.0, w.1))),
             "a host copy refreshed from title memory that another copy of it is written in"
+        );
+    }
+}
+
+/// A card copy made before a list runs: (reader, writer, from, to), title
+/// addresses inside both host copies.
+type CrossCopy = (std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Per list of `runs`: the ranges of host copies it refreshes that an
+/// earlier list of the same submission writes through another host copy of
+/// the same title memory (a title buffer inside a window, aliased buffers).
+/// The refresh is done on the CPU before any list runs, so without a copy
+/// the list would read the bytes from before those writes, a submission or
+/// more late (pedestrians' bodies drawn as spikes: skinned vertices of an
+/// earlier frame). The copies go in the list's prelude, which runs after
+/// the earlier lists. A list's own writes after the one copied win over it:
+/// the copy of that range is dropped.
+fn cross_list_copies(runs: &[&HostList]) -> Vec<Vec<CrossCopy>> {
+    use std::sync::Arc;
+    let mut out: Vec<Vec<CrossCopy>> = Vec::with_capacity(runs.len());
+    // Writes of the lists before, in submission order.
+    let mut written: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        let mut copies: Vec<CrossCopy> = Vec::new();
+        let mut seen: std::collections::HashSet<(usize, usize, usize, usize)> = std::collections::HashSet::new();
+        for step in &deferred.copies {
+            let Step::Refresh(reader, address, len) = step else {
+                continue;
+            };
+            let me = Arc::as_ptr(reader) as usize;
+            let (rs, rl) = reader.span();
+            let (lo, hi) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
+            if lo >= hi {
+                continue;
+            }
+            // In order: a later write of the reader itself takes back what
+            // an earlier copy would bring.
+            let mut wanted: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            for (writer, a, l) in &written {
+                let them = Arc::as_ptr(writer) as usize;
+                let (ws, wl) = writer.span();
+                let (from, to) = ((*a).max(lo).max(ws as usize), (*a + *l).min(hi).min((ws + wl) as usize));
+                if from >= to {
+                    continue;
+                }
+                if them == me {
+                    wanted.retain(|w| w.2 <= from || w.1 >= to);
+                } else {
+                    wanted.push((writer.clone(), from, to));
+                }
+            }
+            for (writer, from, to) in wanted {
+                if seen.insert((me, Arc::as_ptr(&writer) as usize, from, to)) {
+                    copies.push((reader.clone(), writer, from, to));
+                }
+            }
+        }
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                written.push((shadow.clone(), *address, *len));
+            }
+        }
+        out.push(copies);
+    }
+    out
+}
+
+/// Records `copies` ([`cross_list_copies`]) between UAV barriers: the
+/// earlier lists' shader writes are done before, and the list's shaders
+/// read after.
+fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
+    let mut barrier = [D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        },
+    }];
+    let mut bytes = 0u64;
+    // SAFETY: an open list; the copies are held by the list's steps until
+    // it is reset, and the ranges lie in both.
+    unsafe {
+        list.ResourceBarrier(&barrier);
+        for (reader, writer, from, to) in copies {
+            list.CopyBufferRegion(
+                &reader.buffer,
+                reader.offset(*from as u64),
+                &writer.buffer,
+                writer.offset(*from as u64),
+                (*to - *from) as u64,
+            );
+            bytes += (*to - *from) as u64;
+        }
+        list.ResourceBarrier(&barrier);
+    }
+    // SAFETY: the barrier's union holds a ManuallyDrop of None.
+    unsafe { std::mem::ManuallyDrop::drop(&mut barrier[0].Anonymous.UAV) };
+    ALIAS_COPIED.fetch_add(bytes, Ordering::Relaxed);
+    static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let k = copies.len() as u64;
+    let n = TIMES.fetch_add(k, Ordering::Relaxed);
+    if n == 0 || n / 10_000 != (n + k) / 10_000 {
+        tracing::info!(
+            copies = n + k,
+            mb = ALIAS_COPIED.load(Ordering::Relaxed) >> 20,
+            "card copies between host copies of the same title memory, from earlier lists of a submission (VICTORY_ALIAS_COPIES=0 turns them off)"
         );
     }
 }
@@ -4718,10 +4825,12 @@ impl Host {
         } else if !behind {
             aliased_under_flights(runs, false);
         }
-        for list in runs {
+        let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
+        for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let aliased = crossed.get_mut(n).map(std::mem::take).unwrap_or_default();
+            if let Some(prelude) = list.prelude(aliased) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -5453,7 +5562,11 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    ///
+    /// `aliased`: copies on the card, before the list, from host copies
+    /// that earlier lists of the submission wrote into the host copies of
+    /// the same title memory this list refreshed ([`cross_list_copies`]).
+    fn prelude(&self, aliased: Vec<CrossCopy>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -5514,7 +5627,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && aliased.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5538,11 +5651,21 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                if !aliased.is_empty() {
+                    record_cross_copies(list, &aliased);
+                }
                 list.Close()
             })
         };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        if !aliased.is_empty() {
+            let mut deferred = self.deferred();
+            for (reader, writer, ..) in aliased {
+                deferred.held.push(reader);
+                deferred.held.push(writer);
+            }
         }
         list.cast().ok()
     }
