@@ -593,6 +593,7 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        let start = std::time::Instant::now();
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -603,7 +604,11 @@ fn check(
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
                 if t.list {
-                    t.lines.push(format!("{}  pipeline created", label()));
+                    t.lines.push(format!(
+                        "{}  pipeline created in {:.1} s",
+                        label(),
+                        start.elapsed().as_secs_f32()
+                    ));
                 }
             }
             Err(e) => t.fail(format!("pipeline: {e}"), &label),

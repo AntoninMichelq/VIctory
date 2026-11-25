@@ -459,6 +459,12 @@ impl Shader {
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        // Whatever the passes, a branch on a constant goes one way: the
+        // lowering branches on literal lane skips, and a big program left
+        // with every never-taken side (ScreenProbes 39f0e9ae: 22k blocks,
+        // joins of 1.9k ways in) takes the driver's compiler minutes and
+        // gigabytes. Exact and structural only.
+        let passes = passes | super::bitcode::opt::BRANCHES;
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
