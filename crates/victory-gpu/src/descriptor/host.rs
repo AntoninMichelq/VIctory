@@ -999,6 +999,36 @@ impl HostHeap {
         true
     }
 
+    /// Makes null again the title slots (not the dynamic ones, which lists
+    /// recorded may still read) that show one of the host textures `old`
+    /// (raw pointers), and queues them for the texture pass from the next
+    /// frame; a draw that reads one through a table makes it again first.
+    /// Returns how many there were.
+    pub(crate) fn unmake_views_of(&self, old: &[*mut std::ffi::c_void]) -> usize {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let hits: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.iter()
+                .take(self.count as usize)
+                .enumerate()
+                .filter(|(_, k)| k.as_ref().is_some_and(|k| old.contains(&windows::core::Interface::as_raw(k))))
+                .map(|(i, _)| i as u32)
+                .collect()
+        };
+        for &i in &hits {
+            self.unmake(&mut made, i);
+        }
+        drop(made);
+        if !hits.is_empty() {
+            let frame = crate::frame::current();
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &i in &hits {
+                textures.written(i, frame, frame + 1, false);
+            }
+        }
+        hits.len()
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -2059,7 +2089,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 // A host copy that starts some levels down: the view's
                 // levels move up with it.
-                let skip = crate::resource::skipped_mips(resource);
+                // (By the host copy itself: see `crate::resource::skip_for`.)
+                let skip = crate::resource::texture_memory(resource)
+                    // SAFETY: a live resource.
+                    .map_or(0, |(_, d)| crate::resource::skip_for(&d, unsafe { texture.GetDesc() }.Width));
                 if skip > 0
                     && let Some(d) = desc.as_mut()
                 {

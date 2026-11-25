@@ -1769,7 +1769,7 @@ impl State {
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
                 let staging = std::time::Instant::now();
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, false);
                 HEAP_SPLIT_US[4].fetch_add(staging.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // A texture view the host refuses removes the device: name it.
@@ -2161,7 +2161,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, true);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2286,7 +2286,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, true);
                     }
                 }
                 for k in selected {
@@ -2297,7 +2297,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, true);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2335,7 +2335,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, true);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2976,7 +2976,9 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// `drawn`: a draw reads it (not the pass over textures picked by index):
+/// noted for `crate::resource::loading_full_frame`.
+fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3000,6 +3002,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            if drawn {
+                crate::resource::note_drawn(*resource as This);
+            }
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -3149,13 +3154,19 @@ fn loading_frame(frame: u64) -> bool {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(400)
     });
-    if SEEN.swap(frame, Ordering::Relaxed) != frame {
+    let ended = SEEN.swap(frame, Ordering::Relaxed);
+    if ended != frame {
         // Draws asked for, not run: a world frame whose pipelines are
         // still being made drops most of its draws and is no loading one
         // (cold run bd5b339 A kept starting every pipeline in the world).
         let now = ASKED.load(Ordering::Relaxed);
         let before = AT_START.swap(now, Ordering::Relaxed);
-        LAST.store(now.saturating_sub(before), Ordering::Relaxed);
+        let drew = now.saturating_sub(before);
+        LAST.store(drew, Ordering::Relaxed);
+        // The pictures the frame that ended drew go full size if it was a
+        // loading screen's.
+        #[cfg(windows)]
+        crate::resource::loading_full_frame(ended, most > 0 && drew < most);
     }
     let last = LAST.load(Ordering::Relaxed);
     most > 0 && last < most
