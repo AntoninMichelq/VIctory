@@ -46,3 +46,10 @@ pub fn record<R>(
     });
     out
 }
+
+/// Monotonic GPU timing totals since start: `(card_idle_us, gpu_wait_us,
+/// clock_signals)`. `clock_signals > 0` means the host card clock is active
+/// and `dt_wall - dt_idle` measures the card's busy time over an interval.
+pub fn card_totals_us() -> (u64, u64, u64) {
+    crate::host::card_totals_us()
+}
