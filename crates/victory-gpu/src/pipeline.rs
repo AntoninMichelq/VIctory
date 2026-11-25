@@ -434,6 +434,8 @@ struct Pipeline {
 #[cfg(windows)]
 struct Precompiled {
     registers: crate::precompiled::GraphicsRegisters,
+    /// The input layout of the info section.
+    inputs: Vec<crate::precompiled::InputElement>,
     variants: crate::precompiled::Variants<make::Pending>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
@@ -479,7 +481,7 @@ pub(crate) fn host_pipeline<'a>(
         return make::ready(&p.host);
     };
     let (variant, new) = pre.variants.get(targets, || {
-        let state = host::GraphicsState::precompiled(&pre.registers, targets);
+        let state = host::GraphicsState::precompiled(&pre.registers, &pre.inputs, targets);
         make::Pending::new(p.shaders.clone(), Some(Box::new(state)))
     });
     if new {
@@ -1042,9 +1044,10 @@ mod pack {
 /// whose host pipelines are made at its draws, its state read from the
 /// registers section ([`Precompiled`]); anything else is left (`None`),
 /// and the stages found are returned for the log.
-/// shortcut: the info and map sections (which the container has in its
-/// own form) are ignored, and what of the registers section
-/// [`crate::precompiled::GraphicsRegisters`] does not read.
+/// shortcut: the map sections (which the container has in its own form)
+/// are ignored, and what of the registers and info sections
+/// [`crate::precompiled::GraphicsRegisters`] and
+/// [`crate::precompiled::input_layout`] do not read.
 #[cfg(windows)]
 pub(crate) fn create_from_words(
     slot: usize,
@@ -1130,15 +1133,20 @@ pub(crate) fn create_from_words(
         )
         && found.len() == 2
     {
-        let mut dwords = Vec::new();
-        if let Some(r) = d.sections.iter().find(|s| s.role == crate::precompiled::Role::Registers)
-            && r.size <= 0x1000
-        {
-            let mut bytes = vec![0u8; r.size as usize];
-            if read(r.address as usize, &mut bytes) {
-                dwords = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-            }
-        }
+        let section = |role| {
+            let s = d.sections.iter().find(|s| s.role == role).filter(|s| s.size <= 0x1000)?;
+            let mut bytes = vec![0u8; s.size as usize];
+            read(s.address as usize, &mut bytes).then_some(bytes)
+        };
+        let dwords: Vec<u32> = section(crate::precompiled::Role::Registers)
+            .map(|b| b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
+            .unwrap_or_default();
+        let inputs = section(crate::precompiled::Role::Info)
+            .and_then(|b| crate::precompiled::input_layout(&b))
+            .unwrap_or_else(|| {
+                note_once("an info section without a readable input layout: none");
+                Vec::new()
+            });
         let (registers, notes) = crate::precompiled::GraphicsRegisters::decode(&dwords);
         for note in notes {
             note_once(note);
@@ -1146,6 +1154,7 @@ pub(crate) fn create_from_words(
         let shaders = vec![vs.clone(), ps.clone()];
         let precompiled = Box::new(Precompiled {
             registers,
+            inputs,
             variants: Default::default(),
         });
         return (Some(hand_out(shaders, None, Some(precompiled), iid, out)), stages);
@@ -1445,6 +1454,7 @@ mod pack_diag {
         ) else {
             return;
         };
+        let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
         let file = std::fs::read(&pack).unwrap();
         let records: Vec<_> = victory_game::sgd5::records(&file).collect();
         let index = crate::precompiled::PackIndex::build(
@@ -1478,5 +1488,147 @@ mod pack_diag {
         }
         println!("programs {looked}, not found {missing:?}");
         assert!(missing.is_empty());
+        // Each graphics description's input layout reads, and names every
+        // input its vertex shader reads.
+        #[cfg(feature = "diagnostics")]
+        for n in 0..64 {
+            let file = |part: &str| std::fs::read(std::path::Path::new(&dir).join(format!("1c8-{n:02}-{part}.bin")));
+            let (Ok(info), Ok(code)) = (file("Info"), file("Code(1)")) else { continue };
+            let layout = crate::precompiled::input_layout(&info).unwrap_or_else(|| panic!("{n}: no layout"));
+            let container = index
+                .find(&code)
+                .and_then(|at| records.iter().find(|r| r.offset == at)?.unpack())
+                .unwrap();
+            let vs = super::shader("vertex", &container);
+            let reads = super::rect_diag::vertex_inputs(&vs.translated().unwrap().host.dxil);
+            let named = |e: &crate::precompiled::InputElement| {
+                layout.iter().any(|l| l.name == e.name && l.index == e.index)
+            };
+            let summary: Vec<String> = layout.iter().map(|e| format!("{}{} {} @{}", e.name, e.index, e.format, e.offset)).collect();
+            println!("1c8-{n:02} layout {summary:?}");
+            assert!(reads.iter().all(named), "{n}: the vertex shader reads {reads:?}");
+            // The host pipeline of the whole description, drawn into one
+            // RGBA8 target as triangles and as rectangles.
+            let (Ok(regs), Ok(ps_code)) = (file("Registers"), file("Code(0)")) else { continue };
+            let dwords: Vec<u32> = regs.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            let (registers, _) = crate::precompiled::GraphicsRegisters::decode(&dwords);
+            let ps_container = index
+                .find(&ps_code)
+                .and_then(|at| records.iter().find(|r| r.offset == at)?.unpack())
+                .unwrap();
+            let ps = super::shader("pixel", &ps_container);
+            if crate::host::host().is_none() {
+                continue;
+            }
+            for topology in [4, 17] {
+                let targets = crate::precompiled::Targets::new(&[28], 0, 1).drawing(topology);
+                let g = super::host::GraphicsState::precompiled(&registers, &layout, &targets);
+                let made = super::host::HostPipeline::new(&[vs.clone(), ps.clone()], Some(&g));
+                let made = made.unwrap_or_else(|| panic!("1c8-{n:02} topology {topology}: refused"));
+                assert!(topology != 17 || made.rects, "1c8-{n:02}: no rectangle geometry stage");
+            }
+        }
+    }
+}
+
+/// Diagnostics, run by hand on the host GPU: the rectangle pipelines of the
+/// precompiled vertex and pixel shaders named by `VICTORY_RECT_PAIRS`
+/// (`<vertex hash>/<pixel hash>,...`, as the log names them), taken from
+/// the shader pack, with an input layout made from the vertex shader's
+/// inputs; they are to be made with their rectangle geometry stage
+/// (`VICTORY_D3D12_DEBUG=1` adds the debug layer's messages, where it is
+/// installed): `VICTORY_SHADER_PACK=<shaders.rpf> VICTORY_RECT_PAIRS=...
+/// cargo test -p victory-gpu --features diagnostics --lib rect_pairs --
+/// --ignored --nocapture`.
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod rect_diag {
+    /// The non-system inputs of a DXIL vertex shader's input signature as
+    /// one buffer of 32-bit floats, packed in order.
+    pub(super) fn vertex_inputs(dxil: &[u8]) -> Vec<crate::precompiled::InputElement> {
+        let Ok(c) = victory_shader::Container::parse(dxil) else { return Vec::new() };
+        let Some(part) = c.part(victory_shader::FourCC::ISG1) else { return Vec::new() };
+        let d = part.data;
+        let word = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+        let mut offset = 0;
+        let mut out = Vec::new();
+        for i in 0..word(0) as usize {
+            let at = 8 + 32 * i;
+            let (name_at, index, system) = (word(at + 4) as usize, word(at + 8), word(at + 12));
+            if system != 0 {
+                continue;
+            }
+            let end = d[name_at..].iter().position(|&b| b == 0).unwrap();
+            let name = String::from_utf8_lossy(&d[name_at..name_at + end]).into_owned();
+            let columns = (d[at + 24] & 0xf).count_ones();
+            // R32_FLOAT, R32G32_FLOAT, R32G32B32_FLOAT, R32G32B32A32_FLOAT.
+            let format = [41, 16, 6, 2][columns.clamp(1, 4) as usize - 1];
+            out.push(crate::precompiled::InputElement {
+                name,
+                index,
+                format,
+                slot: 0,
+                offset,
+                per_instance: false,
+                step_rate: 0,
+            });
+            offset += 4 * columns;
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "reads the title's shader pack and needs the host GPU"]
+    fn rect_pairs_make_their_pipelines() {
+        let (Some(pack), Ok(pairs)) = (
+            std::env::var_os("VICTORY_SHADER_PACK"),
+            std::env::var("VICTORY_RECT_PAIRS"),
+        ) else {
+            return;
+        };
+        // The pipelines' own log lines, the host's messages among them.
+        let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+        if crate::host::host().is_none() {
+            return;
+        }
+        let wanted: Vec<(String, String)> = pairs
+            .split(',')
+            .filter_map(|p| p.split_once('/'))
+            .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+            .collect();
+        let file = std::fs::read(&pack).unwrap();
+        let mut by_hash = std::collections::HashMap::new();
+        for r in victory_game::sgd5::records(&file) {
+            let Some(c) = r.unpack() else { continue };
+            let hash = blake3::hash(&c).to_hex()[..16].to_owned();
+            if wanted.iter().any(|(v, p)| *v == hash || *p == hash) {
+                by_hash.insert(hash, c);
+            }
+        }
+        let targets = crate::precompiled::Targets::new(&[28], 0, 1).drawing(17);
+        let registers = crate::precompiled::GraphicsRegisters::console_defaults();
+        for (v, p) in &wanted {
+            let (Some(vc), Some(pc)) = (by_hash.get(v), by_hash.get(p)) else {
+                println!("{v}/{p}: not in the pack");
+                continue;
+            };
+            let vs = super::shader("vertex", vc);
+            let ps = super::shader("pixel", pc);
+            // The vertex shader's inputs as one buffer of floats, in order
+            // (the description's own layout is not at hand here).
+            let inputs = vs
+                .translated()
+                .map(|t| vertex_inputs(&t.host.dxil))
+                .unwrap_or_default();
+            let g = super::host::GraphicsState::precompiled(&registers, &inputs, &targets);
+            let Some(made) = super::host::HostPipeline::new(&[vs.clone(), ps.clone()], Some(&g)) else {
+                panic!(
+                    "{v}/{p}: no pipeline; translated {} {}",
+                    vs.translated().is_some(),
+                    ps.translated().is_some()
+                );
+            };
+            println!("{v}/{p}: made, rectangle geometry stage {}", made.rects);
+            assert!(made.rects, "{v}/{p}: made without its rectangle geometry stage");
+        }
     }
 }

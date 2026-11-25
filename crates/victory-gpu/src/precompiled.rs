@@ -15,7 +15,8 @@
 //! registers     0x1c bytes (compute: register values, e.g. 0x4005cf00
 //!               first); 0x184 or 0x18c (graphics)
 //! info          0x14 bytes (compute: u32 hash, u32 3, zeros); 0x50-0xbc
-//!               (graphics: u32 hash, u32 0x1000, ...)
+//!               (graphics: u32 hash, u32 0x1000, ..., the input layout,
+//!               see [`input_layout`])
 //! code          GFX10 machine code: made from the native program of one
 //!               of the title's shader containers (its hashed prologue
 //!               words kept, see [`program_key`]), followed by s_code_end
@@ -636,6 +637,82 @@ fn stencil_op(op: u32, op_value: u32, notes: &mut Vec<&'static str>) -> u32 {
     }
 }
 
+/// One vertex input of a graphics description's input layout
+/// ([`input_layout`]), as `D3D12_INPUT_ELEMENT_DESC` has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputElement {
+    pub name: String,
+    pub index: u32,
+    /// The title's DXGI format.
+    pub format: u32,
+    pub slot: u32,
+    pub offset: u32,
+    pub per_instance: bool,
+    pub step_rate: u32,
+}
+
+/// The input layout a graphics description's info section holds; `None`
+/// if the section does not read as one.
+///
+/// ```text
+/// 0x38  u32 bytes of the layout (from 0x4c, padding not counted)
+/// 0x4c  u32 element count, then per element:
+///       u32 name length (its zero included), the name,
+///       u32 semantic index, u32 format, u32 input slot,
+///       u32 byte offset, u32 classification (1 per instance),
+///       u32 instance step rate
+/// ```
+///
+/// Read from the 64 descriptions dumped: e.g. `POSITION` R32G32B32_FLOAT
+/// at 0, `COLOR` R8G8B8A8_UNORM at 12, `TEXCOORD` R32G32_FLOAT at 16; a
+/// section of 0x50 bytes has a count of 0. Without it a host pipeline
+/// whose vertex shader reads inputs is refused (`E_INVALIDARG`, run 47).
+pub fn input_layout(info: &[u8]) -> Option<Vec<InputElement>> {
+    const START: usize = 0x4c;
+    const MAX_ELEMENTS: usize = 32;
+    const MAX_NAME: usize = 64;
+    let word = |at: usize| {
+        info.get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let bytes = word(0x38)? as usize;
+    let end = START.checked_add(bytes).filter(|&e| e <= info.len())?;
+    let count = word(START)? as usize;
+    if count > MAX_ELEMENTS {
+        return None;
+    }
+    let mut at = START + 4;
+    let mut elements = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = word(at)? as usize;
+        if !(2..=MAX_NAME).contains(&len) {
+            return None;
+        }
+        let name = info.get(at + 4..at + 4 + len)?;
+        let (&zero, name) = name.split_last()?;
+        if zero != 0 || !name.iter().all(|c| c.is_ascii_graphic()) {
+            return None;
+        }
+        let fields = at + 4 + len;
+        let field = |i: usize| word(fields + 4 * i);
+        let class = field(4)?;
+        if class > 1 {
+            return None;
+        }
+        elements.push(InputElement {
+            name: String::from_utf8(name.to_vec()).ok()?,
+            index: field(0)?,
+            format: field(1)?,
+            slot: field(2)?,
+            offset: field(3)?,
+            per_instance: class == 1,
+            step_rate: field(5)?,
+        });
+        at = fields + 24;
+    }
+    (at <= end).then_some(elements)
+}
+
 /// What a graphics pipeline of method 0x1c8 is made for besides its
 /// description: what the draw that uses it has bound (render target and
 /// depth formats as the host has them, their number, samples) and the
@@ -910,6 +987,91 @@ mod tests {
         more.merge(index);
         assert_eq!(more.find(&program(4, 100)), Some(0x2000));
         assert_eq!(more.find(&padded), Some(0x100));
+    }
+
+    /// An info section holding `elements` (name, index, format, slot,
+    /// offset, classification, step rate), laid out as the title's.
+    fn info(elements: &[(&str, [u32; 6])]) -> Vec<u8> {
+        let mut layout = le(&[elements.len() as u32]);
+        for (name, fields) in elements {
+            layout.extend(le(&[name.len() as u32 + 1]));
+            layout.extend(name.as_bytes());
+            layout.push(0);
+            layout.extend(le(fields));
+        }
+        let mut info = le(&[
+            0x76e7_bc07,
+            0x1000,
+            0,
+            1,
+            0x1c,
+            0,
+            0,
+            u32::MAX,
+            0,
+            0x3_0100,
+            1,
+            0,
+            0,
+            0,
+        ]);
+        info.extend(le(&[layout.len() as u32, 0xc, 0, 0, 0]));
+        assert_eq!(info.len(), 0x4c);
+        info.extend(&layout);
+        info.resize(info.len().next_multiple_of(4), 0);
+        info
+    }
+
+    #[test]
+    fn reads_input_layouts() {
+        let section = info(&[
+            ("POSITION", [0, 6, 0, 0, 0, 0]),
+            ("COLOR", [0, 28, 0, 12, 0, 0]),
+            ("TEXCOORD", [0, 16, 0, 16, 0, 0]),
+        ]);
+        // As description 00 holds it, byte for byte from 0x38 on.
+        assert_eq!(section.len(), 188);
+        assert_eq!(&section[0x50..0x5d], b"\x09\0\0\0POSITION\0");
+        let layout = input_layout(&section).unwrap();
+        let summary: Vec<_> = layout
+            .iter()
+            .map(|e| (e.name.as_str(), e.format, e.offset))
+            .collect();
+        assert_eq!(
+            summary,
+            [("POSITION", 6, 0), ("COLOR", 28, 12), ("TEXCOORD", 16, 16)]
+        );
+        assert!(
+            layout
+                .iter()
+                .all(|e| e.slot == 0 && !e.per_instance && e.index == 0)
+        );
+        // Per instance, a second slot, a semantic index.
+        let layout = input_layout(&info(&[("TEXCOORD", [3, 2, 1, 8, 1, 1])])).unwrap();
+        assert_eq!(
+            layout,
+            [InputElement {
+                name: "TEXCOORD".into(),
+                index: 3,
+                format: 2,
+                slot: 1,
+                offset: 8,
+                per_instance: true,
+                step_rate: 1
+            }]
+        );
+        // None (a section of 0x50 bytes).
+        assert_eq!(input_layout(&info(&[])), Some(Vec::new()));
+        // What does not read: cut short, a name without its zero, an
+        // unknown classification, a stated size past the section.
+        assert_eq!(input_layout(&section[..0x90]), None);
+        let mut no_zero = section.clone();
+        no_zero[0x5c] = b'X';
+        assert_eq!(input_layout(&no_zero), None);
+        assert_eq!(input_layout(&info(&[("COLOR", [0, 28, 0, 0, 2, 0])])), None);
+        let mut long = section.clone();
+        long[0x38] = 0xff;
+        assert_eq!(input_layout(&long), None);
     }
 
     /// What the title hands a method of a container's program: a third

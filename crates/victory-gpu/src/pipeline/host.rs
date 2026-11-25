@@ -205,15 +205,37 @@ impl GraphicsState {
     }
 
     /// The state of a precompiled graphics pipeline ([`crate::precompiled`])
-    /// drawn into `t`: what its registers section holds (`r`), the targets,
-    /// samples and topology type of the draw, and D3D12's defaults for the
-    /// rest (no input layout, sample mask all, no depth bias, no alpha to
-    /// coverage).
+    /// drawn into `t`: what its registers section holds (`r`), the input
+    /// layout of its info section (`inputs`), the targets, samples and
+    /// topology type of the draw, and D3D12's defaults for the rest (sample
+    /// mask all, no depth bias, no alpha to coverage).
     pub(crate) fn precompiled(
         r: &crate::precompiled::GraphicsRegisters,
+        inputs: &[crate::precompiled::InputElement],
         t: &crate::precompiled::Targets,
     ) -> GraphicsState {
         let mut g = GraphicsState::default();
+        g.names = inputs
+            .iter()
+            .map(|e| CString::new(e.name.as_str()).unwrap_or_default())
+            .collect();
+        g.inputs = inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: if e.per_instance {
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                } else {
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                },
+                InstanceDataStepRate: e.step_rate,
+            })
+            .collect();
         g.blend.IndependentBlendEnable = true.into();
         for (i, target) in g.blend.RenderTarget.iter_mut().enumerate() {
             let b = &r.blend[i];

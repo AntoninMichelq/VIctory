@@ -144,14 +144,39 @@ against GFX10's public register layouts:
 | 74 | `0x19fc0130` (47), `...01c0`, `...0120` | likely `DB_SHADER_CONTROL`: Z order in bits 4-5 (late Z with kill, bit 6, in `0x1c0`); nothing D3D12 needs |
 | 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
 
-What the host pipeline gets beyond these: no input layout (none is in the
-description; see Open), sample mask all, no depth bias, no alpha to
-coverage, D3D12's nearest for what has no exact equal (constant alpha
+What the host pipeline gets beyond these: the input layout of the info
+section (below), sample mask all, no depth bias, no alpha to coverage, D3D12's nearest for what has no exact equal (constant alpha
 blend factors as the blend factor, stencil ops `ONES` and
 replace-by-op-value as replace, logic stencil ops as keep, both faces
 culled as none). A registers section shorter than 60 dwords or unreadable
 gets the console's reset state (no blending, all written, no depth or
 stencil test, no culling, solid, clipped), logged once.
+
+## Graphics info: the input layout
+
+The graphics info section (0x50-0xbc bytes) holds the vertex input layout
+(`precompiled::input_layout`), the formats in the title's DXGI numbering:
+
+```text
+0x00  u32 hash, u32 0x1000, ...
+0x38  u32 bytes of the layout (from 0x4c, padding not counted)
+0x4c  u32 element count, then per element:
+      u32 name length (its zero included), the name,
+      u32 semantic index, u32 format, u32 input slot,
+      u32 byte offset, u32 classification (1 per instance),
+      u32 instance step rate
+```
+
+In the 64 dumped: `POSITION` R32G32B32_FLOAT at 0, `COLOR` R8G8B8A8_UNORM
+at 12, `TEXCOORD` R32G32_FLOAT at 16 (the most common); `COLOR` at 0 and
+`POSITION` R32G32_FLOAT at 4; `POSITION` R32G32_FLOAT alone; none (a
+section of 0x50 bytes). Each names every input its vertex shader reads.
+Without it the host refuses a pipeline whose vertex shader reads inputs
+(`E_INVALIDARG`, with or without the rectangle geometry stage): run 47
+dropped the draws of 9 such pipelines drawn as rectangles. With it, all 64
+descriptions dumped are made offline as triangle and rectangle pipelines
+(the rectangles with their geometry stage). The header's other words are
+not read.
 
 **No render target or depth formats are in the description.** On the
 console they come with the targets bound at draw time; a host pipeline
@@ -163,10 +188,7 @@ formats bound then (above).
 
 - Not run in the game yet. Whether the front face reading (bit 2 of dword
   40) is right shows in the 10 of 64 descriptions that cull back faces.
-- The info section (0x50-0xbc bytes) holds the names of the interface
-  between the programs (`POSITION`, `COLOR`, `TEXCOORD`, ...); whether a
-  vertex program reads vertex inputs that need an input layout is not
-  known. The host pipeline has none.
+- The words of the info section's header besides the layout's size.
 - Dwords 63 and 92-96 of the graphics registers.
 - Host pipelines of precompiled pipelines are not started early in later
   runs (their variants appear only at draws).
