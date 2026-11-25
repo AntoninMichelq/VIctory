@@ -2091,6 +2091,42 @@ impl State {
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
+    /// `VICTORY_SCISSOR_PROBE=<hash prefix>,...`: the draws whose pipeline
+    /// names one of those shaders rasterise one pixel (their vertices and
+    /// instances all run). With the timing on, what is left of such a
+    /// draw's time is its geometry and instances, not its pixels. Whether
+    /// it applied (`on`); with `on` false, the title's rectangles again.
+    #[cfg(feature = "diagnostics")]
+    fn scissor_probe(&self, list: &HostList, on: bool) -> bool {
+        static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let wanted = WANTED.get_or_init(|| {
+            std::env::var("VICTORY_SCISSOR_PROBE")
+                .unwrap_or_default()
+                .split(',')
+                .map(|h| h.trim().to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        });
+        if wanted.is_empty() {
+            return false;
+        }
+        if !on {
+            if !self.scissors.is_empty() {
+                crate::draw::scissors(list, &self.scissors);
+            }
+            return false;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        if !wanted.iter().any(|w| p.name.contains(w.as_str())) {
+            return false;
+        }
+        let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+        crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
+        true
+    }
+
     fn mesh_scissor(&self, list: &HostList, on: bool) {
         if mesh_test() != 2 {
             return;
@@ -2869,6 +2905,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let probed = kind != DISPATCH && self.scissor_probe(list, true);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -2883,6 +2921,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if probed {
+            self.scissor_probe(list, false);
         }
         if inline {
             crate::indirect::done(list, &bounded);
