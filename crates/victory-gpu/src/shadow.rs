@@ -163,6 +163,24 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// `VICTORY_CARD_BUFFERS_ROOM` (percent of the card's budget, 80 unless
+/// set, 50 to 98): a big title buffer gets a copy in the card's memory only
+/// while the card's memory in use, with it, stays under this. At 80 the
+/// copies asked for after the world's textures filled the card (past 90 %
+/// of the budget in gameplay) stayed in the PC's memory, snapshotted and
+/// compared on the CPU every submission (`VICTORY_COPY_STATS=1` counts
+/// those refused).
+fn card_room() -> u64 {
+    static ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUFFERS_ROOM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(80)
+            .clamp(50, 98)
+    })
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -218,7 +236,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * card_room()
     {
         crate::copytop::card_refused(2, size);
         return None;
