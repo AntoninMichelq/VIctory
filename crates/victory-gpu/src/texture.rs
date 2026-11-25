@@ -181,6 +181,11 @@ fn pool_take(class: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     };
     let Kept(buffer, data, class) = kept.swap_remove(at);
+    drop(kept);
+    // Zeros, as a new buffer holds: what a partly mapped texture's
+    // detiling leaves out must not be another texture's texels.
+    // SAFETY: the mapping of a buffer of `class` bytes nothing else holds.
+    unsafe { std::ptr::write_bytes(data, 0, class as usize) };
     STAGING_POOL[2].fetch_sub(class, Relaxed);
     STAGING_POOL[1].fetch_add(1, Relaxed);
     Some((buffer, data))
