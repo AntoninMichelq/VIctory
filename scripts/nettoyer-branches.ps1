@@ -26,10 +26,10 @@ if (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -l
   exit 1
 }
 
-function Git { & git @args; if ($LASTEXITCODE -ne 0) { throw "git $args a echoue" } }
+function GitOk { & git.exe @args; if ($LASTEXITCODE -ne 0) { throw "git $args a echoue" } }
 
 if (-not ((git remote) -contains 'fork')) { Git remote add fork $ForkUrl }
-Git fetch fork --prune
+GitOk fetch fork --prune
 
 $current = (git branch --show-current)
 $forkBranches = git ls-remote --heads fork | ForEach-Object { ($_ -split "`t")[1] -replace '^refs/heads/', '' }
@@ -69,13 +69,13 @@ if ($new.Count -gt 0) {
   $blob = (git hash-object -w $tmp)
   $tree = ("100644 blob $blob`tARCHIVE.md" | git mktree)
   $commit = (git commit-tree $tree @parents -m "Archive: branches removed on $date")
-  Git push fork "${commit}:refs/heads/archive/branches"
+  GitOk push fork "${commit}:refs/heads/archive/branches"
   Remove-Item $tmp
 }
 
 for ($i = 0; $i -lt $forkDel.Count; $i += 40) {
   $chunk = $forkDel[$i..([Math]::Min($i + 39, $forkDel.Count - 1))]
-  Git push fork --delete @chunk
+  GitOk push fork --delete @chunk
 }
 
 # Worktrees other than this folder: remove only clean ones on a branch that goes away.
