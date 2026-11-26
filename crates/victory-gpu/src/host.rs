@@ -1605,7 +1605,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1704,7 +1704,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -2109,6 +2109,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Pipeline and root-signature pairs already retained by this recording
+    /// (`VICTORY_TEX_UPLOAD_POOL=1`, Belobug #25 / `6cd310ae`).
+    bound_pipelines: std::collections::HashSet<(usize, usize)>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -6779,34 +6782,53 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// Mapped upload memory for a placed texture footprint. With
+    /// `VICTORY_TEX_UPLOAD_POOL=1` (Belobug #30 / `6cd310ae`), sub-allocates
+    /// 512-byte-aligned ranges from the list's pooled scratch chunks; otherwise
+    /// allocates one upload buffer per copy as before.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        if tex_upload_pool() {
+            let alignment = u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            return self.scratch_in(size, alignment, |buffer, offset, _, data| {
+                (buffer.clone(), offset, data)
+            });
+        }
+        let host = host()?;
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        alignment: u64,
+        use_range: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let result = use_range(&buffer, 0, gpu, data);
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some(result);
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len()
+            && s.used.next_multiple_of(alignment) + len > s.chunks[s.current].1
+        {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -6819,10 +6841,12 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        let at = s.used.next_multiple_of(alignment);
+        let data = (chunk.data + at as usize) as *mut u8;
+        let result = use_range(&chunk.buffer, at, chunk.gpu + at, data);
+        s.used = at + len;
+        Some(result)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -7121,6 +7145,30 @@ impl HostList {
         }
     }
 
+    /// Retains a pipeline and root-signature pair (once per recording when
+    /// `VICTORY_TEX_UPLOAD_POOL=1`, else on every pipeline change as before).
+    pub(crate) fn keep_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        if tex_upload_pool() {
+            let pair = (p.pso.as_raw() as usize, p.root.as_raw() as usize);
+            let mut deferred = self.deferred();
+            if !deferred.bound_pipelines.insert(pair) {
+                return;
+            }
+            if let Ok(pso) = p.pso.cast::<windows::core::IUnknown>() {
+                deferred.kept.push(pso);
+            }
+            if let Ok(root) = p.root.cast::<windows::core::IUnknown>() {
+                deferred.kept.push(root);
+            }
+            drop(deferred);
+            self.used_pipeline(&p.name);
+            return;
+        }
+        self.used_pipeline(&p.name);
+        self.keep(&p.pso);
+        self.keep(&p.root);
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -7292,6 +7340,16 @@ impl HostList {
 /// detiled one after the other on the submitting thread: 230-530 ms a
 /// frame while the world streamed in, 50-70 ms in bursts later (run of
 /// 2026-11-25 02:18).
+/// `VICTORY_TEX_UPLOAD_POOL=1` (off by default, live): pools aligned texture
+/// copy uploads in `HostList`'s scratch chunks and retains each `(pso, root)`
+/// pair at most once per list recording (Belobug #30/#25, `6cd310ae`).
+pub(crate) fn tex_upload_pool() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_TEX_UPLOAD_POOL", |v, _| {
+        u64::from(v.is_some_and(|v| v.trim() == "1"))
+    }) == 1
+}
+
 pub(crate) fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
