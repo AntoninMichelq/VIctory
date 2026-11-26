@@ -3336,6 +3336,20 @@ impl State {
             why("no host signature");
             return false;
         };
+        // Zero records execute nothing on the GPU (`VICTORY_SCOPED_UAV=1`,
+        // PR #2168): skip refresh, clamp dispatch, barriers, and state invalidation.
+        if max == 0 && crate::indirect::scoped_uav() {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(format!("indirect kind {kind} max 0 at {arguments:#x}"), kind == DISPATCH)
+            });
+            if kind == DISPATCH {
+                DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
@@ -3431,19 +3445,43 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                let (bounded, args_at, compact_count) = if windowed && records > 1 {
+                    match crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)) {
+                        Some(b) => (b, 0, None),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
+                } else if count_arg.is_none()
+                    && crate::indirect::indirect_compact()
+                    && records >= crate::indirect::COMPACT_MIN_RECORDS
+                {
+                    match crate::indirect::bound_compact(list, (&args.buffer, offset), (kind, step, records)) {
+                        Some((b, at, cnt)) => (b, at, Some(cnt)),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no compact clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    match crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)) {
+                        Some(b) => (b, 0, None),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
                 };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
-                };
+                if let Some(cnt) = compact_count {
+                    ledger_count = Some(cnt);
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
+                self.window = (windowed && args_at == 0).then(|| Window {
                     copy: args.id(),
                     kind,
                     stride,
@@ -3452,7 +3490,7 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, args_at)
             }
         };
         let ran = match kind {

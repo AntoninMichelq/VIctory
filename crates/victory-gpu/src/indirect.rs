@@ -20,12 +20,62 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
+
+/// Live per-frame cache for `VICTORY_SCOPED_UAV` and `VICTORY_INDIRECT_COMPACT`
+/// (avoids `GetEnvironmentVariableW` per draw while staying toggleable live).
+static LIVE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static LIVE_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn live_flags() -> u8 {
+    let frame = crate::frame::current();
+    if LIVE_FRAME.load(Ordering::Relaxed) != frame {
+        let mut flags = 0u8;
+        if std::env::var_os("VICTORY_SCOPED_UAV").is_some_and(|v| v == "1") {
+            flags |= 1;
+        }
+        if std::env::var_os("VICTORY_INDIRECT_COMPACT").is_some_and(|v| v == "1") {
+            flags |= 2;
+        }
+        LIVE_FLAGS.store(flags, Ordering::Relaxed);
+        LIVE_FRAME.store(frame, Ordering::Relaxed);
+        return flags;
+    }
+    LIVE_FLAGS.load(Ordering::Relaxed)
+}
+
+/// `VICTORY_SCOPED_UAV=1` (PR #2168 `0f616aea`): replace global NULL-resource
+/// UAV barriers around indirect clamps and settlers with targeted UAV barriers
+/// on the actual source/count/budget/ledger buffers, and skip zero-record clamps.
+pub(crate) fn scoped_uav() -> bool {
+    live_flags() & 1 != 0
+}
+
+/// `VICTORY_INDIRECT_COMPACT=1` (PR #2201 `60a649f8`): compact surviving
+/// non-empty indirect records behind a 16-byte compacted count header when no
+/// title count buffer is present and `records >= COMPACT_MIN_RECORDS`.
+pub(crate) fn indirect_compact() -> bool {
+    live_flags() & 2 != 0
+}
+
+/// Minimum record count before stream compaction is enabled (PR #2201).
+pub(crate) const COMPACT_MIN_RECORDS: u32 = 16;
+
+static COMPACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn take_compact_stats() -> [u64; 2] {
+    [
+        COMPACT_STATS[0].swap(0, Ordering::Relaxed),
+        COMPACT_STATS[1].swap(0, Ordering::Relaxed),
+    ]
+}
 
 const SOURCE: &str = r#"
 #ifdef BATCH
@@ -470,7 +520,12 @@ pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, 
     // SAFETY: an open list; our root signature and pipeline; a live ledger
     // the clamps wrote before (the barrier).
     unsafe {
-        list.ResourceBarrier(&[uav_barrier()]);
+        let barrier = if scoped_uav() {
+            uav_barrier_for(ledger)
+        } else {
+            uav_barrier()
+        };
+        list.ResourceBarrier(&[barrier]);
         list.SetComputeRootSignature(&c.root);
         list.SetPipelineState(&c.pso);
         list.SetComputeRoot32BitConstants(0, 1, (&raw const entries).cast(), 0);
@@ -621,6 +676,181 @@ fn validate_layout(
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
+/// Dedicated tiled 64-lane stream-compaction clamp shader (`VICTORY_INDIRECT_COMPACT=1`,
+/// adapted from PR #2201 `60a649f8`). Kept separate from `SOURCE` so it never
+/// interferes with `has_count` bits (`4/8` flat, `16` ledger, `32` CLAMP_BATCH).
+/// Packs surviving `cost > 0` records at byte offset 16 and stores the compacted
+/// count at offset 0.
+const COMPACT_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Record : register(b0) {
+    uint kind;
+    uint stride;
+    uint records;
+    uint args_offset;
+};
+ByteAddressBuffer src_args : register(t0);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint GROUPS = 1u << 20;
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+groupshared uint offsets[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    uint total = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    uint tiles = (records + 63u) / 64u;
+    for (uint tile = 0; tile < tiles; tile++) {
+        uint record = tile * 64u + lane;
+        uint src_at = args_offset + record * stride;
+        uint cost = 0;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        if (record < records) {
+            if (kind <= 1) {
+                uint2 asked = src_args.Load2(src_at);
+                uint count = min(asked.x, 1u << 24);
+                uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                draw_counts = uint2(count, instances);
+            } else if (kind == 2) {
+                uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64u;
+                groups = g;
+            } else {
+                uint3 g = src_args.Load3(src_at);
+                budget.InterlockedMax(4, g.x);
+                budget.InterlockedAdd(8, min(g.x, 1u << 24));
+                g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+                cost = g.x * g.y * g.z * 128u;
+                groups = g;
+            }
+        }
+        costs[lane] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            uint n = min(64u, records - tile * 64u);
+            for (uint i = 0; i < n; i++) {
+                uint c = costs[i];
+                if (c > left) {
+                    costs[i] = PAST;
+                    left = 0;
+                } else {
+                    left -= c;
+                    if (c > 0) {
+                        offsets[i] = total;
+                        total++;
+                    }
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (record < records && costs[lane] != PAST && cost > 0) {
+            uint dst_at = 16u + offsets[lane] * stride;
+            if (kind <= 1) {
+                dst_args.Store2(dst_at, draw_counts);
+                for (uint off = 8; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            } else {
+                dst_args.Store3(dst_at, groups);
+                for (uint off = 12; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            }
+        }
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+        dst_args.Store(0, total);
+    }
+}
+"#;
+
+fn compactor() -> Option<&'static Clamp> {
+    static COMPACT: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    COMPACT
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match compile_for(device, COMPACT_SOURCE) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no indirect compactor: falling back to plain clamp");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// [`bound`] with stream compaction (`VICTORY_INDIRECT_COMPACT=1`): compacts
+/// surviving non-empty records at offset 16 behind the compacted count at
+/// offset 0. Falls back to `None` if compaction is unavailable.
+pub(crate) fn bound_compact(
+    list: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64, (ID3D12Resource, u64))> {
+    let bytes = validate_layout((kind, stride, records), src_offset, None)?;
+    let total = bytes.checked_add(16)?;
+    let (c, (budget_res, budget), dst) =
+        (compactor()?, list.budget_resource()?, list.indirect_scratch(total)?);
+    // SAFETY: live D3D12 buffers.
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (src_gpu, args_offset) = match src_offset
+        .checked_add(bytes)
+        .filter(|&end| end <= u64::from(u32::MAX))
+    {
+        Some(_) => (src_base, src_offset as u32),
+        None => (src_base.checked_add(src_offset)?, 0),
+    };
+    let constants = [kind, stride, records, args_offset];
+    let l = &list.list;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    let scoped = scoped_uav();
+    let first = [
+        if scoped { uav_barrier_for(src) } else { uav_barrier() },
+        transition(&dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    ];
+    let second = [
+        if scoped { uav_barrier_for(budget_res) } else { uav_barrier() },
+        transition(
+            &dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
+    // SAFETY: open list, live buffers, root signature and pipeline.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootUnorderedAccessView(2, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    COMPACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    COMPACT_STATS[1].fetch_add(u64::from(records), Ordering::Relaxed);
+    let count_buf = dst.clone();
+    Some((dst, 16, (count_buf, 0)))
+}
+
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -628,8 +858,10 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, (budget_res, budget), dst) =
+        (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    record_clamp_flags_with(c, &list.list, &dst, Some(budget_res), budget, src, count, spec, 0)
+        .then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -648,10 +880,13 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let (c, (budget_res, budget), dst) =
+        (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    record_clamp_flags_with(c, &list.list, &dst, Some(budget_res), budget, src, None, spec, 2)
+        .then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -666,6 +901,7 @@ fn record_clamp(
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
 /// their draws ([`bound_ahead`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -677,7 +913,17 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_flags(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), u32::from(ahead) << 1)
+    record_clamp_flags_with(
+        c,
+        l,
+        dst,
+        None,
+        budget,
+        (src, src_offset),
+        count,
+        (kind, stride, records),
+        u32::from(ahead) << 1,
+    )
 }
 
 /// The clamp shader's flag for a clamp charged to a ledger entry (modes 8
@@ -702,18 +948,21 @@ pub(crate) fn bound_flat(list: &HostList, src: (&ID3D12Resource, u64), stride: u
     const INDEXED: u32 = 1;
     let spec = (INDEXED, stride, 1);
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, (budget_res, budget), dst) =
+        (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
     let flags = if per == 3 { 4 | 8 } else { 4 };
-    record_clamp_flags(c, &list.list, &dst, budget, src, None, spec, flags).then_some(dst)
+    record_clamp_flags_with(c, &list.list, &dst, Some(budget_res), budget, src, None, spec, flags)
+        .then_some(dst)
 }
 
 /// [`record_clamp_as`] with the shader's flag bits: 2 ahead, 4 flat, 8
 /// flat with three indices per instance ([`LEDGER_BIT`] is the ledger's).
 #[allow(clippy::too_many_arguments)]
-fn record_clamp_flags(
+fn record_clamp_flags_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
+    budget_res: Option<&ID3D12Resource>,
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -776,6 +1025,61 @@ fn record_clamp_flags(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
+    let scoped = scoped_uav();
+    if scoped && records == 0 {
+        // Skip UAV barriers and clamp dispatch; keep `dst` transition paired
+        // with `done()` (`COMMON -> INDIRECT_ARGUMENT`).
+        let to_indirect = [transition(
+            dst,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )];
+        // SAFETY: open list and live `dst` buffer.
+        unsafe { l.ResourceBarrier(&to_indirect) };
+        return true;
+    }
+    if scoped {
+        let mut first = Vec::with_capacity(3);
+        if waits {
+            first.push(uav_barrier_for(src));
+            if let Some((cb, _)) = count
+                && cb.as_raw() != src.as_raw()
+            {
+                first.push(uav_barrier_for(cb));
+            }
+        }
+        first.push(transition(
+            dst,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ));
+        let mut second = Vec::with_capacity(2);
+        if waits {
+            second.push(match budget_res {
+                Some(b) => uav_barrier_for(b),
+                None => uav_barrier(),
+            });
+        }
+        second.push(transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ));
+        // SAFETY: open list, live buffers, root signature and pipeline.
+        unsafe {
+            l.ResourceBarrier(&first);
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.ResourceBarrier(&second);
+        }
+        return true;
+    }
     let first = [
         uav_barrier(),
         transition(
@@ -918,15 +1222,17 @@ pub(crate) fn settle_later(
     chunk: &ID3D12Resource,
     heads: u64,
     clamps: u32,
+    budget_res: Option<&ID3D12Resource>,
     budget: u64,
 ) -> bool {
     let Some(c) = settler_later() else {
         return false;
     };
-    settle_later_with(c, l, chunk, heads, clamps, budget);
+    settle_later_with_res(c, l, chunk, heads, clamps, budget_res, budget);
     true
 }
 
+#[cfg(test)]
 fn settle_later_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -935,10 +1241,29 @@ fn settle_later_with(
     clamps: u32,
     budget: u64,
 ) {
+    settle_later_with_res(c, l, chunk, heads, clamps, None, budget);
+}
+
+fn settle_later_with_res(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    chunk: &ID3D12Resource,
+    heads: u64,
+    clamps: u32,
+    budget_res: Option<&ID3D12Resource>,
+    budget: u64,
+) {
     // SAFETY: an open list; our root signature and pipeline; live buffers
     // (`chunk` and `budget` writable, `heads` mapped host memory).
     unsafe {
-        l.ResourceBarrier(&[uav_barrier()]);
+        if scoped_uav() {
+            match budget_res {
+                Some(b) => l.ResourceBarrier(&[uav_barrier_for(chunk), uav_barrier_for(b)]),
+                None => l.ResourceBarrier(&[uav_barrier_for(chunk), uav_barrier()]),
+            }
+        } else {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstant(0, clamps, 0);
@@ -946,7 +1271,14 @@ fn settle_later_with(
         l.SetComputeRootUnorderedAccessView(2, chunk.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(3, budget);
         l.Dispatch(1, 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
+        if scoped_uav() {
+            l.ResourceBarrier(&[match budget_res {
+                Some(b) => uav_barrier_for(b),
+                None => uav_barrier(),
+            }]);
+        } else {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
     }
 }
 
@@ -989,7 +1321,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (c, (budget_res, budget)) = (clamp()?, clamps.budget_resource()?);
     // SAFETY: live buffers.
     let (src_base, count_base) =
         unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
@@ -1093,7 +1425,12 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.Dispatch(records.div_ceil(64), 1, 1);
         if later.is_none() && (hoist_mode() == 7 || (hoist_mode() >= 8 && ran.is_none())) {
-            l.ResourceBarrier(&[uav_barrier()]);
+            let barrier = if scoped_uav() {
+                uav_barrier_for(budget_res)
+            } else {
+                uav_barrier()
+            };
+            l.ResourceBarrier(&[barrier]);
         }
     }
     Some((dst, if later.is_some() { at + 16 } else { at }, ran))
@@ -1123,6 +1460,22 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed COM pointer; `ManuallyDrop` never releases it,
+                // and the caller keeps `resource` alive through `ResourceBarrier`.
+                pResource: std::mem::ManuallyDrop::new(Some(unsafe {
+                    std::mem::transmute_copy(resource)
+                })),
             }),
         },
     }

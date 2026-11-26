@@ -6709,9 +6709,9 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    /// The host resource and GPU address of the list's indirect-work budget,
+    /// zeroed at each submission of the list from the first use after a reset on.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -6740,7 +6740,13 @@ impl HostList {
             })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+    }
+
+    /// The host address of the list's indirect-work budget, zeroed at each
+    /// submission of the list from the first use after a reset on.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_resource().map(|(_, gpu)| gpu)
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -6922,15 +6928,15 @@ impl HostList {
             return;
         }
         let clamps = std::mem::take(&mut chunks.later);
-        let (Some((chunk, _)), Some((heads, _)), Some(budget)) =
-            (chunks.all.get(chunks.later_chunk), chunks.heads.as_ref(), self.budget())
+        let (Some((chunk, _)), Some((heads, _)), Some((budget_res, budget))) =
+            (chunks.all.get(chunks.later_chunk), chunks.heads.as_ref(), self.budget_resource())
         else {
             tracing::warn!(clamps, "clamps recorded to be settled were not: their budget is not charged");
             return;
         };
         // SAFETY: a live buffer.
         let heads = unsafe { heads.GetGPUVirtualAddress() } + 4 * u64::from(chunks.later_from);
-        if crate::indirect::settle_later(&self.list, chunk, heads, clamps, budget) {
+        if crate::indirect::settle_later(&self.list, chunk, heads, clamps, Some(budget_res), budget) {
             // Another pipeline: the next clamp binds its own again.
             chunks.bound = false;
             static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -8057,6 +8063,14 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; indirect records emptied by the budget (VICTORY_CLAMP_BUDGET): {emptied:.1} per frame"
         );
+        if crate::indirect::indirect_compact() {
+            let [calls, records] = crate::indirect::take_compact_stats();
+            tracing::info!(
+                "indirect compaction (VICTORY_INDIRECT_COMPACT=1): {:.1} calls/frame ({:.0} records/frame)",
+                calls as f64 / frames,
+                records as f64 / frames,
+            );
+        }
         late_line(frames);
         if async_compute() {
             let secs = elapsed.as_secs_f64().max(1e-6);
