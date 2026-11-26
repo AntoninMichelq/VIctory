@@ -1654,6 +1654,7 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
+            let unordered = matches!(view, crate::descriptor::View::Unordered(..));
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 if reuse {
                     plan.unresolved.insert(index);
@@ -1665,6 +1666,11 @@ impl State {
                 }
                 continue;
             };
+            // Shaders that pick it may write it, and nothing copies that
+            // back (see above): `shadow::recopy_tick` must leave it alone.
+            if unordered {
+                shadow.mark_gpu_written();
+            }
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);

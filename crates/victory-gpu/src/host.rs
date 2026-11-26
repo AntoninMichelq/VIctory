@@ -8630,6 +8630,7 @@ impl Meter {
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
+        crate::shadow::recopy_tick();
         crate::copytop::frames(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
