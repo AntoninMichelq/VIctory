@@ -837,8 +837,11 @@ impl State {
     /// dispatch.
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
+        // `u32::MAX` for VRS: a compute dispatch (e.g. `ambient`) does not reset
+        // the graphics shading rate on the open command list, so the next draw
+        // must re-emit `RSSetShadingRate` even when it wants `1x1`.
         (self.host_pipeline, self.host_roots, self.host_heaps, self.host_vrs) =
-            (0, [0; 2], [usize::MAX; 2], 0);
+            (0, [0; 2], [usize::MAX; 2], u32::MAX);
     }
 
     pub(crate) fn replay(&mut self, list: &HostList) {
@@ -4027,31 +4030,52 @@ const VRS_2X2: u32 = 5; // D3D12_SHADING_RATE_2X2
 /// - `6318f669` / `7affbd5b`: 1.86 ms/frame (fullscreen lighting/post pass)
 /// - `25ebc920`: 1.38 ms/frame (`48e74d16` 0.55 + `1cd9bc63` 0.50 + `e5a6ec76` 0.33)
 /// - `7f99b1cc` / `3c0e9845`: 0.26 ms/frame
-const VRS_TILES_HASHES: [&str; 4] = ["456f02b5", "6318f669", "25ebc920", "7f99b1cc"];
+// Pixel shader hash prefixes for the heavy fullscreen / tiled-lighting passes
+// measured in `gputime` (`456f02b5` 8.54 ms, `6318f669` 1.86 ms,
+// `48e74d16`/`1cd9bc63`/`e5a6ec76` 1.38 ms, `3c0e9845` 0.26 ms).
+const VRS_TILES_PIXEL_HASHES: [&str; 6] = [
+    "456f02b5",
+    "6318f669",
+    "48e74d16",
+    "1cd9bc63",
+    "e5a6ec76",
+    "3c0e9845",
+];
 
 #[derive(Clone, Default)]
 struct VrsConfig {
     raw: String,
     /// `0` = off, else `VRS_1X2` / `VRS_2X1` / `VRS_2X2`.
     rate: u32,
-    /// Apply to all pixel draws with render targets (excluding skin bake).
+    /// Apply to all single-RT pixel draws (excluding skin bake and MRT G-buffer).
     all: bool,
-    /// Pipeline name substrings (hash prefixes) to shade at `rate`.
+    /// When true, match `hashes` only against the pixel shader portion (`pixel ...`).
+    pixel_only: bool,
+    /// Hash prefixes to shade at `rate`.
     hashes: Vec<String>,
 }
 
 impl VrsConfig {
-    fn rate_for(&self, pipeline_name: &str) -> u32 {
-        if self.rate == VRS_1X1 {
+    fn rate_for(&self, pipeline_name: &str, targets_len: usize) -> u32 {
+        if self.rate == VRS_1X1 || targets_len == 0 {
             return VRS_1X1;
         }
         if BAKE_PIXEL_SHADERS.iter().any(|h| pipeline_name.contains(h)) {
             return VRS_1X1;
         }
         if self.all {
-            return self.rate;
+            // Exclude MRT passes (G-buffer: normals, roughness, motion vectors).
+            return if targets_len == 1 { self.rate } else { VRS_1X1 };
         }
-        if self.hashes.iter().any(|h| pipeline_name.contains(h.as_str())) {
+        let haystack = if self.pixel_only {
+            match pipeline_name.split_once("pixel ") {
+                Some((_, ps)) => ps,
+                None => return VRS_1X1,
+            }
+        } else {
+            pipeline_name
+        };
+        if self.hashes.iter().any(|h| haystack.contains(h.as_str())) {
             self.rate
         } else {
             VRS_1X1
@@ -4084,30 +4108,35 @@ fn parse_vrs(raw: &str) -> VrsConfig {
             raw: trimmed.to_owned(),
             rate: VRS_2X2,
             all: false,
-            hashes: VRS_TILES_HASHES.iter().map(|&s| s.to_owned()).collect(),
+            pixel_only: true,
+            hashes: VRS_TILES_PIXEL_HASHES.iter().map(|&s| s.to_owned()).collect(),
         },
         "tiles2x1" | "lights2x1" => VrsConfig {
             raw: trimmed.to_owned(),
             rate: VRS_2X1,
             all: false,
-            hashes: VRS_TILES_HASHES.iter().map(|&s| s.to_owned()).collect(),
+            pixel_only: true,
+            hashes: VRS_TILES_PIXEL_HASHES.iter().map(|&s| s.to_owned()).collect(),
         },
         "all" | "2x2" => VrsConfig {
             raw: trimmed.to_owned(),
             rate: VRS_2X2,
             all: true,
+            pixel_only: false,
             hashes: Vec::new(),
         },
         "2x1" => VrsConfig {
             raw: trimmed.to_owned(),
             rate: VRS_2X1,
             all: true,
+            pixel_only: false,
             hashes: Vec::new(),
         },
         "1x2" => VrsConfig {
             raw: trimmed.to_owned(),
             rate: VRS_1X2,
             all: true,
+            pixel_only: false,
             hashes: Vec::new(),
         },
         _ => {
@@ -4130,6 +4159,7 @@ fn parse_vrs(raw: &str) -> VrsConfig {
                     raw: trimmed.to_owned(),
                     rate,
                     all: false,
+                    pixel_only: false,
                     hashes,
                 }
             }
@@ -4138,31 +4168,37 @@ fn parse_vrs(raw: &str) -> VrsConfig {
 }
 
 /// Live per-frame cache of `VICTORY_VRS` (refreshed once per frame so it is
-/// toggleable live via `VICTORY_LIVE` without per-draw env syscalls).
+/// toggleable live via `VICTORY_LIVE` without per-draw env syscalls, locks, or
+/// heap allocations).
 static VRS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-static VRS_CACHE: std::sync::Mutex<Option<VrsConfig>> = std::sync::Mutex::new(None);
+static VRS_ACTIVE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(VRS_1X1);
+static VRS_CACHE: std::sync::RwLock<Option<VrsConfig>> = std::sync::RwLock::new(None);
 /// `[0]` draws shaded at a coarse VRS rate, `[1]` `RSSetShadingRate` calls.
 static VRS_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-fn vrs_config() -> VrsConfig {
+fn vrs_refresh() {
     let frame = crate::frame::current();
-    if VRS_FRAME.load(Ordering::Relaxed) != frame {
-        let raw = std::env::var("VICTORY_VRS").unwrap_or_default();
-        let cfg = parse_vrs(&raw);
-        *VRS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
-        VRS_FRAME.store(frame, Ordering::Relaxed);
-        return cfg;
+    if VRS_FRAME.load(Ordering::Relaxed) == frame {
+        return;
     }
-    VRS_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_default()
+    let raw = std::env::var("VICTORY_VRS").unwrap_or_default();
+    let cfg = parse_vrs(&raw);
+    let rate = cfg.rate;
+    *VRS_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    VRS_ACTIVE_RATE.store(rate, Ordering::Release);
+    VRS_FRAME.store(frame, Ordering::Release);
 }
 
 pub(crate) fn vrs_mode_label() -> Option<String> {
-    let cfg = vrs_config();
-    (cfg.rate != VRS_1X1).then_some(cfg.raw)
+    vrs_refresh();
+    if VRS_ACTIVE_RATE.load(Ordering::Acquire) == VRS_1X1 {
+        return None;
+    }
+    let guard = VRS_CACHE.read().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|cfg| cfg.rate != VRS_1X1)
+        .map(|cfg| cfg.raw.clone())
 }
 
 pub(crate) fn take_vrs_stats() -> [u64; 2] {
@@ -4177,10 +4213,14 @@ impl State {
         if crate::host::vrs_tier() == 0 {
             return;
         }
-        let wanted = if self.targets.is_empty() {
+        vrs_refresh();
+        let wanted = if self.targets.is_empty() || VRS_ACTIVE_RATE.load(Ordering::Acquire) == VRS_1X1 {
             VRS_1X1
         } else {
-            vrs_config().rate_for(pipeline_name)
+            let guard = VRS_CACHE.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .map_or(VRS_1X1, |cfg| cfg.rate_for(pipeline_name, self.targets.len()))
         };
         if wanted != VRS_1X1 {
             VRS_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -4222,16 +4262,24 @@ mod tests {
         assert_eq!(parse_vrs("").rate, VRS_1X1);
         assert_eq!(parse_vrs("off").rate, VRS_1X1);
         let tiles = parse_vrs("tiles");
-        assert_eq!(tiles.rate_for("[vertex e732a8b4bea4c0dd, pixel 456f02b52910aabc]"), VRS_2X2);
-        assert_eq!(tiles.rate_for("[vertex 25ebc92075b62822, pixel 48e74d16cbfa45e3]"), VRS_2X2);
-        assert_eq!(tiles.rate_for("[mesh f0c7efd2aceb2aaa, pixel 7d85c9cab3c80721]"), VRS_1X1);
+        assert_eq!(tiles.rate_for("[vertex e732a8b4bea4c0dd, pixel 456f02b52910aabc]", 1), VRS_2X2);
+        assert_eq!(tiles.rate_for("[vertex 25ebc92075b62822, pixel 48e74d16cbfa45e3]", 1), VRS_2X2);
+        // Unrelated pixel shader sharing the same VS must stay 1x1.
+        assert_eq!(tiles.rate_for("[vertex 25ebc92075b62822, pixel deadbeef12345678]", 1), VRS_1X1);
+        // Skin bake and depth-only stay 1x1.
+        assert_eq!(tiles.rate_for("[mesh f0c7efd2aceb2aaa, pixel 7d85c9cab3c80721]", 1), VRS_1X1);
+        assert_eq!(tiles.rate_for("[vertex e732a8b4bea4c0dd, pixel 456f02b52910aabc]", 0), VRS_1X1);
+        // Global mode protects MRT G-buffer (targets_len > 1).
+        let all = parse_vrs("2x2");
+        assert_eq!(all.rate_for("[vertex aaaa, pixel bbbb]", 1), VRS_2X2);
+        assert_eq!(all.rate_for("[vertex aaaa, pixel bbbb]", 4), VRS_1X1);
         let custom = parse_vrs("2x1:456f02b5, 6318f669");
-        assert_eq!(custom.rate_for("[vertex e732a8b4, pixel 456f02b52910aabc]"), VRS_2X1);
-        assert_eq!(custom.rate_for("[vertex 7affbd5b, pixel 6318f669e4f17d65]"), VRS_2X1);
+        assert_eq!(custom.rate_for("[vertex e732a8b4, pixel 456f02b52910aabc]", 1), VRS_2X1);
+        assert_eq!(custom.rate_for("[vertex 7affbd5b, pixel 6318f669e4f17d65]", 1), VRS_2X1);
         let all = parse_vrs("1x2");
-        assert_eq!(all.rate_for("[mesh f0c7efd2, pixel 7d85c9ca]"), VRS_1X2);
+        assert_eq!(all.rate_for("[mesh f0c7efd2, pixel 7d85c9ca]", 1), VRS_1X2);
         // Skin bake pixel shaders always stay at 1x1.
-        assert_eq!(all.rate_for("[vertex 1234, pixel c0a7fe77b1862e10]"), VRS_1X1);
+        assert_eq!(all.rate_for("[vertex 1234, pixel c0a7fe77b1862e10]", 1), VRS_1X1);
     }
 
     #[test]
