@@ -24,12 +24,19 @@
 //!   scalar values only) branch on the first lane's condition. Every lane
 //!   that reaches the branch computed the same condition from the same
 //!   scalar values; the host compiler is told so and branches on SCC.
+//! - 4: a scalar load of several dwords from a constant buffer at a
+//!   computed offset (`s_buffer_load_dwordx4/x8/x16`, a record picked by
+//!   an index: the volumetric gathers' lights) reads the 16-byte rows the
+//!   dwords lie in, one read each, instead of one read per dword: 5 reads
+//!   for 16 dwords, not 16. Each read was a vector load the next one
+//!   waited for (`s_waitcnt vmcnt(0)`); the console makes one scalar load.
+//!   The same dwords, whatever the offset's alignment; any program.
 //!
 //! Part of the translation: the shader cache keys on it (`victory-gpu`'s
 //! does).
 
 use super::Lower;
-use super::super::bitcode::{Attr, Cast, V, pred};
+use super::super::bitcode::{Attr, Bin, Cast, V, pred};
 use super::super::shader::flags;
 use crate::structure::{Atom, Bool};
 
@@ -37,8 +44,10 @@ use crate::structure::{Atom, Bool};
 pub const UNIFORM_LOADS: u32 = 1;
 /// Uniform branches branch on a wave-uniform condition.
 pub const UNIFORM_BRANCHES: u32 = 2;
+/// Constant-buffer dwords at a computed offset read by rows.
+pub const GROUPED_ROWS: u32 = 4;
 /// Every bit.
-pub const ALL: u32 = UNIFORM_LOADS | UNIFORM_BRANCHES;
+pub const ALL: u32 = UNIFORM_LOADS | UNIFORM_BRANCHES | GROUPED_ROWS;
 
 /// `VICTORY_HOT_SHADERS`'s bits (see the module).
 pub fn hot_shaders() -> u32 {
@@ -62,6 +71,41 @@ impl Lower<'_> {
     /// programs only (no helper lanes, every lane a thread of its own).
     fn hot(&self, bit: u32) -> bool {
         hot_shaders() & bit != 0 && self.s.threads.is_some()
+    }
+
+    /// The `count` dwords of constant buffer `h` from byte `a` on, read by
+    /// 16-byte rows (bit [`GROUPED_ROWS`]); `None` without the bit or for
+    /// fewer than four dwords (then dword by dword, `cbuffer_dword`).
+    pub(super) fn cbuffer_rows(&mut self, h: V, a: V, count: u32) -> Option<Vec<V>> {
+        if hot_shaders() & GROUPED_ROWS == 0 || count < 4 {
+            return None;
+        }
+        let c = self.cur;
+        let (two, three, four) = (self.s.m.i32(2), self.s.m.i32(3), self.s.m.i32(4));
+        let row = self.s.m.bin(c, Bin::LShr, a, four);
+        let first = self.s.m.bin(c, Bin::LShr, a, two);
+        let first = self.s.m.bin(c, Bin::And, first, three);
+        // Dword k is component (first + k) & 3 of row (a >> 4) + (first + k) >> 2.
+        let mut flat = Vec::new();
+        for j in 0..(count + 2) / 4 + 1 {
+            let jc = self.s.m.i32(j);
+            let ri = self.s.m.bin(c, Bin::Add, row, jc);
+            let r = self.s.op(c, "cbufferLoadLegacy.i32", Attr::ReadOnly, self.s.t.cbuf_ret, 59, &[h, ri]);
+            for e in 0..4 {
+                flat.push(self.s.m.extract(c, r, e));
+            }
+        }
+        let mut out = Vec::with_capacity(count as usize);
+        for k in 0..count as usize {
+            let mut x = flat[k];
+            for s in 1..4 {
+                let sc = self.s.m.i32(s as u32);
+                let is = self.s.m.cmp(c, pred::EQ, first, sc);
+                x = self.s.m.select(c, is, flat[k + s], x);
+            }
+            out.push(x);
+        }
+        Some(out)
     }
 
     /// A dword a scalar load read from a buffer, as the first lane read it

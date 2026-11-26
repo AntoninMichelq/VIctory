@@ -6039,6 +6039,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let mut rows: HashMap<u32, V> = HashMap::new();
+        let run = if constant.is_none() { self.cbuffer_rows(h, addr, count) } else { None };
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
@@ -6061,6 +6062,7 @@ impl<'a> Lower<'a> {
                     };
                     self.s.m.extract(c, row, (byte >> 2) & 3)
                 }
+                None if run.is_some() => run.as_ref().map_or(addr, |r| r[k as usize]),
                 None => {
                     let off = self.s.m.i32(4 * k);
                     let a = self.s.m.bin(c, Bin::Add, addr, off);
