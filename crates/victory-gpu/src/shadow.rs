@@ -3327,6 +3327,55 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// `VICTORY_RECOPY_ALL_EVERY=<seconds>`: every that many seconds, every
+/// host copy of title memory (buffers' and windows') is marked as never
+/// copied, so the next refresh of any range of it copies it again from
+/// title memory, whatever write watching says. A test of copies that
+/// went stale for good (a buffer whose first copy was taken before the
+/// title or a read filled it, then never seen written: geometry drawn
+/// from zeros), and a stopgap if it is that. Ranges shaders are writing
+/// are skipped as by any refresh. Off (unset or 0): as before.
+/// shortcut: what shaders wrote into a copy and that was never copied
+/// back (a heap-picked unordered view) is replaced by title memory.
+pub(crate) fn recopy_tick() {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_RECOPY_ALL_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        tracing::info!(seconds = every, "every host copy copied again from title memory (VICTORY_RECOPY_ALL_EVERY)");
+        every
+    });
+    if every == 0 {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match *last {
+            Some(at) if now.duration_since(at).as_secs() < every => return,
+            None => {
+                *last = Some(now);
+                return;
+            }
+            _ => *last = Some(now),
+        }
+    }
+    let mut copies: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    copies.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    let bytes: u64 = copies.iter().map(|c| c.len).sum();
+    for copy in &copies {
+        copy.copied.lock().unwrap_or_else(|e| e.into_inner()).fill(0);
+    }
+    tracing::info!(
+        copies = copies.len(),
+        mb = bytes >> 20,
+        "every host copy marked to be copied again from title memory (VICTORY_RECOPY_ALL_EVERY)"
+    );
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
