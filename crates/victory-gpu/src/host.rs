@@ -4681,7 +4681,7 @@ impl Host {
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                     let runs: Vec<&HostList> = flights.iter().flat_map(|f| f.order.iter().map(|&i| f.lists[i].host())).collect();
                     fail(format_args!(
-                        "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY=1) of {} lists{}{}",
+                        "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY) of {} lists{}{}",
                         flights.len(),
                         runs.len(),
                         self.removal_data(&runs),
