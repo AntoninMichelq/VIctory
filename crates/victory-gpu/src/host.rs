@@ -2889,6 +2889,14 @@ fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
             bytes += (*to - *from) as u64;
         }
         list.ResourceBarrier(&barrier);
+        // In the first list's prelude with `VICTORY_ALIAS_ON_CARD`: the
+        // buffers the copies promoted (to copy destination or source) are
+        // put back to COMMON, as the lists after this one in the same
+        // ExecuteCommandLists find them otherwise promoted still (review 7,
+        // 2). A buffer both read and written by the copies is left as it is.
+        if BACK_TO_COMMON.get() {
+            back_to_common(list, copies);
+        }
     }
     // SAFETY: the barrier's union holds a ManuallyDrop of None.
     unsafe { std::mem::ManuallyDrop::drop(&mut barrier[0].Anonymous.UAV) };
@@ -2902,6 +2910,63 @@ fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
             mb = ALIAS_COPIED.load(Ordering::Relaxed) >> 20,
             "card copies between host copies of the same title memory, from earlier lists of a submission (VICTORY_ALIAS_COPIES=0 turns them off)"
         );
+    }
+}
+
+std::thread_local! {
+    /// [`record_cross_copies`] on this thread now puts its buffers back to
+    /// COMMON ([`back_to_common`]): the first list's prelude, with
+    /// `VICTORY_ALIAS_ON_CARD`.
+    static BACK_TO_COMMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`record_cross_copies`]' copies' buffers from COPY_DEST (readers) and
+/// COPY_SOURCE (writers) back to COMMON, each once.
+fn back_to_common(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
+    use windows::core::Interface;
+    let mut dest: Vec<&ID3D12Resource> = Vec::new();
+    let mut source: Vec<&ID3D12Resource> = Vec::new();
+    for (reader, writer, ..) in copies {
+        if !dest.iter().any(|r| r.as_raw() == reader.buffer.as_raw()) {
+            dest.push(&reader.buffer);
+        }
+        if !source.iter().any(|r| r.as_raw() == writer.buffer.as_raw()) {
+            source.push(&writer.buffer);
+        }
+    }
+    let both = |r: &ID3D12Resource, other: &[&ID3D12Resource]| other.iter().any(|o| o.as_raw() == r.as_raw());
+    let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+    for (set, other, before) in [
+        (&dest, &source, D3D12_RESOURCE_STATE_COPY_DEST),
+        (&source, &dest, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    ] {
+        for r in set.iter().filter(|r| !both(r, other)) {
+            barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some((*r).clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: before,
+                        StateAfter: D3D12_RESOURCE_STATE_COMMON,
+                    }),
+                },
+            });
+        }
+    }
+    if barriers.is_empty() {
+        return;
+    }
+    // SAFETY: an open list; the buffers were promoted to these states by the
+    // copies just recorded in it.
+    unsafe { list.ResourceBarrier(&barriers) };
+    for b in &mut barriers {
+        // SAFETY: each union holds a transition with a clone to let go.
+        unsafe {
+            let t = std::mem::ManuallyDrop::take(&mut b.Anonymous.Transition);
+            drop(std::mem::ManuallyDrop::into_inner(t.pResource));
+        }
     }
 }
 
@@ -3083,13 +3148,19 @@ fn settle_stale(
     // Then aliased refreshes, as the flights still in the air are now: taken
     // from their writer copies on the card, behind them on the queue,
     // instead of a wait ([`alias_on_card`]) where that can be shown right.
+    // Only if nothing was waited for above: the submission's write-watch
+    // asking the plan relies on was made before any wait, and a title write
+    // during one would not be in it (review 7, 1).
+    if alias_on_card()
+        && rounds == 0
+        && let Some(planned) = plan_alias_copies(host, runs)
+    {
+        crate::copytop::settle_cause(crate::copytop::S_ALIAS_CARD);
+        crate::timeline::mark("alias-on-card", planned.iter().map(|c| c.len() as u64).sum());
+        return planned;
+    }
     if alias_on_card() {
-        if let Some(planned) = plan_alias_copies(host, runs) {
-            crate::copytop::settle_cause(crate::copytop::S_ALIAS_CARD);
-            crate::timeline::mark("alias-on-card", planned.iter().map(|c| c.len() as u64).sum());
-            return planned;
-        }
-        crate::timeline::mark("alias-on-card-refused", 0);
+        crate::timeline::mark("alias-on-card-refused", rounds);
         if !alias_partial() {
             host.settle(submitted, WHY_STALE);
             return Vec::new();
@@ -5783,7 +5854,13 @@ impl Host {
             firsts.push(lists.len());
             let aliased = crossed.get_mut(n).map(std::mem::take).unwrap_or_default();
             let preluding = crate::prepstats::start();
-            if let Some(prelude) = list.prelude(aliased) {
+            // The first list's prelude holds the flights' copies alone
+            // (`VICTORY_ALIAS_ON_CARD`), its buffers as the earlier
+            // submissions left them (COMMON): put back there after.
+            BACK_TO_COMMON.set(n == 0 && alias_on_card());
+            let prelude = list.prelude(aliased);
+            BACK_TO_COMMON.set(false);
+            if let Some(prelude) = prelude {
                 lists.push(Some(prelude));
             }
             crate::prepstats::done(crate::prepstats::P::Preludes, preluding);
