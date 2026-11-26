@@ -60,9 +60,12 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
-    /// With `VICTORY_TEXTURE_UPLOAD_BANDS=1`: `(top, bottom)` texel rows to
-    /// copy on the next upload (`None` = full subresource copy).
-    pending_band: Mutex<Option<(u32, u32)>>,
+    /// With `VICTORY_TEXTURE_UPLOAD_BANDS=1`: detiled linear rows `[top, bottom)`
+    /// awaiting upload (`None` = full subresource copy from `side`).
+    pending_band: Mutex<Option<PendingBand>>,
+    /// Monotonic generation counter for [`PendingBand`] updates so a list's
+    /// submission callback never clears a newer band.
+    band_gen: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// The host texture if it is made level by level (`crate::tiles`):
@@ -831,6 +834,68 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_texture(staging);
         return;
     }
+    // Partial dirty-band upload (`VICTORY_TEXTURE_UPLOAD_BANDS=1`): copy the
+    // detiled CPU band into a per-list 512-byte-aligned upload slice so we
+    // never mutate the shared `side` staging buffer while an earlier list is
+    // still executing on the GPU, and `PlacedFootprint.Offset` always satisfies
+    // `D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT` (512 bytes) even when `RowPitch`
+    // is an odd multiple of 256 and `top / block` is odd.
+    let pending_band = if staging.uploaded.load(Relaxed) && staging.footprints.len() == 1 {
+        staging.pending_band.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    } else {
+        None
+    };
+    if let Some(pb) = pending_band
+        && let Some((scratch_buf, scratch_offset, scratch_ptr)) = list.upload(pb.data.len() as u64)
+    {
+        debug_assert_eq!(scratch_offset % u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT), 0);
+        // SAFETY: `scratch_ptr` points to `pb.data.len()` mapped upload bytes
+        // owned by `list` until reset; non-overlapping with `pb.data`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pb.data.as_ptr(), scratch_ptr, pb.data.len());
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        const COPY_DEST: u32 = 0x400;
+        crate::list::ensure_state(list, resource, COPY_DEST);
+        let mut footprint = staging.footprints[0];
+        footprint.Offset = scratch_offset;
+        footprint.Footprint.Height = pb.bottom - pb.top;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; `scratch_buf` is kept alive by `list` until reset.
+            pResource: unsafe { std::mem::transmute_copy(&scratch_buf) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources, `footprint.Offset`
+        // is 512-byte aligned, and the band is block-aligned inside the texture.
+        unsafe { list.list.CopyTextureRegion(&to, 0, pb.top, 0, &from, None) };
+        {
+            let staging = staging.clone();
+            let uploaded_gen = pb.generation;
+            list.defer_host(move || {
+                staging.uploaded.store(true, Relaxed);
+                let mut pending = staging.pending_band.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.as_ref().is_some_and(|cur| cur.generation == uploaded_gen) {
+                    *pending = None;
+                    staging.dirty.store(false, Relaxed);
+                }
+            });
+        }
+        list.defer_texture(staging);
+        return;
+    }
+
     // The buffer to copy from, which the list keeps until it is reset (so
     // that letting the staging buffer go never frees what a recorded copy
     // reads). Not there: let go after a submission took the last change,
@@ -852,23 +917,40 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
-    let band = if staging.uploaded.load(Relaxed) && staging.footprints.len() == 1 {
-        *staging.pending_band.lock().unwrap_or_else(|e| e.into_inner())
-    } else {
-        None
-    };
-    if let Some((top, bottom)) = band {
-        let mut footprint = staging.footprints[0];
-        let block = staging.layout.desc.block;
-        let pitch = footprint.Footprint.RowPitch;
-        footprint.Offset += u64::from(top / block) * u64::from(pitch);
-        footprint.Footprint.Height = bottom - top;
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        #[cfg(feature = "diagnostics")]
+        {
+            let f = footprint.Footprint;
+            // SAFETY: live resources.
+            let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            list.note_read(
+                || {
+                    format!(
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.Format.0,
+                        d.MipLevels,
+                        staging.footprints.len(),
+                        staging.size,
+                        footprint.Offset,
+                        f.Width,
+                        f.Height,
+                        f.Depth,
+                        f.RowPitch
+                    )
+                },
+                (gpu + footprint.Offset, len),
+            );
+        }
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: i as u32,
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -876,60 +958,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: footprint,
+                PlacedFootprint: *footprint,
             },
         };
-        // SAFETY: an open list; both locations name live resources and the
-        // band is block-aligned inside both the staging buffer and texture.
-        unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, None) };
-    } else {
-        for (i, footprint) in staging.footprints.iter().enumerate() {
-            #[cfg(feature = "diagnostics")]
-            {
-                let f = footprint.Footprint;
-                // SAFETY: live resources.
-                let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-                let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-                list.note_read(
-                    || {
-                        format!(
-                            "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                            d.Width,
-                            d.Height,
-                            d.DepthOrArraySize,
-                            d.Format.0,
-                            d.MipLevels,
-                            staging.footprints.len(),
-                            staging.size,
-                            footprint.Offset,
-                            f.Width,
-                            f.Height,
-                            f.Depth,
-                            f.RowPitch
-                        )
-                    },
-                    (gpu + footprint.Offset, len),
-                );
-            }
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: a borrowed pointer the location never releases.
-                pResource: unsafe { std::mem::transmute_copy(texture) },
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: i as u32,
-                },
-            };
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&buffer) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
-                },
-            };
-            // SAFETY: an open list; both locations name live resources.
-            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-        }
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -938,7 +971,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         let staging = staging.clone();
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            let pending = staging.pending_band.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.is_none() {
+                staging.dirty.store(false, Relaxed);
+            }
         });
     }
     // Once per submission however many of its lists sample the texture.
@@ -1247,22 +1283,38 @@ impl Staging {
         true
     }
 
-    /// Reads and detiles only `band` into the existing staging buffer, then
-    /// records it for a compact `CopyTextureRegion` on the next upload.
+    /// Reads and detiles only `band` (merged by union with any unuploaded
+    /// [`PendingBand`]) into a fresh CPU buffer, never mutating the shared
+    /// `side` upload buffer while a previous submission may still read it.
     fn detile_band(&self, band: RowBand) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let [footprint] = self.footprints.as_slice() else {
             return false;
         };
-        let side = self.side.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(data) = side.as_ref().map(|s| s.data) else {
+        let merged = {
+            let pending = self.pending_band.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.as_ref() {
+                Some(prev) => merge_row_bands(
+                    RowBand {
+                        top: prev.top,
+                        bottom: prev.bottom,
+                        source_start: prev.source_start,
+                        source_end: prev.source_end,
+                    },
+                    band,
+                    self.layout.desc.height,
+                ),
+                None => Some(band),
+            }
+        };
+        let Some(band) = merged else {
             return false;
         };
         let block = self.layout.desc.block;
         let pitch = footprint.Footprint.RowPitch as usize;
         let rows = ((band.bottom - band.top) / block) as usize;
         let len = rows * pitch;
-        let dst_offset = footprint.Offset as usize + (band.top / block) as usize * pitch;
+        let mut linear = vec![0u8; len];
         let started = std::time::Instant::now();
         let ok = with_read(self.layout.size as usize, |src| {
             // SAFETY: source range lies inside `self.layout.size`; `copy_mapped`
@@ -1275,26 +1327,25 @@ impl Staging {
                     false,
                 );
             }
-            // SAFETY: `dst_offset + len` lies inside the staging buffer's
-            // single 2D subresource footprint.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(dst_offset), len) };
             self.layout
-                .detile_rows(src, linear, pitch, band.top / block..band.bottom / block)
+                .detile_rows(src, &mut linear, pitch, band.top / block..band.bottom / block)
                 .is_ok()
         });
         if !ok {
             return false;
         }
         DETILE_US.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let generation = self.band_gen.fetch_add(1, Relaxed) + 1;
         {
             let mut pending = self.pending_band.lock().unwrap_or_else(|e| e.into_inner());
-            if self.dirty.load(Relaxed) {
-                if let Some((top, bottom)) = *pending {
-                    *pending = Some((top.min(band.top), bottom.max(band.bottom)));
-                }
-            } else {
-                *pending = Some((band.top, band.bottom));
-            }
+            *pending = Some(PendingBand {
+                generation,
+                top: band.top,
+                bottom: band.bottom,
+                source_start: band.source_start,
+                source_end: band.source_end,
+                data: Arc::new(linear),
+            });
         }
         self.dirty.store(true, Relaxed);
         self.detiled.store(crate::host::moment(), Relaxed);
@@ -1702,6 +1753,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         pending_band: Mutex::new(None),
+        band_gen: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand: crate::resource::host_tiled(resource),
         retry: std::sync::atomic::AtomicBool::new(false),
@@ -1716,6 +1768,31 @@ struct RowBand {
     bottom: u32,
     source_start: usize,
     source_end: usize,
+}
+
+#[derive(Clone)]
+struct PendingBand {
+    generation: u64,
+    top: u32,
+    bottom: u32,
+    source_start: usize,
+    source_end: usize,
+    data: Arc<Vec<u8>>,
+}
+
+/// Merges two dirty row bands by union, returning `None` if the combined band
+/// exceeds half the texture height (caller falls back to a full detile).
+fn merge_row_bands(a: RowBand, b: RowBand, height: u32) -> Option<RowBand> {
+    let top = a.top.min(b.top);
+    let bottom = a.bottom.max(b.bottom);
+    let source_start = a.source_start.min(b.source_start);
+    let source_end = a.source_end.max(b.source_end);
+    (top < bottom && bottom - top <= height / 2 && source_start < source_end).then_some(RowBand {
+        top,
+        bottom,
+        source_start,
+        source_end,
+    })
 }
 
 /// `VICTORY_TEXTURE_UPLOAD_BANDS=1` (off by default, live): for eligible
@@ -1805,7 +1882,7 @@ fn dirty_band(
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{dirty_band, dirty_envelope, pool_class};
+    use super::{RowBand, dirty_band, dirty_envelope, merge_row_bands, pool_class};
 
     #[test]
     fn dirty_band_and_envelope_cover_written_rows() {
@@ -1833,6 +1910,13 @@ mod pool_tests {
         assert!(band.top < band.bottom && band.bottom - band.top <= 256);
         // Full-height dirty range falls back to full copy.
         assert!(dirty_band(&l, 0..l.size as usize).is_none());
+        // Merging two disjoint bands takes their union and falls back past half height.
+        let a = RowBand { top: 64, bottom: 128, source_start: 0x1_0000, source_end: 0x2_0000 };
+        let b = RowBand { top: 192, bottom: 256, source_start: 0x3_0000, source_end: 0x4_0000 };
+        let merged = merge_row_bands(a, b, 512).expect("union fits within half height");
+        assert_eq!(merged, RowBand { top: 64, bottom: 256, source_start: 0x1_0000, source_end: 0x4_0000 });
+        let far = RowBand { top: 384, bottom: 448, source_start: 0x6_0000, source_end: 0x7_0000 };
+        assert!(merge_row_bands(a, far, 512).is_none());
     }
 
     /// Classes: 64 KiB at least, powers of two kept, others rounded up to
