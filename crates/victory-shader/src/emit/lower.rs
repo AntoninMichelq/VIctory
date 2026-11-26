@@ -28,6 +28,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "code_table.rs"]
+mod code_table;
 
 type Why = &'static str;
 
@@ -1778,9 +1780,8 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect::<Vec<_>>();
+                let first = code_table::first(self.x.p, &first).ok_or("a code table")?;
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)

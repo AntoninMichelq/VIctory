@@ -83,6 +83,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_LOOP_ABORT_KEEPS_DEPTH",
                     "VICTORY_LEAN_MATH",
+                    "VICTORY_CODE_TABLE_AFTER",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
