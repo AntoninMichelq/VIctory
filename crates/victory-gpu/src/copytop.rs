@@ -147,8 +147,8 @@ pub(crate) fn time(kind: usize, started: Option<std::time::Instant>) {
 /// Why flights were settled before a submission (title memory stale under
 /// their shader writes: `stale_under_flights`, `merge_under_writes`):
 /// counts since the last table, by [`SETTLE_NAMES`].
-static SETTLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-const SETTLE_NAMES: [&str; 7] = [
+static SETTLES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const SETTLE_NAMES: [&str; 8] = [
     "title memory stale under shader writes",
     "written by an earlier list of copies the flights alias",
     "of the first: a copy of guarded (not write-watched) memory",
@@ -156,6 +156,7 @@ const SETTLE_NAMES: [&str; 7] = [
     "more than 512 changed runs for the card",
     "no snapshot to merge into",
     "waits for some flights only (VICTORY_SETTLE_PARTIAL=1)",
+    "aliased: waits until no flight writes the ranges (VICTORY_ALIAS_PARTIAL=1)",
 ];
 pub(crate) const S_STALE: usize = 0;
 pub(crate) const S_ALIASED: usize = 1;
@@ -164,6 +165,7 @@ pub(crate) const S_NO_ANSWER: usize = 3;
 pub(crate) const S_RUNS: usize = 4;
 pub(crate) const S_NO_SNAPSHOT: usize = 5;
 pub(crate) const S_PARTIAL: usize = 6;
+pub(crate) const S_ALIAS_PARTIAL: usize = 7;
 
 /// At presents since the last table: their count, the submissions in the
 /// air summed and at most, the frames ahead summed and at most
