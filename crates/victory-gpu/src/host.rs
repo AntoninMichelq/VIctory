@@ -2693,7 +2693,7 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
                     if !copied && let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
-                    if !shadow.writes_pending() && touches(&flights, from, to) {
+                    if !alias_parts(shadow, from, to, &flights).is_empty() {
                         alias_note(true, shadow.span(), (from, to), None);
                         settle = true;
                     }
@@ -3027,7 +3027,9 @@ pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
         settle_now(WHY_FENCE);
         return;
     }
-    relay_wait(WHY_FENCE, |line| reached() || (line.line.is_empty() && !line.settling));
+    // The value set, and the landing that set it over (the signal is set
+    // before the landing's last steps and its line rebuilt: review 4, 4.1).
+    relay_wait(WHY_FENCE, |line| !line.settling && (reached() || line.line.is_empty()));
 }
 
 /// Before a submission, with [`settle_partial`]: waits until the flights up
@@ -3062,20 +3064,84 @@ fn settle_stale(
         host.settle(submitted, WHY_STALE);
         return copies;
     }
-    if let Some(until) = until {
+    // Until the flights up to `until` have landed, and the landing that
+    // took them is over (`FINISHED` is set before its line is rebuilt);
+    // then the submission's refreshes are looked at again: a span merged
+    // before one that could not be may be under a flight that landed
+    // since, and spans not looked at yet are now (review 4, 2.1-2.2).
+    let mut until = until;
+    let mut rounds = 0;
+    while let Some(u) = until {
+        if u == u64::MAX || rounds == 8 {
+            host.settle(submitted, WHY_STALE);
+            return copies;
+        }
         crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
-        crate::timeline::mark("partial-until", until);
-        relay_wait(WHY_STALE, |_| FINISHED.load(Ordering::Acquire) >= until);
+        crate::timeline::mark("partial-until", u);
+        relay_wait(WHY_STALE, |line| FINISHED.load(Ordering::Acquire) >= u && !line.settling);
+        until = stale_under_flights_until(runs);
+        rounds += 1;
     }
     if alias_partial {
         // Until no flight in the air writes what the refreshes of other
-        // copies of the same title memory read ([`aliased_under_flights`]).
+        // copies of the same title memory read ([`aliased_under_flights`]),
+        // and no landing is under way (its line is rebuilt at its end).
         let ranges = alias_ranges(runs);
         crate::copytop::settle_cause(crate::copytop::S_ALIAS_PARTIAL);
         crate::timeline::mark("alias-partial", ranges.len() as u64);
-        relay_wait(WHY_STALE, |line| ranges.iter().all(|&(from, to)| !touches(&line.written, from, to)));
+        relay_wait(WHY_STALE, |line| {
+            !line.settling && ranges.iter().all(|&(from, to)| !touches(&line.written, from, to))
+        });
     }
     copies
+}
+
+/// `VICTORY_ALIAS_STRICT=1` (off by default; on with `VICTORY_ALIAS_PARTIAL`
+/// or `VICTORY_ALIAS_ON_CARD`): a refresh counts as aliased under flights by
+/// its parts outside the ranges its own copy's shaders write, not only if
+/// its copy has no shader writes at all (review 4, 3.1: a copy written by
+/// flights in one range, refreshed in another that a flight writes
+/// through another copy, read the older bytes there).
+fn alias_strict() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_ALIAS_STRICT", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+        || alias_partial()
+        || alias_on_card()
+}
+
+/// The parts of `[from, to)` of `shadow`'s copy that flights write through
+/// other copies (`flights`: what flights' shaders may write), outside the
+/// ranges `shadow`'s own shaders write: with [`alias_strict`]; without it,
+/// all of `[from, to)` if the copy has no shader writes and flights touch
+/// it, else nothing (as before).
+fn alias_parts(shadow: &crate::shadow::Shadow, from: usize, to: usize, flights: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if from >= to || !touches(flights, from, to) {
+        return Vec::new();
+    }
+    if !alias_strict() {
+        return if shadow.writes_pending() { Vec::new() } else { vec![(from, to)] };
+    }
+    let mut parts = vec![(from, to)];
+    for (a, e) in shadow.pending_ranges() {
+        parts = parts
+            .into_iter()
+            .flat_map(|(f, t)| {
+                if e <= f || a >= t {
+                    return vec![(f, t)];
+                }
+                let mut rest = Vec::with_capacity(2);
+                if f < a {
+                    rest.push((f, a));
+                }
+                if e < t {
+                    rest.push((e, t));
+                }
+                rest
+            })
+            .collect();
+    }
+    parts.retain(|&(f, t)| touches(flights, f, t));
+    parts
 }
 
 /// `VICTORY_ALIAS_ON_CARD=1` (off by default; with the relay; read live):
@@ -3129,8 +3195,10 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
             };
             let (rs, rl) = reader.span();
             let (from, to) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
-            // As `aliased_under_flights` picks them.
-            if from >= to || reader.writes_pending() || !touches(&written, from, to) {
+            // As `aliased_under_flights` picks them (strict: parts outside
+            // the reader's own shader writes).
+            let parts = alias_parts(reader, from, to, &written);
+            if parts.is_empty() {
                 continue;
             }
             if !reader.plain() {
@@ -3139,23 +3207,24 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
             for (on_compute, back) in &flights {
                 for (writer, ranges) in back {
                     if Arc::ptr_eq(writer, reader) {
-                        return None;
+                        continue;
                     }
                     let (ws, wl) = writer.span();
                     for &(a, b) in ranges {
-                        let (lo, hi) = (a.max(from).max(ws as usize), b.min(to).min((ws + wl) as usize));
-                        if lo >= hi {
-                            continue;
+                        for &(pf, pt) in &parts {
+                            let (lo, hi) = (a.max(pf).max(ws as usize), b.min(pt).min((ws + wl) as usize));
+                            if lo >= hi {
+                                continue;
+                            }
+                            if *on_compute {
+                                return None;
+                            }
+                            // Every page of the writer's copy there current.
+                            if writer.current_parts(lo, hi)? != [(lo, hi)] {
+                                return None;
+                            }
+                            copies.push((reader.clone(), writer.clone(), lo, hi));
                         }
-                        if *on_compute {
-                            return None;
-                        }
-                        // Every page of the writer's copy there current.
-                        let parts = writer.current_parts(lo, hi)?;
-                        if parts != [(lo, hi)] {
-                            return None;
-                        }
-                        copies.push((reader.clone(), writer.clone(), lo, hi));
                     }
                 }
             }
@@ -3188,10 +3257,7 @@ fn alias_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
-                let (from, to) = (*address, *address + *len);
-                if !shadow.writes_pending() && touches(&flights, from, to) {
-                    out.push((from, to));
-                }
+                out.extend(alias_parts(shadow, *address, *address + *len, &flights));
             }
         }
     }
