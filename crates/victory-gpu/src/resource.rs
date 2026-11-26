@@ -1330,7 +1330,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // its memory (which it maps as it streams levels in) and fills.
         // (And whose console layout the upload reads: `crate::texture`
         // gives the tiles as it uploads.)
-        let on_demand = r.host.placed.load(Relaxed)
+        // As upstream (#2389): any title texture not committed (placed in a
+        // title heap, at a title address, or placed from a view); the
+        // `placed` flag alone took only the last kind (148 MB saved of 163
+        // in cumul5 L1, 2026-11-26).
+        let on_demand = !matches!(r.backing, Backing::Committed(_))
             && fills(&r.desc)
             && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
         let Some((texture, tiled)) = host_texture(&r.desc, r.host.state, clear, full, on_demand) else {
