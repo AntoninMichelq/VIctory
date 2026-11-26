@@ -1734,6 +1734,118 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        static VIEW_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threads = *VIEW_THREADS.get_or_init(|| {
+            let n = std::env::var("VICTORY_VIEW_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 16);
+            if n > 1 {
+                tracing::info!(
+                    threads = n,
+                    "heap buffer view mirroring parallelized across threads (VICTORY_VIEW_THREADS)"
+                );
+            }
+            n
+        });
+        if threads > 1 && slots.len() >= 256 {
+            /// Shared read-only view of a live title heap across scoped worker threads.
+            struct SharedHeap<'a>(&'a crate::descriptor::Heap);
+            // SAFETY: title heaps are free-threaded and outlive this scope.
+            unsafe impl Sync for SharedHeap<'_> {}
+            impl SharedHeap<'_> {
+                fn handle(&self, index: u32) -> Option<u64> {
+                    self.0.handle(index)
+                }
+            }
+            let shared_heap = &SharedHeap(heap);
+            const CHUNK: usize = 256;
+            let parts: Vec<&[u32]> = slots.chunks(CHUNK).collect();
+            let results: Vec<std::sync::OnceLock<Vec<(u32, Option<Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>>)>>> =
+                parts.iter().map(|_| std::sync::OnceLock::new()).collect();
+            let next_chunk = std::sync::atomic::AtomicUsize::new(0);
+            let workers = threads.min(parts.len());
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let c = next_chunk.fetch_add(1, Ordering::Relaxed);
+                        let Some(&chunk) = parts.get(c) else {
+                            break;
+                        };
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &index in chunk {
+                            let Some(handle) = shared_heap.handle(index) else {
+                                out.push((index, None));
+                                continue;
+                            };
+                            let Some(view) = host.mirror(index, handle, true) else {
+                                out.push((index, None));
+                                continue;
+                            };
+                            let unordered = matches!(view, crate::descriptor::View::Unordered(..));
+                            let entry = crate::descriptor::host::buffer_copy(&view)
+                                .map(|(shadow, address, len)| (shadow, address, address + len, unordered));
+                            out.push((index, Some(entry)));
+                        }
+                        if alive
+                            && let Some(why) = crate::descriptor::host::device_removed()
+                            && !GONE.swap(true, Ordering::Relaxed)
+                        {
+                            let last: Vec<String> = chunk
+                                .iter()
+                                .filter_map(|&i| crate::descriptor::view(shared_heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                                .map(|s| s.chars().take(200).collect())
+                                .collect();
+                            tracing::error!(why, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                            crate::host::log_removal_context();
+                        }
+                        let _ = results[c].set(out);
+                    });
+                }
+            });
+            for (index, outcome) in results
+                .into_iter()
+                .filter_map(std::sync::OnceLock::into_inner)
+                .flatten()
+            {
+                match outcome {
+                    None => {
+                        plan.unresolved.remove(&index);
+                        if reuse && !full_rescan {
+                            plan.update_slot(index, None);
+                        } else {
+                            plan.ranges.remove(&index);
+                        }
+                    }
+                    Some(None) => {
+                        if reuse {
+                            plan.unresolved.insert(index);
+                        }
+                        if reuse && !full_rescan {
+                            plan.update_slot(index, None);
+                        } else {
+                            plan.ranges.remove(&index);
+                        }
+                    }
+                    Some(Some((shadow, address, end, unordered))) => {
+                        if unordered {
+                            shadow.mark_gpu_written();
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        if host.shows(index, &shadow.buffer) == Some(false) {
+                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                        }
+                        plan.unresolved.remove(&index);
+                        if reuse && !full_rescan {
+                            plan.update_slot(index, Some((shadow, address, end)));
+                        } else {
+                            plan.ranges.insert(index, (shadow, address, end));
+                        }
+                    }
+                }
+            }
+        } else {
         for (n, &index) in slots.iter().enumerate() {
             let Some(handle) = heap.handle(index) else {
                 plan.unresolved.remove(&index);
@@ -1797,6 +1909,7 @@ impl State {
             } else {
                 plan.ranges.insert(index, (shadow, address, address + len));
             }
+        }
         }
         let slots_done = std::time::Instant::now();
         HEAP_SPLIT_US[0].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);

@@ -895,11 +895,42 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
     }
 }
 
+/// `VICTORY_SAME_RECORDS=1` (off by default): skip descriptor copies when
+/// source and destination bytes are already identical, avoiding redundant
+/// title-memory writes and host-heap mirroring.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("identical descriptor copies skipped (VICTORY_SAME_RECORDS=1)");
+        }
+        on
+    })
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
+    if dst != 0 && src != 0 && len > 0 {
+        if same_records() {
+            if dst == src {
+                return;
+            }
+            let non_overlapping =
+                src.saturating_add(len) <= dst || dst.saturating_add(len) <= src;
+            if non_overlapping {
+                // SAFETY: both non-overlapping ranges are descriptor slots the title owns.
+                let same = unsafe {
+                    std::slice::from_raw_parts(src as *const u8, len as usize)
+                        == std::slice::from_raw_parts(dst as *const u8, len as usize)
+                };
+                if same {
+                    return;
+                }
+            }
+        }
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
