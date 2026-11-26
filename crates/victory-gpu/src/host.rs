@@ -2681,13 +2681,16 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                Step::GpuWrite(shadow, address, len) => {
+                // (With the copies made on the card, this submission's own
+                // writes are not looked for: a walk of all of them per
+                // refresh, for nothing.)
+                Step::GpuWrite(shadow, address, len) if !copied => {
                     own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
                 }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let me = Arc::as_ptr(shadow) as usize;
-                    if let Some(w) = own.iter().find(|w| !copied && w.0 != me && w.1 < to && w.2 > from) {
+                    if !copied && let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
@@ -2908,16 +2911,34 @@ fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
 fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
+    // up to date at most). By copy in a map, whether shaders write it asked
+    // once per copy (`VICTORY_FLIGHT_CHECKS_MAP=1`): a lock and a search of
+    // the copies so far for each of a submission's ~500 refresh steps.
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+    if flight_checks_map() {
+        let mut by_copy: std::collections::HashMap<usize, (Arc<crate::shadow::Shadow>, usize, usize)> =
+            std::collections::HashMap::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    by_copy
+                        .entry(Arc::as_ptr(shadow) as usize)
+                        .and_modify(|s| (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)))
+                        .or_insert_with(|| (shadow.clone(), *address, *address + *len));
+                }
+            }
+        }
+        spans.extend(by_copy.into_values().filter(|s| s.0.writes_pending()));
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && shadow.writes_pending()
+                {
+                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                    }
                 }
             }
         }
@@ -2946,6 +2967,19 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
         return until;
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from)).then_some(u64::MAX)
+}
+
+/// `VICTORY_FLIGHT_CHECKS_MAP=1` (off by default; read live): the check of
+/// a submission's refreshes against flights' writes takes each copy once
+/// ([`stale_under_flights_until`]), and the submission's one write-watch
+/// asking (`crate::watch::ask_once`) asks, per copy, the ranges refreshed
+/// (joined where within 64 KiB, as [`refresh_ranges`]) instead of their
+/// envelope, when [`refresh_ranges`] is on. Run prep (2026-11-26 02:36):
+/// "write-watch asking + flight checks" 11.6 ms a frame, 42 submissions
+/// of ~520 refresh steps each.
+fn flight_checks_map() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FLIGHT_CHECKS_MAP", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// `VICTORY_SETTLE_PARTIAL=1` (off by default; with `VICTORY_RELAY` and
@@ -5295,30 +5329,53 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            let asking = crate::copytop::start();
+            let ranges: Vec<(usize, usize)> = if refresh_ranges() && flight_checks_map() {
+                // The ranges asked for, per copy, not their envelope.
+                let mut parts: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && !shadow.unwatched()
+                        {
+                            add_range(
+                                parts.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default(),
+                                *address,
+                                *address + *len,
+                            );
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                parts.into_values().flatten().collect()
+            } else {
+                let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && !shadow.unwatched()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                    }
+                }
+                spans.into_values().collect()
+            };
             crate::watch::ask_once(&ranges);
+            crate::copytop::time(crate::copytop::T_ONCE, asking);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
+            let checking = crate::copytop::start();
             let (until, aliased) = if behind {
                 (stale_under_flights_until(runs), aliased_under_flights(runs, behind))
             } else {
                 (None, false)
             };
+            crate::copytop::time(crate::copytop::T_CHECKS, checking);
             if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
                 settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
