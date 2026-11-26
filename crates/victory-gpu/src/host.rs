@@ -1070,7 +1070,7 @@ pub(crate) struct HostList {
     /// clamps of the list after it ([`HostList::clamp_room`]).
     clamp_chunks: Mutex<ClampChunks>,
     /// Hoisted clamps not yet recorded (`crate::indirect::Batch`).
-    clamp_batch: Mutex<Option<crate::indirect::Batch>>,
+    clamp_batch: Mutex<Vec<crate::indirect::Batch>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -6627,7 +6627,7 @@ impl HostList {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             (chunks.used, chunks.at, chunks.barrier, chunks.entries, chunks.later, chunks.bound) = (0, 0, false, 0, 0, false);
             chunks.heads_used = 0;
-            *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7460,7 +7460,7 @@ impl HostList {
     }
 
     /// The hoisted clamps of this list waiting to be recorded together.
-    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Batch>> {
+    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, Vec<crate::indirect::Batch>> {
         self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -8799,6 +8799,27 @@ impl Meter {
             );
         }
         late_line(frames);
+        {
+            let [copies, batches] = crate::texture::take_alias_batch_stats();
+            if copies > 0 || crate::texture::alias_batch() {
+                tracing::info!(
+                    "alias copy batches (VICTORY_ALIAS_BATCH={}): {:.1} copies/frame in {:.1} batches/frame",
+                    u8::from(crate::texture::alias_batch()),
+                    copies as f64 / frames,
+                    batches as f64 / frames,
+                );
+            }
+            let [jobs, dispatches, unbatched] = crate::indirect::take_clamp_merge_stats();
+            if crate::indirect::clamp_merge() || jobs > 0 {
+                tracing::info!(
+                    "clamp merge (VICTORY_CLAMP_MERGE={}): {:.1} batched jobs/frame in {:.1} dispatches/frame ({:.1} unbatched/frame)",
+                    u8::from(crate::indirect::clamp_merge()),
+                    jobs as f64 / frames,
+                    dispatches as f64 / frames,
+                    unbatched as f64 / frames,
+                );
+            }
+        }
         if async_compute() {
             let secs = elapsed.as_secs_f64().max(1e-6);
             let [dispatches, subs, d2c, c2d] =
