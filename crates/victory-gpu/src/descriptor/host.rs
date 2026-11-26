@@ -2827,14 +2827,16 @@ fn integer_format(format: u32) -> bool {
 /// from run to run: zeros there drew mirror-like clothes, skin and floor
 /// (a roughness or colour of 0) on some launches and not on others.
 fn wait_grey() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_GREY").is_none_or(|v| v != "0"))
+    // Live (`crate::live`): for the slots made after a change.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_WAIT_GREY", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
 }
 
 /// `VICTORY_EVICT_GREY` (on; `=0` off): [`grey_for`].
 fn evict_grey() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_GREY").is_none_or(|v| v != "0"))
+    // Live (`crate::live`): for the slots given up after a change.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_EVICT_GREY", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
 }
 
 /// A grey stand-in texture: 4 texels wide (4x4, 4x4x4), one level, RGB 0x80

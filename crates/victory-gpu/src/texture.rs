@@ -525,8 +525,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
+    // Live (`crate::live`): each upload reads it.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_TEXTURE_NO_WAIT", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
 }
 
 /// How many threads detile a large 2D subresource (4 MiB or more), in row

@@ -520,8 +520,9 @@ pub(crate) static HEAP_TEXTURES_CLAMPED: AtomicU64 = AtomicU64::new(0);
 /// unmapped memory (zeros). About 1,700 slots stayed uploaded in part in
 /// the common room, where characters and posters drew black and chrome.
 fn partly_clamp() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTLY_CLAMP").is_none_or(|v| v != "0"))
+    // Live (`crate::live`): for the slots made again after a change.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_PARTLY_CLAMP", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
 }
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.

@@ -1082,8 +1082,10 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// own copies write title memory and not the copy, and the card runs the
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    // Live (`crate::live`): snapshots noted are taken at every submission
+    // whatever it says (`take_snapshots`), and each hand-back merges its ranges whole.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_WIDE_BACK", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 type Job = Box<dyn FnOnce() + Send>;

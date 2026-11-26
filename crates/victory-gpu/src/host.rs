@@ -3543,8 +3543,9 @@ mod late_tests {
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
 fn join_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    // Live (`crate::live`): each copy recorded reads it.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_JOIN_COPIES", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -7150,8 +7151,9 @@ pub(crate) fn wide_textures() -> bool {
 }
 
 fn wide_refresh() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    // Live (`crate::live`): each flush reads it.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_WIDE_REFRESH", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

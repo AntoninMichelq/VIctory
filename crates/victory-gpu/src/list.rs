@@ -1086,8 +1086,9 @@ fn unlike(dst: This, src: This) -> bool {
 /// the recorded copy's state changes do matters there.
 #[cfg(windows)]
 fn skip_self_copies() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SELF_COPY").is_some_and(|v| v == "0"))
+    // Live (`crate::live`): each copy recorded reads it.
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_SELF_COPY", |v, _| u64::from(v.is_some_and(|v| v.trim() == "0"))) == 1
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
