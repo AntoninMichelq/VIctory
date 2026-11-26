@@ -2269,11 +2269,23 @@ impl State {
             crate::resource::shrinking(small);
             let shrunk_before = crate::resource::SHRUNK.load(Ordering::Relaxed);
             let mirroring = std::time::Instant::now();
-            // On the worker the slot shows the view when the upload is in
-            // the queue ([`crate::heap_worker::Batch::publish`]).
+            // On the worker: reserve the slot with the grey stand-in BEFORE
+            // creating/uploading the texture; the real texture is published
+            // once the upload flight lands on the GPU (`crate::heap_worker`).
             let view = match &into {
                 Into::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
-                Into::Ahead(_) => record.as_ref().map(|(view, _)| view.clone()),
+                Into::Ahead(_) => {
+                    let Some(handle) = heap.handle(index) else {
+                        continue;
+                    };
+                    let Some((_, key)) = &record else {
+                        continue;
+                    };
+                    match host.reserve_grey(index, handle, *key) {
+                        Some(v) => Some(v),
+                        None => continue,
+                    }
+                }
             };
             HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);

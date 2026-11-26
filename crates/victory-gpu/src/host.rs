@@ -2800,6 +2800,9 @@ struct Flight {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// Slots reserved grey by `crate::heap_worker` whose uploads ran in this
+    /// flight: switched to the real textures once the flight lands.
+    publish: Vec<crate::heap_worker::ReadyPublish>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -5474,6 +5477,7 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    crate::heap_worker::publish_landed(&flight.publish);
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -5748,8 +5752,9 @@ impl Host {
             return;
         }
         // Textures uploaded ahead (`crate::heap_worker`): their lists run
-        // before the title's.
-        let ahead = crate::heap_worker::take_ready();
+        // before the title's, and their slots switch from grey to the real
+        // textures once this flight lands.
+        let (ahead, ahead_publish) = crate::heap_worker::take_ready();
         if !ahead.is_empty() {
             let first = lists.len();
             order.splice(0..0, first..first + ahead.len());
@@ -5803,6 +5808,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                publish: ahead_publish,
             })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5870,6 +5876,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                publish: Vec::new(),
             })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -6020,6 +6027,7 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
+                        crate::heap_worker::publish_landed(&flight.publish);
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }

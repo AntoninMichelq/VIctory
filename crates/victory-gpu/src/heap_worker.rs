@@ -179,29 +179,52 @@ impl Drop for Batch {
     }
 }
 
+/// Publications deferred until the upload flight lands on the GPU
+/// (`publish_landed`). Keeps the title heap alive until then.
+pub(crate) struct ReadyPublish {
+    publish: Vec<Publish>,
+    _heap: HeldHeap,
+}
+// SAFETY: `Publish` holds plain integers and `HeldHeap` is `Send`.
+unsafe impl Send for ReadyPublish {}
+
 /// The upload lists ready now, for the submission about to be made, which
-/// runs them ahead of its own lists; their host slots are given their views.
+/// runs them ahead of its own lists; their host slots stay on the grey
+/// stand-in until the flight lands (`publish_landed`).
 /// Called by the thread that submits.
-pub(crate) fn take_ready() -> Vec<HostList> {
+pub(crate) fn take_ready() -> (Vec<HostList>, Vec<ReadyPublish>) {
     // (Asked without the lock by every submission of a run without it.)
     if JOB.get().is_none() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let ready = std::mem::take(&mut *lock(&READY));
     STATS[2].fetch_add(ready.len() as u64, Relaxed);
-    ready
-        .into_iter()
-        .map(|r| {
-            for p in &r.publish {
-                let Some(host) = crate::descriptor::heap(p.heap as This).host() else {
-                    continue;
-                };
-                let shown = host.publish(p.index, p.handle, p.key);
-                STATS[if shown { 3 } else { 4 }].fetch_add(1, Relaxed);
-            }
-            r.list
-        })
-        .collect()
+    let mut lists = Vec::with_capacity(ready.len());
+    let mut pubs = Vec::with_capacity(ready.len());
+    for r in ready {
+        lists.push(r.list);
+        if !r.publish.is_empty() {
+            pubs.push(ReadyPublish {
+                publish: r.publish,
+                _heap: r._heap,
+            });
+        }
+    }
+    (lists, pubs)
+}
+
+/// Switches slots reserved by `victory-heap` from the grey stand-in to the
+/// real uploaded textures, called once the upload flight has landed on the GPU.
+pub(crate) fn publish_landed(batches: &[ReadyPublish]) {
+    for batch in batches {
+        for p in &batch.publish {
+            let Some(host) = crate::descriptor::heap(p.heap as This).host() else {
+                continue;
+            };
+            let shown = host.publish(p.index, p.handle, p.key);
+            STATS[if shown { 3 } else { 4 }].fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// The heap the next pass is over, and what wakes the worker.

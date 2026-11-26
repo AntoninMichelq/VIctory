@@ -1723,6 +1723,51 @@ impl HostHeap {
         }
     }
 
+    /// Reserves host slot `index` with the grey stand-in (or null view) BEFORE
+    /// `crate::heap_worker` prepares and uploads the texture for `(handle, key)`.
+    /// Returns `None` if `index` is out of bounds or the title already overwrote
+    /// the slot. Leaves `made[index] = 0` so [`HostHeap::publish`] switches the
+    /// slot to the real texture once the upload flight lands on the GPU.
+    pub(crate) fn reserve_grey(&self, index: u32, handle: u64, key: u64) -> Option<View> {
+        if index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || u64::from(generation) << 32 | u64::from(i) != key {
+            return None;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let view = view_at(i, generation)?;
+        PUBLISHING.set(true);
+        for stale in self.note_buffer(index, Some(&view), true) {
+            if stale != index {
+                self.unmake(&mut made, stale);
+            }
+        }
+        PUBLISHING.set(false);
+        if made[index as usize] != key {
+            let keep_old = keep_views()
+                && view_at(
+                    made[index as usize] as u32,
+                    (made[index as usize] >> 32) as u32,
+                )
+                .is_some_and(|old| same_placed_texture(&old, &view));
+            if !keep_old {
+                made[index as usize] = 0;
+                let greyed = !self.sampler && grey_for(&view, self.cpu(index));
+                if !self.sampler && !greyed {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, None);
+                if is_texture_view(&view) {
+                    self.show(index, if greyed { 2 } else { 3 });
+                }
+            }
+        }
+        Some(view)
+    }
+
     /// Makes host slot `index` from the record at `handle` if it is still
     /// the one with `key`, whose texture's upload is in the queue now
     /// (`crate::heap_worker`). The slot's place in the queue of textures
@@ -3440,14 +3485,16 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&first), false).is_empty());
         let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(index, 1);
-        // Its upload was recorded: out of the queue, the slot not made yet.
+        // Its upload was recorded: out of the queue, the slot reserved grey until it lands.
         heap.texture_slot_done(1, write, None);
+        assert!(heap.reserve_grey(1, handle, key).is_some());
         assert!(!heap.made(1));
         assert!(heap.publish(1, handle, key));
         assert!(heap.made(1));
         assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
         // Written again since the upload was recorded.
         crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        assert!(heap.reserve_grey(1, handle, key).is_none());
         assert!(!heap.publish(1, handle, key));
         assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
