@@ -3,7 +3,93 @@
 //! fields. (Immediate samplers in shader code come decoded with the
 //! translation.)
 
+use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D12::*;
+
+/// Optional mip LOD bias delta from `VICTORY_MIP_BIAS` (`<float>` or `"auto"`).
+/// Unset or `0` = `None` (no change to any sampler or root signature).
+/// `"auto"` uses AMD's FidelityFX recommendation `log2(scale) - 1.0` from
+/// `VICTORY_FFX_SCALE` (e.g. `-2.0` at 0.5, `-2.25` at 0.42).
+pub(crate) fn mip_bias_delta() -> Option<f32> {
+    static DELTA: OnceLock<Option<f32>> = OnceLock::new();
+    *DELTA.get_or_init(|| {
+        let raw = std::env::var("VICTORY_MIP_BIAS").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            return None;
+        }
+        let delta = if trimmed.eq_ignore_ascii_case("auto") {
+            let scale = std::env::var("VICTORY_FFX_SCALE")
+                .ok()
+                .and_then(|s| {
+                    let head = s.split_once(',').map_or(s.as_str(), |(a, _)| a).trim();
+                    if head.eq_ignore_ascii_case("auto") {
+                        Some(0.42f32)
+                    } else {
+                        head.parse::<f32>().ok()
+                    }
+                })
+                .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+                .unwrap_or(0.5);
+            (scale.log2() - 1.0).clamp(-4.0, 0.0)
+        } else {
+            match trimmed.parse::<f32>() {
+                Ok(v) if v.is_finite() && v != 0.0 => v.clamp(-8.0, 8.0),
+                _ => {
+                    tracing::warn!(
+                        value = trimmed,
+                        "VICTORY_MIP_BIAS: expected float (e.g. -1.5) or auto; disabled"
+                    );
+                    return None;
+                }
+            }
+        };
+        tracing::info!(
+            delta = format_args!("{delta:.2}"),
+            "sampler mip LOD bias active (VICTORY_MIP_BIAS)"
+        );
+        Some(delta)
+    })
+}
+
+/// Pure helper: applies `delta` to `orig_bias` only on standard mipmapped
+/// linear/anisotropic samplers (never comparison/shadow, min/max Hi-Z,
+/// point-only, or single-mip samplers), clamped to D3D12's `[-16.0, 15.99]`.
+fn biased_lod(filter: D3D12_FILTER, min_lod: f32, max_lod: f32, orig_bias: f32, delta: f32) -> f32 {
+    let raw = filter.0 as u32;
+    let reduction = raw >> 7;
+    let filter_bits = raw & 0x7F;
+    if reduction != 0 || filter_bits == 0 || max_lod <= min_lod {
+        return orig_bias;
+    }
+    (orig_bias + delta).clamp(-16.0, 15.99)
+}
+
+/// Applies `VICTORY_MIP_BIAS` (if set) to a host sampler's `MipLODBias`.
+pub(crate) fn apply_mip_bias(
+    filter: D3D12_FILTER,
+    min_lod: f32,
+    max_lod: f32,
+    orig_bias: f32,
+) -> f32 {
+    let Some(delta) = mip_bias_delta() else {
+        return orig_bias;
+    };
+    let next = biased_lod(filter, min_lod, max_lod, orig_bias, delta);
+    if next != orig_bias {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                filter = format_args!("{:#x}", filter.0),
+                orig_bias = format_args!("{orig_bias:.2}"),
+                new_bias = format_args!("{next:.2}"),
+                delta = format_args!("{delta:.2}"),
+                "first sampler biased by VICTORY_MIP_BIAS"
+            );
+        });
+    }
+    next
+}
 
 /// The fields both forms share.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,5 +201,22 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    #[test]
+    fn mip_bias_only_affects_standard_mipmapped_linear_samplers() {
+        // Anisotropic mipmapped sampler: gets biased.
+        assert!((biased_lod(D3D12_FILTER(0x55), 0.0, 1000.0, 0.0, -2.25) - -2.25).abs() < 1e-5);
+        // Trilinear mipmapped sampler with existing bias: adds delta, clamps to -16.
+        assert!((biased_lod(D3D12_FILTER(0x15), 0.0, 12.0, -1.0, -2.0) - -3.0).abs() < 1e-5);
+        assert_eq!(biased_lod(D3D12_FILTER(0x15), 0.0, 12.0, -15.0, -3.0), -16.0);
+        // Comparison (shadow) sampler: untouched.
+        assert_eq!(biased_lod(D3D12_FILTER(0x85), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        // Min/Max reduction (Hi-Z) sampler: untouched.
+        assert_eq!(biased_lod(D3D12_FILTER(0x115), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        // Point-only sampler: untouched.
+        assert_eq!(biased_lod(D3D12_FILTER(0x0), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        // Single-mip sampler (MaxLOD <= MinLOD): untouched.
+        assert_eq!(biased_lod(D3D12_FILTER(0x55), 0.0, 0.0, 0.0, -2.25), 0.0);
     }
 }
