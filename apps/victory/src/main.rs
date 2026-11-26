@@ -114,18 +114,27 @@ enum Command {
         /// Cache folder (`VICTORY_CACHE_DIR` layout: `shaders/` and `pipelines/`).
         #[arg(long)]
         cache: PathBuf,
-        /// Folder(s) of console shader containers (`.bin`/`.cdxil`) to translate
-        /// missing shaders from (defaults to `_work\prison\shaders` if present).
+        /// Folder(s) or archive file(s) holding console shader containers
+        /// (`.bin`/`.cdxil`, `shaders.rpf`, game executable/DLLs).
         #[arg(long)]
         shaders: Vec<PathBuf>,
         /// Optional source cache or `pipelines/` folder to seed
         /// `early-pipelines.txt` and `early-recipes.bin` from.
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Worker threads (default: half logical cores, 2 to 8, or
-        /// `VICTORY_PIPELINE_WORKERS`).
+        /// Worker threads (default: half logical cores, 2 to 8 for pipelines;
+        /// up to 16 for `--all-shaders`).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Translate and cache ALL shader containers found in the game files
+        /// (`shaders.rpf`, executable, DLLs, or `--shaders`) into `shaders/`
+        /// without needing pipeline recipes.
+        #[arg(long)]
+        all_shaders: bool,
+        /// Game folder to scan with `--all-shaders` (defaults to `game_dir`
+        /// in `victory.toml` or `C:\Users\4nto\Downloads\GameFolder`).
+        #[arg(long)]
+        game_dir: Option<PathBuf>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -198,7 +207,9 @@ fn main() -> Result<()> {
             shaders,
             from,
             jobs,
-        } => prewarm::run(cache, shaders, from, jobs),
+            all_shaders,
+            game_dir,
+        } => prewarm::run(cache, shaders, from, jobs, all_shaders, game_dir),
         Command::Config => show_config(),
     }
 }
