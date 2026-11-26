@@ -127,7 +127,46 @@ impl Description {
                 && (1..=MAX_SECTION).contains(&s.size)
                 && (!matches!(s.role, Role::Code(_)) || (s.size >= 64 && s.size.is_multiple_of(4)))
         };
-        sections.iter().all(plausible).then_some(Self {
+        if sections.iter().all(plausible) {
+            return Some(Self {
+                root_signature,
+                sections,
+            });
+        }
+        if slot == GRAPHICS_SLOT {
+            return Self::parse_gapped(words, &plausible);
+        }
+        None
+    }
+
+    /// A graphics description whose two programs do not follow each other:
+    /// registers and info, then three (code, map) slots of which one is
+    /// all zeros. A quarter of the title's 0x1c8 descriptions are so laid
+    /// out (4,030 of 16,384 in run walls10, logged with a mesh and a pixel
+    /// program found among their words); read as the usual layout they
+    /// were "not read" and left unmade. The programs are numbered in their
+    /// order, skipping the empty slot.
+    fn parse_gapped(words: &[u64], plausible: &dyn Fn(&Section) -> bool) -> Option<Self> {
+        let root_signature = *words.first()?;
+        let pairs = words.get(1..1 + 2 * (2 + 3 * 2))?;
+        let pair = |i: usize| (pairs[2 * i], pairs[2 * i + 1]);
+        let mut sections = vec![
+            Section { role: Role::Registers, address: pair(0).0, size: pair(0).1 },
+            Section { role: Role::Info, address: pair(1).0, size: pair(1).1 },
+        ];
+        let mut program = 0;
+        let mut empty = 0;
+        for slot in 0..3 {
+            let (code, map) = (pair(2 + 2 * slot), pair(3 + 2 * slot));
+            if code == (0, 0) && map == (0, 0) {
+                empty += 1;
+                continue;
+            }
+            sections.push(Section { role: Role::Code(program), address: code.0, size: code.1 });
+            sections.push(Section { role: Role::Map(program), address: map.0, size: map.1 });
+            program += 1;
+        }
+        (program == 2 && empty == 1 && sections.iter().all(plausible)).then_some(Self {
             root_signature,
             sections,
         })
@@ -922,6 +961,24 @@ mod tests {
         assert!(Description::parse(COMPUTE_SLOT, &missing).is_none());
         // Graphics needs both programs.
         assert!(Description::parse(GRAPHICS_SLOT, &good).is_none());
+    }
+
+    #[test]
+    fn reads_graphics_description_with_an_empty_program_slot() {
+        // As run walls4 logged one: registers, info, a program, an empty
+        // slot, the other program.
+        let words = [
+            0xbb00, 0x10, 0x200, 0x210, 0x50, 0x8000, 0x4a40, 0x260, 0x5b0, 0, 0, 0, 0, 0xd000, 0xd80, 0x900,
+            0x70, 0, 0,
+        ];
+        let d = Description::parse(GRAPHICS_SLOT, &words).unwrap();
+        let code: Vec<_> = d.code().map(|s| (s.role, s.address, s.size)).collect();
+        assert_eq!(code, [(Role::Code(0), 0x8000, 0x4a40), (Role::Code(1), 0xd000, 0xd80)]);
+        assert_eq!(d.sections[5].role, Role::Map(1));
+        // Two empty slots: one program, not a graphics description.
+        let mut one = words;
+        one[13..17].fill(0);
+        assert!(Description::parse(GRAPHICS_SLOT, &one).is_none());
     }
 
     #[test]

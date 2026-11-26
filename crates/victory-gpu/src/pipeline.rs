@@ -1210,17 +1210,19 @@ pub(crate) fn create_from_words(
     (None, stages)
 }
 
-/// `VICTORY_PRECOMPILED_MESH=0`: graphics descriptions of a mesh and a
-/// pixel program stay unmade, as before. On by default (with the pack
-/// named): the world's static geometry is drawn by mesh programs, and
-/// those descriptions were a quarter of the title's (4,030 of 16,384 in run
-/// walls10), their draws missing. Their host pipelines are mesh pipelines
+/// `VICTORY_PRECOMPILED_MESH=1`: graphics descriptions of a mesh and a
+/// pixel program are made too (with the pack named): the world's static
+/// geometry is drawn by mesh programs, and those descriptions were a
+/// quarter of the title's (4,030 of 16,384 in run walls10, read only since
+/// `Description::parse_gapped`). Their host pipelines are mesh pipelines
 /// (`HostPipeline::new` with a mesh stage), made at draws as the others.
+/// Off by default: their registers section is longer (0x200 bytes) than
+/// the ones `GraphicsRegisters::decode` was worked out from.
 #[cfg(windows)]
 fn precompiled_mesh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_PRECOMPILED_MESH").is_none_or(|v| v != "0");
+        let on = std::env::var("VICTORY_PRECOMPILED_MESH").as_deref() == Ok("1");
         tracing::info!(on, "precompiled graphics pipelines of a mesh program made (VICTORY_PRECOMPILED_MESH)");
         on
     })
