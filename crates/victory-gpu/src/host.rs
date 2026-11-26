@@ -2943,9 +2943,11 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
 /// the card's work and every copy-back with it: 58-79 ms a frame waiting
 /// in run cumul4 ("title memory changed under shader writes"), so that
 /// preparing and copying back ran one after the other on every frame.
+/// Live (`crate::live`): read once per submission's check, whose wait it
+/// decides whole (the flights up to one submission, or all of them).
 fn settle_partial() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_SETTLE_PARTIAL").is_some_and(|v| v == "1"))
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_SETTLE_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Before a submission, with [`settle_partial`]: waits until the flights up
