@@ -1126,6 +1126,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
+        // (`VICTORY_SHOW_AFTER`: the host's own contents wait for nothing.)
+        if host_written
+            && crate::show_after::on()
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            crate::show_after::not_uploaded(&copy);
+        }
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -1158,6 +1165,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.keep(&buffer);
+    // The submission that carries it, for the slots that show it once it
+    // has run (`VICTORY_SHOW_AFTER`).
+    if crate::show_after::on()
+        && let Some(copy) = crate::resource::host_copy(resource)
+        && windows::core::Interface::as_raw(&copy.texture) == windows::core::Interface::as_raw(texture)
+    {
+        crate::show_after::recorded(list, &copy);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;

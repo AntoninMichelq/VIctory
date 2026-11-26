@@ -198,11 +198,14 @@ fn take(device: &ID3D12Device, count: u32) -> Option<Taken> {
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
             };
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation; the out pointer is ours.
-            if let Err(e) = unsafe { device.CreateHeap(&raw const desc, &mut made) } {
+            // (`VICTORY_WAIT_RESIDENT=1`: resident before a tile names it.)
+            let made_now = unsafe { device.CreateHeap(&raw const desc, &mut made) }
+                .and_then(|()| made.as_ref().map_or(Ok(()), |h| crate::host::resident(device, h)));
+            if let Err(e) = made_now {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!(error = %e, "no heap for texture levels on demand: those levels stay empty for now");

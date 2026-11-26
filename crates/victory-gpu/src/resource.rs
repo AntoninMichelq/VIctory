@@ -479,15 +479,17 @@ fn twin_texture(
     let made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
-            D3D12_HEAP_FLAG_NONE,
+            crate::host::not_resident(),
             (&raw const d).cast(),
             D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
             None,
             &mut texture,
         )
-    };
+    }
+    .and_then(|()| texture.as_ref().map_or(Ok(()), |t| crate::host::resident(&host.device, t)));
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+        texture = None;
     }
     let Some(texture) = texture else {
         TWINS[1].fetch_add(1, Relaxed);
@@ -542,15 +544,17 @@ fn twin_texture(
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                crate::host::not_resident(),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
                 None,
                 &mut texture,
             )
-        };
+        }
+        .and_then(|()| texture.as_ref().map_or(Ok(()), |t| crate::host::resident(&host.device, t)));
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+            texture = None;
         }
         texture.map(|texture| {
             crate::host::name(&texture, || {
@@ -1132,6 +1136,9 @@ pub(crate) struct HostTexture {
     /// Made without memory, its levels given tiles as the title's memory
     /// holds them (`crate::tiles`, `VICTORY_LEVELS_ON_DEMAND=1`).
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// The submission that carries its first upload (`crate::show_after`):
+    /// 0 none recorded yet, `u64::MAX` recorded in a list not submitted yet.
+    pub(crate) upload: std::sync::atomic::AtomicU64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1864,7 +1871,13 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled,
+            upload: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Whether its contents come from title memory.
+    pub(crate) fn filled(&self) -> bool {
+        self.filled
     }
 }
 
@@ -2391,7 +2404,7 @@ fn host_texture(
     let made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
-            D3D12_HEAP_FLAG_NONE,
+            crate::host::not_resident(),
             (&raw const d).cast(),
             D3D12_RESOURCE_STATES(
                 crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
@@ -2400,9 +2413,12 @@ fn host_texture(
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
-    };
+    }
+    // `VICTORY_WAIT_RESIDENT=1`: mapped for the card before a slot names it.
+    .and_then(|()| texture.as_ref().map_or(Ok(()), |t| crate::host::resident(&host.device, t)));
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        texture = None;
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
