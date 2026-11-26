@@ -4508,6 +4508,12 @@ impl Host {
         }
     }
 
+    /// The queue lists run on: tile mappings (`crate::tiles`) go on it
+    /// ahead of the lists submitted after them.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
@@ -6928,6 +6934,7 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         crate::overlay::frame_rate(hwnd, fps, ms);
+        crate::tiles::status();
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

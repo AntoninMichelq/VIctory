@@ -62,6 +62,13 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The host texture if it is made level by level (`crate::tiles`):
+    /// each detiling gives tiles to the levels the title's memory holds.
+    /// (Weak: the host texture outlives this or the staging goes with it.)
+    on_demand: Option<std::sync::Weak<crate::resource::HostTexture>>,
+    /// A level the title holds is still without tiles (no heap could be
+    /// had): the next refresh gives again and uploads again.
+    retry: std::sync::atomic::AtomicBool,
 }
 
 /// A staging buffer: system memory the size of its texture (counted in
@@ -729,8 +736,24 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
+/// A host copy or resolve writes `resource` in `list`. A host texture made
+/// level by level (`crate::tiles`) first gets what the title holds
+/// uploaded in `list` and tiles for every level: the host's write lands
+/// whatever level it names, and what it does not cover is the title's data
+/// or zeros, not what the tiles' last owner left. (After Marvisak/VIctory
+/// PR #2389.)
+pub(crate) fn host_written(list: &HostList, resource: This) {
+    if !host_wrote(resource as usize)
+        && let Some(host) = crate::resource::host_tiled(resource).and_then(|w| w.upgrade())
+        && let Some(tiled) = &host.tiled
+        && !tiled.whole()
+    {
+        if let Some(s) = staging(resource, &host.texture) {
+            s.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        tiled.give(&host.texture, tiled.every_level());
+        upload(list, resource, &host.texture);
+    }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
@@ -912,6 +935,11 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        // Levels on demand: a level left without tiles last time (no heap)
+        // gets them now if it can, and the upload writes it whole.
+        if self.retry.load(std::sync::atomic::Ordering::Relaxed) && self.give_held() {
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
@@ -1062,8 +1090,43 @@ impl Staging {
         }
     }
 
+    /// Levels on demand (`crate::tiles`): gives tiles to the levels the
+    /// title's memory holds now, which the detiling wrote whole into the
+    /// staging buffer (the others are zeros there). Called at a
+    /// submission's refresh, before its lists run: each list that samples
+    /// the texture copies every level from the staging buffer first.
+    /// Whether tiles were given (or every level had them already).
+    fn give_held(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = self.on_demand.as_ref().and_then(std::sync::Weak::upgrade) else {
+            self.retry.store(false, Relaxed);
+            return false;
+        };
+        let Some(tiled) = &host.tiled else {
+            return false;
+        };
+        if tiled.whole() {
+            self.retry.store(false, Relaxed);
+            return true;
+        }
+        // Title levels to the host copy's: it may leave `skip` off the top
+        // (`crate::resource::mip_skip`).
+        let held = held_levels(&self.layout, |from, len| committed(self.memory.wrapping_add(from), len)) >> self.skip;
+        let all = tiled.give(&host.texture, held);
+        self.retry.store(!all, Relaxed);
+        all
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.detile_levels(tiled);
+        if self.on_demand.is_some() {
+            self.give_held();
+        }
+    }
+
+    /// [`Staging::detile`] without giving tiles.
+    fn detile_levels(&self, tiled: &[u8]) {
         let began = std::time::Instant::now();
         // The staging buffer, made again if it was let go.
         let mut side = self.side.lock().unwrap_or_else(|e| e.into_inner());
@@ -1271,6 +1334,35 @@ pub(crate) fn first_whole_level(resource: This) -> Option<u32> {
         f if f == n => Some(u32::MAX),
         f => Some(f as u32),
     }
+}
+
+/// The levels of a texture of console layout `layout` whose memory is
+/// mapped (a bit a level, level 0 the lowest), `mapped(offset, bytes)`
+/// saying whether that part of the texture's memory is. The console layout
+/// puts the levels the GPU packs into one block first, then the others
+/// from the smallest up, level 0 last (`victory_formats::texture::Layout`);
+/// the packed ones are held together. One this cannot tell the levels of
+/// (an array) holds them all. From Marvisak/VIctory PR #2389.
+fn held_levels(layout: &victory_formats::texture::Layout, mapped: impl Fn(usize, usize) -> bool) -> u32 {
+    let mips = &layout.mips;
+    if layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
+        return u32::MAX;
+    }
+    let there = |from: u64, to: u64| to > from && mapped(from as usize, (to - from) as usize);
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    let mut held = 0u32;
+    for (level, m) in mips.iter().enumerate().take(tail) {
+        let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+        if there(m.offset, end) {
+            held |= 1 << level;
+        }
+    }
+    if tail < mips.len() && there(0, layout.alignment.min(layout.slice_size)) {
+        for level in tail..mips.len() {
+            held |= 1 << level;
+        }
+    }
+    held
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1495,6 +1587,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        on_demand: crate::resource::host_tiled(resource),
+        retry: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1704,5 +1798,45 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod held_levels_tests {
+    use super::held_levels;
+
+    /// Levels on demand: a level is held when its bytes are mapped; level 0
+    /// sits last in the console layout and the packed small levels first,
+    /// held together. (Marvisak/VIctory PR #2389.)
+    #[test]
+    fn held_levels_follow_the_mapped_bytes() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 2048,
+            height: 2048,
+            depth: 1,
+            mips: 12,
+            element_bytes: 8,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        })
+        .unwrap();
+        let tail = layout.first_tail_mip as usize;
+        assert!(tail > 1 && tail < 12, "a 2048 BC1 chain has a tail");
+        let every = (1u32 << 12) - 1;
+        assert_eq!(held_levels(&layout, |_, _| true), every);
+        assert_eq!(held_levels(&layout, |_, _| false), 0);
+        // Everything up to level 0's start mapped: all but level 0.
+        let level0 = layout.mips[0].offset as usize;
+        assert_eq!(held_levels(&layout, |from, len| from + len <= level0), every & !1);
+        // Only the first block (the tail) mapped: the packed levels alone.
+        let first = layout.alignment.min(layout.slice_size) as usize;
+        let held = held_levels(&layout, |from, len| from + len <= first);
+        assert_eq!(held, every & !((1 << tail) - 1));
+        // An array is not told level by level.
+        let array = Layout::new(&Desc { depth: 2, ..layout.desc }).unwrap();
+        assert_eq!(held_levels(&array, |_, _| false), u32::MAX);
     }
 }
