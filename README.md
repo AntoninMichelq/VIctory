@@ -73,7 +73,8 @@ début du jeu (promenade WASD), images par seconde moyennes sur la durée indiqu
 | cumul11e | + pack de shaders (murs) | 7,51 | – | – | 7 min sans plantage |
 | cumul12 + E1 | + `LATE_WAIT_WRITES=0` | 5,5 / 6,6 | – | ~90 ms | murs présents : beaucoup plus de décor dessiné |
 | **cumul14** (tout regroupé, cache plein) | E1 + gains cool-fox + `MEM_GUARD` | 3,1–5,0 | – | 103–121 ms | 3 essais sans plantage dont 16 min (promenade) ; décor complet ; lent à cause des attentes de relecture (E1), correctif en cours (attente ciblée) |
-| **cumul15a0** (attente ciblée groupée) | `LATE_WAIT_TARGETED=1`, `ALIAS_ON_CARD=1`, `VRS=tiles` | **7,0** | – | 57 ms | promenade, murs présents, sans plantage |
+| **ciblee2** (attente ciblée, référence valable) | `LATE_WAIT_TARGETED=1`, `ALIAS_ON_CARD=0` | **6,1–6,8** | – | – | promenade, murs présents, sans plantage |
+| cumul15a0 *(non retenu)* | `LATE_WAIT_TARGETED=1`, `ALIAS_ON_CARD=1`, `VRS=tiles` | 7,0 | – | 57 ms | image fausse (`ALIAS_ON_CARD=1` / `VRS=tiles` cassent les murs et les personnages) — non retenu |
 
 Mémoire : ~21 Go de RAM pour le Jouer. Le premier lancement d'un nouvel exe refait le cache du pilote AMD
 (plus long) ; avec un cache pré-chauffé, l'arrivée dans le monde prend environ une minute.
@@ -105,7 +106,7 @@ Un lanceur interactif (`Jouer VIctory (choix).bat`) propose trois modes au déma
 
 | Touche | Mode | Réglages principaux |
 |---|---|---|
-| `1` | **Équilibré (FSR + VRS)** | Réglages recommandés : `VICTORY_FFX_SCALE=0.42`, netteté RCAS `auto`, biais de mip `auto`, `VICTORY_VRS=tiles`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_HALF=2`. |
+| `1` | **Équilibré (FSR)** | Réglages recommandés : `VICTORY_FFX_SCALE=0.42`, netteté RCAS `auto`, biais de mip `auto`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_HALF=2` (`ALIAS_ON_CARD=0`, VRS désactivé). |
 | `2` | **Qualité** | Sans FSR ni VRS (`VICTORY_FFX_SCALE`, `VICTORY_FFX_SHARPNESS`, `VICTORY_MIP_BIAS` et `VICTORY_VRS` non définis) pour privilégier la netteté native. |
 | `3` | **Léger (petites configs)** | `VICTORY_FFX_SCALE=0.33`, `VICTORY_TEXTURE_HALF=2`, `VICTORY_CARD_BUFFERS_MB=512`, `VICTORY_VRS=tiles`. |
 
