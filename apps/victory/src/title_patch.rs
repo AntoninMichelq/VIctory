@@ -126,6 +126,23 @@ const SCALE_SPAN: usize = 0x68;
 /// Offset of the `f32` scale slot inside the patched scale method.
 const SCALE_SLOT: usize = 0x64;
 
+/// Picks a safe fixed FidelityFX render scale at startup from the host GPU's
+/// dedicated VRAM in MiB (GTA VI 1.0.2.1 only calls `0x28EF680` at init and
+/// overflows its console transient heap above `0.5`).
+fn auto_scale_for_vram(vram_mb: Option<u64>) -> f32 {
+    let base: f32 = match vram_mb {
+        Some(mb) if mb <= 6500 => 0.38,
+        Some(mb) if mb <= 9000 => 0.42,
+        _ => 0.5,
+    };
+    let min = std::env::var("VICTORY_FFX_SCALE_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 0.5)
+        .unwrap_or(0.38);
+    base.clamp(min, 0.5)
+}
+
 fn ffx_scale(image: &LoadedImage) {
     let dynamic = victory_hle::modules::fidelityfx::dynamic_target_ms().is_some();
     let spec = match std::env::var("VICTORY_FFX_SCALE") {
@@ -133,10 +150,26 @@ fn ffx_scale(image: &LoadedImage) {
         Err(_) if dynamic => "0.5".to_string(),
         Err(_) => return,
     };
-    let (scale, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
-    let scale = scale.trim().parse::<f32>().ok().filter(|s| *s > 0.0 && *s <= 1.0);
+    let (scale_str, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
+    let is_auto = scale_str.trim().eq_ignore_ascii_case("auto");
+    let vram_mb = if is_auto {
+        victory_gpu::external::host_vram_mb()
+    } else {
+        None
+    };
+    let scale = if is_auto {
+        Some(auto_scale_for_vram(vram_mb))
+    } else {
+        scale_str
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|s| *s > 0.0 && *s <= 1.0)
+    };
     let (Some(scale), Some(rva)) = (scale, hex(rva)) else {
-        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>[,<hex rva>]");
+        eprintln!(
+            "VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>|auto[,<hex rva>]"
+        );
         return;
     };
     if rva.checked_add(SCALE_SPAN).is_none_or(|end| end > image.info().size_of_image as usize) {
@@ -161,6 +194,11 @@ fn ffx_scale(image: &LoadedImage) {
             eprintln!(
                 "VIctory: FidelityFX render scale at title+{rva:#x} set to {scale} (dynamic slot at +{:#x})",
                 rva + SCALE_SLOT
+            );
+        } else if is_auto {
+            eprintln!(
+                "VIctory: FidelityFX render scale auto-selected {scale} for {} MB VRAM (title+{rva:#x})",
+                vram_mb.map_or_else(|| "?".to_string(), |m| m.to_string())
             );
         } else {
             eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
@@ -234,5 +272,14 @@ mod tests {
     #[test]
     fn the_picker_returns_the_kind() {
         assert_eq!(picker_stub(7), [0xB8, 7, 0, 0, 0, 0xC3]);
+    }
+
+    #[test]
+    fn auto_scale_picks_safe_tier_by_vram() {
+        assert_eq!(auto_scale_for_vram(Some(6144)), 0.38);
+        assert_eq!(auto_scale_for_vram(Some(8176)), 0.42);
+        assert_eq!(auto_scale_for_vram(Some(12288)), 0.5);
+        assert_eq!(auto_scale_for_vram(Some(16384)), 0.5);
+        assert_eq!(auto_scale_for_vram(None), 0.5);
     }
 }

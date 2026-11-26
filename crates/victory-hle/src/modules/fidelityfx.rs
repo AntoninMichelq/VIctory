@@ -329,9 +329,11 @@ impl DynamicController {
         }
     }
 
-    /// Feeds one frame's GPU time sample and returns `Some(new_scale)` when the
-    /// render scale should be updated.
-    fn on_frame(&mut self, gpu_ms: f64, wait_ms: f64, render_size: [u32; 2]) -> Option<f32> {
+    /// Feeds one frame's GPU time samples (`wait_ms` = submission GPU wait
+    /// matching `on the GPU` in `victory_gpu::host`, `busy_ms` = card busy time
+    /// `dt_wall - dt_idle`) and returns `Some(new_scale)` when the render scale
+    /// should be updated.
+    fn on_frame(&mut self, wait_ms: f64, busy_ms: f64, render_size: [u32; 2]) -> Option<f32> {
         if render_size[0] > 0 && render_size[1] > 0 {
             match self.first_render {
                 None => self.first_render = Some(render_size),
@@ -339,19 +341,19 @@ impl DynamicController {
                 _ => {}
             }
         }
-        if !gpu_ms.is_finite() || gpu_ms < 0.0 {
+        if !wait_ms.is_finite() || wait_ms < 0.0 {
             return None;
         }
-        let sample = gpu_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
+        let sample = wait_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
         self.ema_ms = Some(match self.ema_ms {
             Some(prev) => prev * (1.0 - Self::EMA_ALPHA) + sample * Self::EMA_ALPHA,
             None => sample,
         });
-        if wait_ms.is_finite() && wait_ms >= 0.0 {
-            let w = wait_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
+        if busy_ms.is_finite() && busy_ms >= 0.0 {
+            let b = busy_ms.clamp(0.0, Self::MAX_SAMPLE_MS);
             self.wait_ema_ms = Some(match self.wait_ema_ms {
-                Some(prev) => prev * (1.0 - Self::EMA_ALPHA) + w * Self::EMA_ALPHA,
-                None => w,
+                Some(prev) => prev * (1.0 - Self::EMA_ALPHA) + b * Self::EMA_ALPHA,
+                None => b,
             });
         }
         self.frames_seen += 1;
@@ -429,12 +431,12 @@ fn dynamic_on_dispatch(render_size: [u32; 2]) {
             let dt_idle_us = idle_us.saturating_sub(prev_idle);
             let dt_wait_us = wait_us.saturating_sub(prev_wait);
             let wait_ms = dt_wait_us as f64 / 1000.0;
-            let gpu_ms = if signals > 0 {
+            let busy_ms = if signals > 0 {
                 (dt_wall_us.saturating_sub(dt_idle_us) as f64 / 1000.0).max(wait_ms)
             } else {
                 wait_ms
             };
-            if let Some(new_scale) = state.ctrl.on_frame(gpu_ms, wait_ms, render_size) {
+            if let Some(new_scale) = state.ctrl.on_frame(wait_ms, busy_ms, render_size) {
                 write_scale_slot(new_scale);
             }
         }
@@ -446,8 +448,8 @@ fn dynamic_on_dispatch(render_size: [u32; 2]) {
             scale = format_args!("{:.3}", c.current_scale),
             min = format_args!("{:.3}", c.scale_min),
             max = format_args!("{:.3}", c.scale_max),
-            gpu_ms = format_args!("{:.1}", c.ema_ms.unwrap_or(0.0)),
-            wait_ms = format_args!("{:.1}", c.wait_ema_ms.unwrap_or(0.0)),
+            gpu_wait_ms = format_args!("{:.1}", c.ema_ms.unwrap_or(0.0)),
+            card_busy_ms = format_args!("{:.1}", c.wait_ema_ms.unwrap_or(0.0)),
             target_ms = format_args!("{:.1}", c.target_ms),
             render = ?render_size,
             max_render = ?c.max_render,
@@ -456,6 +458,14 @@ fn dynamic_on_dispatch(render_size: [u32; 2]) {
             title_followed = c.title_followed,
             "FidelityFX dynamic scale"
         );
+        if c.adjustments >= 2 && !c.title_followed {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::info!(
+                    "FidelityFX dynamic scale: title kept renderSize unchanged after scale updates; use VICTORY_FFX_SCALE=auto or a fixed scale"
+                );
+            });
+        }
     }
 }
 

@@ -53,3 +53,8 @@ pub fn record<R>(
 pub fn card_totals_us() -> (u64, u64, u64) {
     crate::host::card_totals_us()
 }
+
+/// The host GPU's dedicated video memory in MiB, or `None` without a host GPU.
+pub fn host_vram_mb() -> Option<u64> {
+    crate::host::host().and_then(crate::host::Host::dedicated_vram_mb)
+}
