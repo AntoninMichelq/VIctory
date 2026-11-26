@@ -3566,7 +3566,10 @@ mod tests {
 
         let list = host.new_list().unwrap();
         crate::texture::upload(&list, view, sampled);
-        assert!(crate::texture::alias(&list, view, source));
+        assert!(matches!(
+            crate::texture::alias(&list, view, source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32),
+            crate::texture::Alias::Copied
+        ));
         crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
         list.close();
