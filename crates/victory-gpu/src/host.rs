@@ -3635,6 +3635,47 @@ pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
 
+/// `VICTORY_LATE_FRAMES=<n>` (with the relay; unset or 0: off, as before):
+/// a present waits until the flights sent before the present `n` frames
+/// earlier have landed, and only those. With the present free of settles
+/// (`VICTORY_LATE_WAIT=3`) nothing bounded how far behind the title memory
+/// the card writes could fall. The title reads results its shaders wrote
+/// (its visibility culling) some frames later without waiting for a fence,
+/// as the console's frame latency lets it: read before they landed, rooms
+/// were judged hidden and not drawn (the prison's missing walls, ceilings
+/// and floors, D1: gone with `LATE_WAIT=0`, `RELAY=0`, or with the present
+/// settling everything, `LATE_WAIT=2`, at a cost). With `n = 1` a frame's
+/// work is home by the end of the next frame.
+pub(crate) fn late_frames_bound() {
+    static FRAMES: OnceLock<usize> = OnceLock::new();
+    let n = *FRAMES.get_or_init(|| {
+        let n = std::env::var("VICTORY_LATE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        tracing::info!(frames = n, relay = relay(), "flights landed by the present that many frames later (VICTORY_LATE_FRAMES)");
+        n
+    });
+    if n == 0 || !relay() {
+        return;
+    }
+    // The last submission's number at each present, the oldest first.
+    static MARKS: Mutex<std::collections::VecDeque<u64>> = Mutex::new(std::collections::VecDeque::new());
+    let target = {
+        let mut marks = MARKS.lock().unwrap_or_else(|e| e.into_inner());
+        marks.push_back(STARTED.load(Ordering::Acquire));
+        if marks.len() <= n {
+            return;
+        }
+        marks.pop_front().unwrap_or(0)
+    };
+    // Landed: no flight up to `target` left in the line, and none being
+    // landed (the flights taken out for landing are older than all left;
+    // `FINISHED` is the last landed, which submissions settled at once,
+    // not flights, never move).
+    relay_wait(WHY_SYNC, |line| {
+        !line.line.iter().any(|i| matches!(i, Late::Run(f) if f.number <= target))
+            && (!line.settling || FINISHED.load(Ordering::Acquire) >= target)
+    });
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
