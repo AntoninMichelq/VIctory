@@ -1228,6 +1228,97 @@ impl HostHeap {
         slots.len()
     }
 
+    /// `VICTORY_REASK_BLANK=1` (off by default, ported from fxceless 06702fe8):
+    /// re-queues placed texture slots that currently read as null and are not
+    /// in any texture queue once their first page is committed.
+    fn reask_blank() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_REASK_BLANK").is_some_and(|v| v == "1"))
+    }
+
+    /// Re-queues up to 128 blank placed texture slots at most once per second
+    /// when `VICTORY_REASK_BLANK=1` is active. A slot asked 3 times that stays
+    /// blank is left alone for 30 s.
+    pub(crate) fn texture_slots_blank(&self, frame: u64) -> usize {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        const REASK_A_PASS: usize = 128;
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        static ASKED: Mutex<Option<std::collections::HashMap<u32, (u8, u64)>>> = Mutex::new(None);
+        if self.sampler || !Self::reask_blank() {
+            return 0;
+        }
+        let now = crate::host::now_ms();
+        let last = LAST.load(Relaxed);
+        if now.saturating_sub(last) < 1_000 || LAST.swap(now, Relaxed) != last {
+            return 0;
+        }
+        let slots: Vec<(u32, u64)> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.by_slot.iter().map(|(&slot, &start)| (slot, start)).collect()
+        };
+        let keys: Vec<u64> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&(slot, _)| made.get(slot as usize).copied().unwrap_or(0)).collect()
+        };
+        let kept_some: Vec<bool> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .iter()
+                .map(|&(slot, _)| kept.get(slot as usize).is_some_and(Option::is_some))
+                .collect()
+        };
+        let queued: Vec<bool> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&(slot, _)| textures.slots.contains_key(&slot)).collect()
+        };
+        let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = asked.get_or_insert_with(std::collections::HashMap::new);
+        let mut due = Vec::new();
+        for (i, &(slot, start)) in slots.iter().enumerate() {
+            if due.len() >= REASK_A_PASS {
+                break;
+            }
+            if self.tabled_lately(slot, frame) {
+                continue;
+            }
+            let key = keys[i];
+            let shows = key != 0 && kept_some[i];
+            let class_n = !shows && key == 0 && !queued[i];
+            if !class_n {
+                asked.remove(&slot);
+                continue;
+            }
+            let (times, since) = asked.get(&slot).copied().unwrap_or((0, 0));
+            if times >= 3 && now.saturating_sub(since) < 30_000 {
+                continue;
+            }
+            if !crate::texture::committed(start as *const u8, 1) {
+                continue;
+            }
+            asked.insert(slot, (if times >= 3 { 1 } else { times + 1 }, now));
+            due.push(slot);
+        }
+        if due.is_empty() {
+            return 0;
+        }
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &due {
+                textures.changed(slot, frame, frame + 1);
+            }
+        }
+        let prev = TOTAL.fetch_add(due.len() as u64, Relaxed);
+        if prev == 0 || (prev / 500) != ((prev + due.len() as u64) / 500) {
+            tracing::info!(
+                batch = due.len(),
+                total = prev + due.len() as u64,
+                "VICTORY_REASK_BLANK=1 re-queued null placed texture slots"
+            );
+        }
+        due.len()
+    }
+
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
