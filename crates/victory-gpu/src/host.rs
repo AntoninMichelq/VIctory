@@ -8725,6 +8725,14 @@ impl Host {
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
+    /// The host adapter's dedicated video memory in MiB (`GetDesc1`), if known.
+    pub(crate) fn dedicated_vram_mb(&self) -> Option<u64> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: plain DXGI descriptor query on our live adapter.
+        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        Some((desc.DedicatedVideoMemory as u64) >> 20)
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
