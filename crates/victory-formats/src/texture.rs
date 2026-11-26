@@ -599,6 +599,44 @@ impl Layout {
         })
     }
 
+    /// Detiles a compact band of element rows from a single 2D subresource.
+    /// The tiled slice keeps its origin; the linear slice starts at the first row.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        linear: &mut [u8],
+        row_pitch: usize,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), Error> {
+        if self.desc.dimension != Dimension::Tex2d
+            || self.slices != 1
+            || self.mips.len() != 1
+            || self.mips[0].depth != 1
+        {
+            return Err(Error::Invalid);
+        }
+        let m = &self.mips[0];
+        if rows.is_empty() || rows.end > m.height {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let need = (rows.len() - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if tiled.len() < self.size as usize || linear.len() < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        self.walk_rows(m, 0, rows, row_pitch, 0, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        });
+        Ok(())
+    }
+
     /// Detiles a tiled 2D subresource in independent row bands. The caller
     /// chooses a worker count appropriate for the size of the subresource.
     /// Linear and volume textures use the ordinary path.
@@ -927,6 +965,42 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn compact_detile_rows_match_the_same_rows_from_a_full_detile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            for block in [1, 4] {
+                let element = if block == 4 { 16 } else { 4 };
+                let l = Layout::new(&Desc {
+                    block,
+                    ..desc(260, 516, 1, element, swizzle)
+                })
+                .unwrap();
+                let tiled: Vec<u8> = (0..l.size).map(|i| (i ^ (i >> 8)) as u8).collect();
+                let m = &l.mips[0];
+                let stride = (m.width * element) as usize;
+                let mut full = vec![0; stride * m.height as usize];
+                l.detile(&tiled, 0, 0, &mut full, stride, 0).unwrap();
+                let first = m.height - 5;
+                let mut band = vec![0; stride * 5];
+                l.detile_rows(&tiled, &mut band, stride, first..m.height)
+                    .unwrap();
+                assert_eq!(band, full[first as usize * stride..], "{swizzle:?}, {block}");
+                assert_eq!(
+                    l.detile_rows(&tiled, &mut band, stride, first..first),
+                    Err(Error::Invalid)
+                );
+                assert_eq!(
+                    l.detile_rows(&tiled, &mut band, stride, first..m.height + 1),
+                    Err(Error::Invalid)
+                );
+                assert_eq!(
+                    l.detile_rows(&tiled, &mut band[..stride], stride, first..m.height),
+                    Err(Error::TooSmall)
+                );
+            }
         }
     }
 

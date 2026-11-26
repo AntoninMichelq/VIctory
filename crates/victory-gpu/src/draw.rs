@@ -1140,7 +1140,8 @@ impl State {
         };
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        let root_changed = self.host_roots[usize::from(compute)] != root;
+        if root_changed {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1153,14 +1154,15 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        let pso = p.pso.as_raw() as usize;
+        let pipeline_changed = self.host_pipeline != pso;
+        if pipeline_changed {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
-            // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            self.host_pipeline = pso;
+        }
+        if pipeline_changed || (crate::host::tex_upload_pool() && root_changed) {
+            list.keep_pipeline(p);
         }
         for stage in &p.stages {
             let t = stage.translated();
