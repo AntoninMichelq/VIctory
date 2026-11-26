@@ -110,8 +110,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave};
-pub use rect::rect_list_gs;
+pub use lower::{host_max_wave, set_host_max_wave, with_flat_instances};
+pub use rect::{rect_list_gs, with_flat_rects};
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_TABLE_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
@@ -447,6 +447,33 @@ fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Resu
     let io = io::raise(&p, native)?;
     let st = st?;
     emit(c, native, &p, &st, &io, &res)
+}
+
+thread_local! {
+    /// [`with_no_structures`]'s choice, for this thread's translations.
+    static NO_STRUCTURES_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with every ray-tracing node test
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) answering as a
+/// structure with nothing in it would: a box node returns no children, a
+/// leaf a miss, and no node is read. For runs without the title's structure
+/// builder (its stages are dropped), whose structures' memory holds whatever
+/// was there: traversing it gave the trace programs garbage hits and misses,
+/// which came out as 16-pixel blocks on the screen-space tracing's tiles
+/// (runs 113/114: present in all 21 frames with the builder off, gone with
+/// it on). With nothing to hit every ray misses, as an empty structure's
+/// would.
+pub fn with_no_structures<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = NO_STRUCTURES_HERE.replace(on);
+    let out = f();
+    NO_STRUCTURES_HERE.set(before);
+    out
+}
+
+/// Whether [`with_no_structures`] asked for it on this thread.
+pub(crate) fn no_structures_here() -> bool {
+    NO_STRUCTURES_HERE.get()
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -872,6 +899,31 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// The render targets a translated pixel shader writes (`dxil`, as
+/// [`HostShader::dxil`]): bit `i` for `SV_Target<i>`; `None` if it has no
+/// output signature that reads.
+pub fn pixel_targets(dxil: &[u8]) -> Option<u8> {
+    let c = Container::parse(dxil).ok()?;
+    targets_written(c.part(FourCC::OSG1)?.data)
+}
+
+/// The `SV_Target` indices an `OSG1` part declares, as bits.
+fn targets_written(part: &[u8]) -> Option<u8> {
+    use crate::dxbc::u32_at;
+    const TARGET: u32 = 64;
+    let count = u32_at(part, 0).ok()? as usize;
+    let base = u32_at(part, 4).ok()? as usize;
+    let mut bits = 0u8;
+    for i in 0..count {
+        let at = base + 32 * i;
+        if u32_at(part, at + 12).ok()? == TARGET {
+            let index = u32_at(part, at + 8).ok()?;
+            bits |= 1u8.checked_shl(index).unwrap_or(0);
+        }
+    }
+    Some(bits)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -2025,5 +2077,34 @@ mod merged_gs_tests {
             Err(ShaderError::Unsupported { what, .. })
                 if what == "an address in an SGPR that is no root parameter"
         ));
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    /// An `OSG1` part of (system value, semantic index) rows.
+    fn part(rows: &[(u32, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend((rows.len() as u32).to_le_bytes());
+        p.extend(8u32.to_le_bytes());
+        for &(system, index) in rows {
+            // stream, name offset, index, system value, type, register,
+            // mask and the rest.
+            for w in [0, 0, index, system, 3, index, 0xf, 0] {
+                p.extend(u32::to_le_bytes(w));
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn targets_written_are_the_sv_target_rows() {
+        assert_eq!(super::targets_written(&part(&[(64, 0)])), Some(1));
+        assert_eq!(super::targets_written(&part(&[(64, 0), (64, 2)])), Some(0b101));
+        // Depth only, or nothing: no target written.
+        assert_eq!(super::targets_written(&part(&[(65, 0)])), Some(0));
+        assert_eq!(super::targets_written(&part(&[])), Some(0));
+        // Cut short.
+        assert_eq!(super::targets_written(&part(&[(64, 1)])[..20]), None);
     }
 }

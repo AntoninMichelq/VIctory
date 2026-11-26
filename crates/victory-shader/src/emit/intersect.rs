@@ -116,6 +116,9 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        if crate::emit::no_structures_here() {
+            return self.bvh_empty(inst, &regs, dst, guard);
+        }
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -216,6 +219,26 @@ impl<'a> Lower<'a> {
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
+            self.write(inst, Reg::V(dst + k as u8), r, guard);
+        }
+        Ok(())
+    }
+
+    /// The node test of a structure with nothing in it
+    /// ([`crate::emit::with_no_structures`]): a box node (kind 4 or 5) returns no
+    /// children ([`bvh::NONE`] four times), any other kind a triangle miss
+    /// ([`bvh::MISS`]); nothing is read.
+    fn bvh_empty(&mut self, inst: &Inst, regs: &[u8], dst: u8, guard: Option<V>) -> Result<(), Why> {
+        let pointer = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+        let pointer = self.i32_of(pointer)?;
+        let c = self.cur;
+        let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+        let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+        let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+        let none = self.s.m.i32(bvh::NONE);
+        for (k, miss) in bvh::MISS.into_iter().enumerate() {
+            let miss = self.s.m.i32(miss.to_bits());
+            let r = self.s.m.select(c, is_box, none, miss);
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())

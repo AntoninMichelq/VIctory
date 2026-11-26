@@ -124,6 +124,48 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// Has every host slot of the shader-visible heaps that shows one of the
+/// host textures `old` (raw pointers) made again from the title's view,
+/// with the texture's new host copy (`crate::resource::loading_full_frame`);
+/// until then they keep showing `old` (never a null view: lists in flight
+/// may read them). Returns how many slots there were.
+#[cfg(windows)]
+pub(crate) fn forget_views_of(old: &[*mut std::ffi::c_void]) -> usize {
+    if old.is_empty() {
+        return 0;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, under
+        // the lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            n += host.forget_views_of(old);
+        }
+    }
+    n
+}
+
+/// Title slots of texture views in the shader-visible heaps by what they
+/// show: host copy, grey stand-in, null view (`crate::quality`).
+#[cfg(windows)]
+pub(crate) fn shown_census() -> [u64; 3] {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = [0u64; 3];
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, under
+        // the lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            for (all, one) in n.iter_mut().zip(host.shown_census()) {
+                *all += one;
+            }
+        }
+    }
+    n
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
@@ -202,6 +244,18 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// Equality key for render-target/depth bind deduplication
+    /// (`VICTORY_BIND_CACHE=1`): resource pointer, whether a view description
+    /// was supplied, and the description words when present.
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, u32, [u32; 6]) {
+        (
+            self.resource as usize,
+            self.described,
+            if self.described != 0 { self.desc } else { [0; 6] },
+        )
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -690,6 +744,17 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped whenever [`forget`] invalidates at least one buffer view: lets
+/// `VICTORY_PLAN_REUSE=1` skip full bindless buffer-slot rescans while no
+/// buffer resource has been released.
+#[cfg(windows)]
+static BUFFER_FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn buffer_forgotten_epoch() -> u64 {
+    BUFFER_FORGOTTEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -701,6 +766,8 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    #[cfg(windows)]
+    let mut forgot_any = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -708,12 +775,20 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
+        #[cfg(windows)]
+        {
+            forgot_any = true;
+        }
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+    }
+    #[cfg(windows)]
+    if forgot_any {
+        BUFFER_FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1186,5 +1261,37 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_record_key_ignores_desc_when_undescribed() {
+        let a = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: 0x1000usize as This,
+            desc: [1, 2, 3, 4, 5, 6],
+        };
+        let b = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: 0x1000usize as This,
+            desc: [9, 9, 9, 9, 9, 9],
+        };
+        let c = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [28, 4, 0, 0, 0, 0],
+        };
+        let d = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [29, 4, 0, 0, 0, 0],
+        };
+        assert_eq!(a.key(), b.key());
+        assert_ne!(a.key(), c.key());
+        assert_ne!(c.key(), d.key());
     }
 }

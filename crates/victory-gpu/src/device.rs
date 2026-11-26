@@ -373,14 +373,39 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Counts the precompiled pipelines made at device methods 0x1c8 and
+/// 0x218 (`slot`) against the calls whose description was read, and logs
+/// both slots' counts at the first calls and at powers of two.
+#[cfg(windows)]
+fn tally_precompiled(slot: usize, made: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let i = usize::from(slot == crate::precompiled::COMPUTE_SLOT);
+    if made {
+        MADE[i].fetch_add(1, Ordering::Relaxed);
+    }
+    let n = CALLS[i].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        let count = |i: usize| (MADE[i].load(Ordering::Relaxed), CALLS[i].load(Ordering::Relaxed));
+        let ((g, gn), (c, cn)) = (count(0), count(1));
+        tracing::info!("precompiled pipelines: graphics made {g} of {gn} calls, compute made {c} of {cn}");
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// pipeline, silently. The descriptions name precompiled parts: a root
+/// signature, then the registers, info, code and map sections of each
+/// program ([`crate::precompiled`]). A compute pipeline is made when its
+/// program's container is known (given by the title, or found in the
+/// shader pack named by `VICTORY_SHADER_PACK`), and with that pack named a
+/// graphics one when both its programs' are (its host pipelines made at
+/// its draws, for the targets bound); the others fail as they
+/// always did, with `out` null, and the first ones log the description's
+/// words and what its first word points at.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -395,6 +420,40 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    // The shader containers among the description's first 32 words: a
+    // compute shader alone, or a vertex and a pixel shader, are made into a
+    // pipeline (`pipeline::create_from_words`). `VICTORY_UNKNOWN_PIPELINES=0`
+    // leaves them all unmade, as before.
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_UNKNOWN_PIPELINES").is_none_or(|v| v != "0"))
+            && !desc.is_null()
+        {
+            let mut bytes = [0u8; 256];
+            if crate::host::read_into(desc, &mut bytes) {
+                let words: Vec<u64> =
+                    bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+                let read = |at: usize, into: &mut [u8]| crate::host::read_into(at as *const u8, into);
+                let (made, stages) = crate::pipeline::create_from_words(SLOT, &words, read, _iid, out);
+                static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+                let n = MADE[usize::from(made.is_some())].fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::info!(
+                        slot = format_args!("{:#x}", SLOT),
+                        ?stages,
+                        made = made.map(|hr| format!("{hr:?}")),
+                        times = n,
+                        "a pipeline of a creation method whose description is not known: shader containers found in it"
+                    );
+                }
+                tally_precompiled(SLOT, made.is_some_and(|hr| hr >= 0));
+                if let Some(hr) = made {
+                    return hr;
+                }
+            }
+        }
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither

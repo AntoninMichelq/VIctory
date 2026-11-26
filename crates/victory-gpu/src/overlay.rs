@@ -47,7 +47,10 @@ const WIDTH: i32 = 330;
 /// The box's height: five lines of numbers, a separator and the
 /// settings' lines.
 fn height() -> i32 {
-    98 + settings().len() as i32 * 17 + if settings().is_empty() { 0 } else { 8 }
+    // Consolas at 15 px takes about 18 px a line: give each 19 and keep
+    // room above and below so the last line is never cut.
+    let lines = 5 + if settings().is_empty() { 0 } else { 1 + settings().len() as i32 };
+    12 + lines * 19
 }
 
 /// The special settings this run has on, as the user calls them: the
@@ -61,18 +64,10 @@ fn settings() -> &'static [&'static str] {
             crate::console::Console::SeriesS => "Mode Series S (FSR, effets bas)",
             crate::console::Console::SeriesX => "Mode Series X (qualite)",
         }];
-        let switches: [(&[&str], &str); 10] = [
-            (&["VICTORY_FFX_SCALE", "VICTORY_UPSCALER"], "FSR AMD (rendu plus bas)"),
-            (&["VICTORY_LATE_WAIT"], "CPU et GPU en parallele"),
-            (&["VICTORY_RELAY"], "Recopies sur un coeur a part"),
-            (&["VICTORY_WIDE_REFRESH", "VICTORY_WIDE_BACK", "VICTORY_WIDE_MERGE"], "Copies multi-coeurs"),
-            (&["VICTORY_JOIN_COPIES"], "Copies groupees"),
-            (&["VICTORY_TEXTURE_NO_WAIT"], "Textures sans attente"),
-            (&["VICTORY_INPLACE"], "Memoire en place"),
-            (&["VICTORY_TEXTURE_HALF"], "Textures basse resolution"),
-            (&["VICTORY_BVH_BUILDER"], "Rayons (RT) actifs"),
-            (&["VICTORY_ROOT_UAVS_ONLY", "VICTORY_ROOT_UAVS"], "Eclairage calcule"),
-        ];
+        // Only the two lines the user wants to see: the console mode
+        // above and FSR here.
+        let switches: [(&[&str], &str); 1] =
+            [(&["VICTORY_FFX_SCALE", "VICTORY_UPSCALER"], "FSR AMD (rendu plus bas)")];
         for (names, label) in switches {
             if names.iter().any(|n| set(n)) {
                 out.push(label);

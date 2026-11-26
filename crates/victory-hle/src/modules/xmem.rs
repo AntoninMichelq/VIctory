@@ -370,6 +370,63 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The same views by section and first page index ([`ViewIndex`]).
+    by_section: ViewIndex,
+}
+
+/// Mapped views by what they show: (section, first page index) to their
+/// addresses, and the most pages a view of each section has held (never
+/// lowered), so the views overlapping pages `[first, last)` of a section
+/// are among those starting in `[first - widest, last)`. The GPU side maps
+/// one view per page, so the title's views number in the tens of
+/// thousands: looking through all of them for each DirectStorage read
+/// (`physical_written`, under the lock every worker takes) is what this
+/// spares.
+#[derive(Default)]
+struct ViewIndex {
+    starts: BTreeMap<(usize, usize), Vec<usize>>,
+    widest: HashMap<usize, usize>,
+}
+
+impl ViewIndex {
+    fn insert(&mut self, at: usize, len: usize, slice: &Slice) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        self.starts.entry((section, slice.index)).or_default().push(at);
+        let widest = self.widest.entry(section).or_default();
+        *widest = (*widest).max(len.div_ceil(PAGE));
+    }
+
+    fn remove(&mut self, at: usize, slice: &Slice) {
+        let key = (Arc::as_ptr(&slice.section) as usize, slice.index);
+        if let Some(ats) = self.starts.get_mut(&key) {
+            ats.retain(|&a| a != at);
+            if ats.is_empty() {
+                self.starts.remove(&key);
+            }
+        }
+    }
+
+    /// Addresses of the views of `section` that may overlap its pages
+    /// `[first, last)` (a superset: callers check the overlap).
+    fn near(&self, section: &Arc<Section>, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let key = Arc::as_ptr(section) as usize;
+        let widest = self.widest.get(&key).copied().unwrap_or(0);
+        self.starts
+            .range((key, first.saturating_sub(widest))..(key, last))
+            .flat_map(|(_, ats)| ats.iter().copied())
+    }
+}
+
+/// `VICTORY_PHYS_INDEX=1`: DirectStorage writes to physical pages find
+/// the title's views of them through [`ViewIndex`] instead of looking at
+/// every view. Off: every view, as before.
+fn index_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = std::env::var("VICTORY_PHYS_INDEX").as_deref() == Ok("1");
+        tracing::info!(on, "views of physical pages found by section (VICTORY_PHYS_INDEX)");
+        on
+    });
+    *ON
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -552,28 +609,43 @@ pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
     let Some(runs) = runs(pages, offset, len) else {
         return;
     };
-    let mut seen: Vec<(usize, usize)> = Vec::new();
-    {
-        let physical = physical();
-        for (slice, n) in &runs {
-            let (first, last) = (slice.index, slice.index + n);
-            for (&at, (size, view)) in &physical.views {
-                if !Arc::ptr_eq(&view.section, &slice.section) {
-                    continue;
-                }
-                let (from, to) = (view.index, view.index + size.div_ceil(PAGE));
-                let (lo, hi) = (first.max(from), last.min(to));
-                if lo < hi {
-                    let start = at + (lo - from) * PAGE;
-                    let end = (at + (hi - from) * PAGE).min(at + size);
-                    seen.push((start, end - start));
-                }
-            }
-        }
-    }
+    let seen = written_ranges(&physical(), &runs, index_on());
     for (at, len) in seen {
         victory_gpu::kernel_will_write(at, len);
     }
+}
+
+/// The title's address ranges showing the pages of `runs`: through the
+/// index, or by looking at every view.
+fn written_ranges(physical: &Physical, runs: &[(Slice, usize)], indexed: bool) -> Vec<(usize, usize)> {
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    for (slice, n) in runs {
+        let (first, last) = (slice.index, slice.index + n);
+        let mut look = |at: usize, size: usize, view: &Slice| {
+            if !Arc::ptr_eq(&view.section, &slice.section) {
+                return;
+            }
+            let (from, to) = (view.index, view.index + size.div_ceil(PAGE));
+            let (lo, hi) = (first.max(from), last.min(to));
+            if lo < hi {
+                let start = at + (lo - from) * PAGE;
+                let end = (at + (hi - from) * PAGE).min(at + size);
+                seen.push((start, end - start));
+            }
+        };
+        if indexed {
+            for at in physical.by_section.near(&slice.section, first, last) {
+                if let Some((size, view)) = physical.views.get(&at) {
+                    look(at, *size, view);
+                }
+            }
+        } else {
+            for (&at, (size, view)) in &physical.views {
+                look(at, *size, view);
+            }
+        }
+    }
+    seen
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -780,6 +852,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.by_section.insert(base, len, &slice);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -858,6 +931,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.by_section.remove(at, &slice);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1338,6 +1412,40 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn the_view_index_finds_what_looking_at_every_view_finds() {
+        // Views of two sections, one per page and wider ones, as maps and
+        // unmaps leave them (no host mapping: the bookkeeping alone).
+        let sections = [Arc::new(Section(std::ptr::null_mut())), Arc::new(Section(std::ptr::null_mut()))];
+        let mut physical = Physical::default();
+        let add = |physical: &mut Physical, at: usize, pages: usize, s: usize, index: usize| {
+            let slice = Slice { section: sections[s].clone(), index };
+            physical.by_section.insert(at, pages * PAGE, &slice);
+            physical.views.insert(at, (pages * PAGE, slice));
+        };
+        for i in 0..40 {
+            add(&mut physical, 0x1000_0000 + i * PAGE, 1, i % 2, i / 2);
+        }
+        add(&mut physical, 0x2000_0000, 7, 0, 3);
+        add(&mut physical, 0x3000_0000, 2, 1, 18);
+        add(&mut physical, 0x4000_0000, 5, 0, 0);
+        // One taken away, as `unmap` does.
+        let (_, slice) = physical.views.remove(&(0x1000_0000 + 4 * PAGE)).expect("mapped");
+        physical.by_section.remove(0x1000_0000 + 4 * PAGE, &slice);
+        for s in 0..2 {
+            for first in 0..22 {
+                for n in 1..6 {
+                    let runs = [(Slice { section: sections[s].clone(), index: first }, n)];
+                    let mut all = written_ranges(&physical, &runs, false);
+                    let mut indexed = written_ranges(&physical, &runs, true);
+                    all.sort_unstable();
+                    indexed.sort_unstable();
+                    assert_eq!(indexed, all, "section {s}, pages {first}+{n}");
+                }
+            }
+        }
     }
 
     #[test]

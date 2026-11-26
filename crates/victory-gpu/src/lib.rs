@@ -43,14 +43,18 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+pub mod live;
 pub mod object;
 #[cfg(windows)]
 mod overlay;
 pub mod pipeline;
+pub mod precompiled;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -60,10 +64,24 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod copytop;
+#[cfg(windows)]
+mod cpuframe;
+#[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod prepstats;
+#[cfg(windows)]
+mod quality;
+#[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiles;
 #[cfg(windows)]
 mod watch;
 

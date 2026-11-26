@@ -72,6 +72,22 @@ impl Pending {
     }
 }
 
+/// Why a pipeline has no host pipeline, for the dropped draws' report:
+/// still being made, a shader that does not translate, or refused (on
+/// `VICTORY_NO_COMPILE`, a stage we do not run, or the host's creation
+/// failed); `None` if it has one.
+#[cfg(windows)]
+pub(crate) fn lacks(p: &Pending) -> Option<&'static str> {
+    match p.made.get() {
+        Some(Some(_)) => None,
+        None => Some("waiting: its host pipeline is being made"),
+        Some(None) if p.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))) => {
+            Some("a shader that does not translate")
+        }
+        Some(None) => Some("refused (VICTORY_NO_COMPILE, a stage not run, or the host's creation failed)"),
+    }
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
@@ -125,7 +141,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+        super::library::note_used(&p.key, &p.shaders, p.graphics.as_deref());
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -139,6 +155,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// The stages and hashes of `p`'s shaders, for the log.
+pub(crate) fn names(p: &Pending) -> String {
+    p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ")
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -377,7 +398,7 @@ fn workers() -> bool {
 static MAKING_NOW: AtomicU64 = AtomicU64::new(0);
 
 /// Held while a worker compiles: counts it in [`MAKING_NOW`].
-struct Making;
+pub(crate) struct Making;
 
 impl Drop for Making {
     fn drop(&mut self) {
@@ -394,7 +415,7 @@ impl Drop for Making {
 /// commit left) above `VICTORY_PIPELINE_MIN_FREE_MB` (4096) at
 /// `VICTORY_PIPELINE_COMPILE_MB` (1536) each; one always goes on, so
 /// pipelines are still made, one at a time.
-fn room_to_make() -> Making {
+pub(crate) fn room_to_make() -> Making {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     static SETTINGS: OnceLock<(u64, u64)> = OnceLock::new();
     let (min_free, each) = *SETTINGS.get_or_init(|| {

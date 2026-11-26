@@ -38,6 +38,10 @@ struct Queue {
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
     held: std::sync::Mutex<Vec<Held>>,
+    /// Cross-queue GPU fence values this queue's next submission must wait for
+    /// (`VICTORY_ASYNC_COMPUTE=1`), accumulated as waits pass ahead of a run.
+    #[cfg(windows)]
+    pending_sync: std::sync::Mutex<crate::host::QueueSync>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -158,14 +162,16 @@ fn submit_cut(this: This, lists: &[This]) {
         // Sent to the card and not waited for: their host sides are taken
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
+        let sync = std::mem::take(&mut *lock(&queue(this).pending_sync));
         let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
+        host.execute_late_sync(taken, order, sync);
     } else if first > 0 {
+        let sync = std::mem::take(&mut *lock(&queue(this).pending_sync));
         let now: Vec<_> = lists[..first]
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&now);
+        host.execute_sync(&now, sync);
         // They have run: their descriptor tables' slots are free again, as
         // on the path without cuts ([`execute`]). This path replaced that
         // one without the call, so the lists that run at once kept their
@@ -236,11 +242,12 @@ fn submit_split(this: This, lists: &[This]) {
         )
     });
     if cut > 0 {
+        let sync = std::mem::take(&mut *lock(&queue(this).pending_sync));
         let now: Vec<_> = lists[..cut]
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&now);
+        host.execute_sync(&now, sync);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -318,18 +325,33 @@ pub(crate) fn release_held(all: bool) {
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
+            let (held, pending_sync) = unsafe {
+                let q = &*(q as *const Queue);
+                (&q.held, &q.pending_sync)
+            };
             let mut held = lock(held);
             loop {
-                match held.first() {
+                let sync_step = match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
-                        break;
+                        if crate::host::async_compute()
+                            && let Some(sync) = crate::host::late_signal_sync(fence, value)
+                        {
+                            Some(sync)
+                        } else {
+                            break;
+                        }
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
-                    Some(_) => {}
+                    Some(Held::Value(wait)) if !all => match value_met_sync(wait) {
+                        Some(sync) => Some(sync),
+                        None => break,
+                    },
+                    Some(_) => None,
+                };
+                if let Some(sync) = sync_step {
+                    lock(pending_sync).merge(sync);
                 }
                 match held.remove(0) {
                     Held::Wait(..) => {}
@@ -348,6 +370,7 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        let sync = std::mem::take(&mut *lock(pending_sync));
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -374,14 +397,14 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            host.execute_late_sync(lists, order, sync);
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
                                     order.iter().map(|&i| lists[i].host()).collect();
                                 match crate::host::host() {
                                     Some(host) => {
-                                        host.execute(&runs);
+                                        host.execute_sync(&runs, sync);
                                         true
                                     }
                                     None => false,
@@ -428,7 +451,20 @@ pub(crate) fn release_held(all: bool) {
 /// will once those in the air have run.
 #[cfg(windows)]
 fn value_met(wait: &crate::list::ValueWait) -> bool {
-    wait.met() || (crate::host::late() && crate::host::late_met(wait))
+    value_met_sync(wait).is_some()
+}
+
+/// [`value_met`], returning any cross-queue GPU fence wait required when the
+/// value comes from an in-flight submission on the other host queue.
+#[cfg(windows)]
+fn value_met_sync(wait: &crate::list::ValueWait) -> Option<crate::host::QueueSync> {
+    if wait.met() {
+        return Some(crate::host::QueueSync::default());
+    }
+    if crate::host::late() {
+        return crate::host::late_met_sync(wait);
+    }
+    None
 }
 
 fn queue<'a>(this: This) -> &'a Queue {
@@ -457,6 +493,8 @@ pub(crate) extern "system" fn create(
         desc,
         #[cfg(windows)]
         held: Default::default(),
+        #[cfg(windows)]
+        pending_sync: Default::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -567,11 +605,16 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         if kept {
             return;
         }
+        let sync = if this.is_null() {
+            crate::host::QueueSync::default()
+        } else {
+            std::mem::take(&mut *lock(&queue(this).pending_sync))
+        };
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        host.execute_sync(&host_lists, sync);
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
         // another queue waits for.
@@ -762,6 +805,8 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(windows)]
+    crate::timeline::present();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -826,9 +871,11 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        let wait_compute = crate::resource::host_copy(resource)
+            .map_or(0, |c| c.last_compute.load(Ordering::Relaxed));
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(texture, state, frame, wait_compute);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

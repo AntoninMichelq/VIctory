@@ -613,9 +613,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let range = (high - low).max(1e-20);
     // How much of the target holds anything: a lit scene and one bright
     // lamp on black have the same highest value.
+    let non_finite = values.iter().filter(|v| v.iter().any(|c| !c.is_finite())).count();
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    tracing::info!(format, low, high, nonzero_percent, non_finite, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.

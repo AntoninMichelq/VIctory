@@ -690,3 +690,63 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// With no structures ([`super::with_no_structures`], the title's builder
+/// off): every node test answers as an empty structure's would, whatever
+/// the node's memory holds: a box node no children, a leaf a miss; threads
+/// that do not run the instruction keep their registers.
+#[test]
+fn with_no_structures_every_box_has_no_children_and_every_leaf_misses() {
+    let (shader, res) = super::with_no_structures(true, || build(true, WHOLE)).expect("the program lowers");
+    assert_eq!(res.bvh.len(), 1);
+    let (scene, batches) = scene();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let miss = bvh::MISS.map(f32::to_bits);
+    let (mut boxes, mut leaves) = (0, 0);
+    for batch in &batches {
+        // The nodes are where the descriptor says (title memory from 0):
+        // they would be found and tested without the switch.
+        let _memory = Memory::at(0);
+        let data = buffer(&scene, batch, 0);
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        for t in 0..THREADS as usize {
+            let want = match batch.get(t).copied().flatten() {
+                Some((_, 4 | 5, _)) => {
+                    boxes += 1;
+                    [bvh::NONE; 4]
+                }
+                Some(_) => {
+                    leaves += 1;
+                    miss
+                }
+                None => BEFORE,
+            };
+            assert_eq!(&out[0][4 * t..4 * t + 4], want, "thread {t}");
+        }
+    }
+    assert!(boxes > 0 && leaves > 0, "boxes {boxes}, leaves {leaves}");
+}

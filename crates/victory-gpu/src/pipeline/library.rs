@@ -425,12 +425,17 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+pub(crate) const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// A library the driver refused, kept as it was ([`open`]).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
-const EARLY_FILE: &str = "early-pipelines.txt";
+pub(crate) const EARLY_FILE: &str = "early-pipelines.txt";
+/// Full recipes (shaders + graphics state) for the early pipelines, so
+/// `victory prewarm` can compile them offline into `host-pipelines.bin`.
+pub(crate) const RECIPES_FILE: &str = "early-recipes.bin";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -440,7 +445,7 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let library = open_in(&device, blob, DIR.get().map(PathBuf::as_path));
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -450,14 +455,16 @@ fn library() -> Option<&'static Library> {
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
-/// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+/// adapter or driver change, damage). A rejected file in `dir` is renamed
+/// to [`REJECTED_FILE`] instead of being overwritten by an empty library.
+fn open_in(device: &ID3D12Device1, blob: Blob, dir: Option<&std::path::Path>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -476,7 +483,13 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                rejected = true;
+                tracing::warn!(
+                    error = %e,
+                    "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})"
+                );
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -484,6 +497,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    // And the file is kept under another name, not written over by this
+    // run's first save: a refusal may be this device's alone (fxceless 79cfdd96).
+    if rejected && let Some(dir) = dir {
+        let src = dir.join(LIBRARY_FILE);
+        if src.exists()
+            && let Err(e) = std::fs::rename(&src, dir.join(REJECTED_FILE))
+        {
+            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        }
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -632,6 +655,13 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let recipes_bytes: Option<Vec<u8>> = {
+        let map = RECIPES.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().filter(|m| !m.is_empty()).map(|m| {
+            let refs: Vec<&super::recipe::Recipe> = m.values().collect();
+            super::recipe::encode_all(&refs)
+        })
+    };
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -648,7 +678,11 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| match &recipes_bytes {
+            Some(data) => write_atomically(&dir.join(RECIPES_FILE), data),
+            None => Ok(()),
+        });
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -693,7 +727,7 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
@@ -701,7 +735,27 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Recipes for the early pipelines, keyed by `Pending::key`.
+static RECIPES: Mutex<Option<std::collections::HashMap<String, super::recipe::Recipe>>> =
+    Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn recipes() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, super::recipe::Recipe>>> {
+    let mut map = RECIPES.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_none() {
+        let loaded = DIR
+            .get()
+            .and_then(|d| std::fs::read(d.join(RECIPES_FILE)).ok())
+            .and_then(|b| super::recipe::decode_all(&b))
+            .unwrap_or_default();
+        let mut by_key = std::collections::HashMap::with_capacity(loaded.len());
+        for r in loaded {
+            by_key.insert(r.key.clone(), r);
+        }
+        *map = Some(by_key);
+    }
+    map
+}
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -734,11 +788,28 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
-pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
+pub(crate) fn note_used(
+    key: &str,
+    shaders: &[std::sync::Arc<super::Shader>],
+    graphics: Option<&super::host::GraphicsState>,
+) {
+    {
+        let mut used = used();
+        let set = used.get_or_insert_with(HashSet::new);
+        if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
+    if !shaders.is_empty() {
+        let mut map = recipes();
+        let by_key = map.get_or_insert_with(std::collections::HashMap::new);
+        if by_key.len() < EARLY_MAX && !by_key.contains_key(key) {
+            by_key.insert(
+                key.to_owned(),
+                super::recipe::Recipe::from_pending(key, shaders, graphics),
+            );
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -763,10 +834,16 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
+        let dir = tempfile::tempdir().unwrap();
+        let bad = b"not a pipeline library".repeat(16);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &bad).unwrap();
+        let blob = Blob::of(dir.path());
+        let library = open_in(&device, blob, Some(dir.path())).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+        assert!(!dir.path().join(LIBRARY_FILE).exists());
+        assert_eq!(std::fs::read(dir.path().join(REJECTED_FILE)).unwrap(), bad);
     }
 
     /// A mapped file reads as the file's bytes, a file written through a

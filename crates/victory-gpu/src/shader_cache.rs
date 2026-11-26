@@ -82,6 +82,12 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_STRICT_JOINS",
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_LOOP_ABORT_KEEPS_DEPTH",
+                    "VICTORY_LEAN_MATH",
+                    "VICTORY_HOT_SHADERS",
+                    "VICTORY_CODE_TABLE_AFTER",
+                    // Ray-tracing node tests as empty structures (`rt_miss`).
+                    "VICTORY_BVH_BUILDER",
+                    "VICTORY_RT_MISS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -106,10 +112,36 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Whether ray-tracing node tests answer as empty structures
+/// (`victory_shader::emit::with_no_structures`; port of Felix2180's
+/// b47e0cb9): with the title's structure builder off (`VICTORY_BVH_BUILDER`
+/// other than `1`) its stages are dropped, but the trace programs still walk
+/// the structures' memory, which holds whatever was there (garbage hits and
+/// misses, seen as 16-pixel blocks on the screen-space tracing's tiles).
+/// Off by default here: `VICTORY_RT_MISS=1` turns it on (every ray misses,
+/// the title's fallbacks run).
+fn rt_miss() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        rt_miss_from(
+            std::env::var("VICTORY_BVH_BUILDER").ok().as_deref(),
+            std::env::var("VICTORY_RT_MISS").ok().as_deref(),
+        )
+    })
+}
+
+/// [`rt_miss`] from the two switches' values.
+fn rt_miss_from(builder: Option<&str>, miss: Option<&str>) -> bool {
+    builder != Some("1") && miss == Some("1")
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        victory_shader::emit::with_no_structures(rt_miss(), || victory_shader::emit::translate(c))
+            .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => {
             // The host's wave width and view heap limit are set at run time
@@ -355,6 +387,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rays_miss_only_when_asked_and_the_builder_is_off() {
+        assert!(!rt_miss_from(None, None), "off by default");
+        assert!(rt_miss_from(None, Some("1")));
+        assert!(rt_miss_from(Some("0"), Some("1")));
+        assert!(!rt_miss_from(Some("1"), Some("1")), "the builder's structures are traversed");
+        assert!(!rt_miss_from(None, Some("0")));
+    }
 
     fn shader() -> HostShader {
         HostShader {
