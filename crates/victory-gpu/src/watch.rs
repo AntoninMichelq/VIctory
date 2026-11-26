@@ -47,6 +47,10 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Page ranges a thread is asking the kernel about outside the lock
+    /// (`VICTORY_JOURNAL_SHARED=2`): no other asking of, or answer for,
+    /// pages among them until their writes are in the journal.
+    inflight: Vec<(usize, usize)>,
 }
 
 static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
@@ -56,6 +60,7 @@ static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    inflight: Vec::new(),
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -282,11 +287,87 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
-/// `VICTORY_JOURNAL_SHARED=1`: [`writes`] answers a range asked ahead
-/// under a shared lock (off: the one lock as before). Live (`crate::live`).
-fn journal_shared() -> bool {
+/// `VICTORY_JOURNAL_SHARED`: 1, [`writes`] answers a range asked ahead
+/// under a shared lock; 2, also asks the kernel (and guards view memory)
+/// outside the lock ([`writes_outside`]); 0 or unset, the one lock as
+/// before. Live (`crate::live`).
+fn journal_mode() -> u64 {
     static ON: crate::live::Switch = crate::live::Switch::new();
-    ON.get("VICTORY_JOURNAL_SHARED", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+    ON.get("VICTORY_JOURNAL_SHARED", |v, _| v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(2))
+}
+
+fn journal_shared() -> bool {
+    journal_mode() >= 1
+}
+
+/// [`writes`] with `VICTORY_JOURNAL_SHARED=2`: the kernel's asking (30-70
+/// microseconds) and the guarding of view memory are done outside the
+/// journal's lock, which other threads' answers waited behind (prep2 run
+/// of 2026-11-26: 375 ms of waits a frame summed over the threads, for
+/// 8,100 answers, 3,300 of them kernel askings). The pages asked about are
+/// in flight meanwhile: an asking or an answer that touches them waits
+/// until they are in the journal, so no answer misses writes the kernel
+/// has already reset.
+fn writes_outside(first: usize, last: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let overlaps = |j: &Journal| j.inflight.iter().any(|&(a, b)| a < last && first < b);
+    loop {
+        let waiting = crate::prepstats::start();
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        crate::prepstats::done(crate::prepstats::P::JournalWait, waiting);
+        if !overlaps(&j) {
+            if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+                return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+            }
+            j.inflight.push((first, last));
+            break;
+        }
+        drop(j);
+        std::thread::yield_now();
+    }
+    let done = |pages: Option<Vec<usize>>| {
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = j.inflight.iter().position(|&r| r == (first, last)) {
+            j.inflight.swap_remove(at);
+        }
+        let pages = pages?;
+        j.asked += 1;
+        let now = j.asked;
+        for page in pages {
+            j.written.insert(page, now);
+        }
+        Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    };
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    let mut granularity = 0;
+    let asked = FOUND.with(|found| {
+        let mut found = found.borrow_mut();
+        if found.len() < count {
+            found.resize(count, 0);
+        }
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        (!failed).then(|| found[..count].iter().map(|&at| at / PAGE).collect::<Vec<_>>())
+    });
+    let pages = match asked {
+        Some(pages) => Some(pages),
+        None if guarded => guard(first * PAGE, last * PAGE),
+        None => None,
+    };
+    done(pages)
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -297,9 +378,10 @@ fn journal_shared() -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    // (Pages in flight, `writes_outside`: the kernel's answer is not in
+    // the journal yet; [`writes`] waits for it.)
+    (j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        && !j.inflight.iter().any(|&(a, b)| a < last && first < b))
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -322,9 +404,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if journal_shared() {
         let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         crate::prepstats::done(crate::prepstats::P::JournalWait, waiting);
-        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+            && !j.inflight.iter().any(|&(a, b)| a < last && first < b)
+        {
             return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
         }
+    }
+    if journal_mode() >= 2 {
+        return writes_outside(first, last, guarded);
     }
     let waiting = if journal_shared() { crate::prepstats::start() } else { waiting };
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
