@@ -2555,6 +2555,191 @@ fn late_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_WAIT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_LATE_WAIT_TARGETED=1` (off by default): learns at runtime which
+/// title-memory ranges trigger premature reads (`BUFFERS_EARLY` / `WHY_READ`),
+/// waits only for submissions writing those learned ranges (capped per frame),
+/// and bounds `LATE_WAIT=3` presents to 1 frame of lag via `relay_wait` so
+/// unobserved CPU culling reads land on time without 28 settles/frame.
+pub(crate) fn late_targeted() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LATE_WAIT_TARGETED").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "targeted late waits enabled: learned hot-buffer settles + 1-frame present bound (VICTORY_LATE_WAIT_TARGETED=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Bounded set of learned hot title-memory ranges `(start, end, last_frame)`
+/// for [`late_targeted`].
+struct TargetedSet {
+    ranges: Vec<(usize, usize, u64)>,
+}
+
+impl TargetedSet {
+    const PAGE: usize = 4096;
+    const MAX_SPAN: usize = 64 * 1024;
+    const MAX_ENTRIES: usize = 128;
+    const STALE_FRAMES: u64 = 300;
+
+    const fn new() -> Self {
+        Self { ranges: Vec::new() }
+    }
+
+    fn learn(&mut self, from: usize, to: usize, frame: u64) {
+        if to <= from || from == 0 {
+            return;
+        }
+        let start = from & !(Self::PAGE - 1);
+        let capped_to = to.min(from.saturating_add(Self::MAX_SPAN));
+        let end = capped_to.saturating_add(Self::PAGE - 1) & !(Self::PAGE - 1);
+        if end <= start {
+            return;
+        }
+        self.ranges
+            .retain(|&(_, _, last)| frame.saturating_sub(last) <= Self::STALE_FRAMES);
+        self.ranges.push((start, end, frame));
+        self.ranges.sort_unstable_by_key(|&(s, e, _)| (s, e));
+        let mut merged: Vec<(usize, usize, u64)> = Vec::with_capacity(self.ranges.len());
+        for (s, e, f) in self.ranges.drain(..) {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 && e.saturating_sub(last.0) <= Self::MAX_SPAN => {
+                    last.1 = last.1.max(e);
+                    last.2 = last.2.max(f);
+                }
+                _ => merged.push((s, e, f)),
+            }
+        }
+        if merged.len() > Self::MAX_ENTRIES {
+            merged.sort_unstable_by_key(|&(_, _, f)| std::cmp::Reverse(f));
+            merged.truncate(Self::MAX_ENTRIES);
+            merged.sort_unstable_by_key(|&(s, e, _)| (s, e));
+        }
+        self.ranges = merged;
+    }
+
+    fn hits(&mut self, from: usize, to: usize, frame: u64) -> bool {
+        if to <= from || self.ranges.is_empty() {
+            return false;
+        }
+        let mut hit = false;
+        for entry in &mut self.ranges {
+            if entry.0 >= to {
+                break;
+            }
+            if entry.1 > from {
+                entry.2 = frame;
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    fn remapped(&mut self, at: usize, len: usize) {
+        if len == 0 || self.ranges.is_empty() {
+            return;
+        }
+        let end = at.saturating_add(len);
+        self.ranges.retain(|&(s, e, _)| e <= at || s >= end);
+    }
+
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+}
+
+static TARGETED: std::sync::Mutex<TargetedSet> = std::sync::Mutex::new(TargetedSet::new());
+static TARGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `[targeted_settles, present_frame_waits, capped_skips]`.
+static TARGETED_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static LAST_PRESENT_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn learn_targeted(from: usize, to: usize) {
+    if !late_targeted() || to <= from {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut set = TARGETED.lock().unwrap_or_else(|e| e.into_inner());
+    set.learn(from, to, frame);
+    TARGETED_LEN.store(set.len(), Ordering::Relaxed);
+}
+
+pub(crate) fn targeted_remapped(at: usize, len: usize) {
+    if TARGETED_LEN.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut set = TARGETED.lock().unwrap_or_else(|e| e.into_inner());
+    set.remapped(at, len);
+    TARGETED_LEN.store(set.len(), Ordering::Relaxed);
+}
+
+fn writes_targeted(back: &[Declared], tex_back: &[(usize, usize)]) -> bool {
+    if TARGETED_LEN.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let frame = crate::frame::current();
+    let mut set = TARGETED.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, ranges) in back {
+        for &(from, to) in ranges {
+            if set.hits(from, to, frame) {
+                return true;
+            }
+        }
+    }
+    for &(from, to) in tex_back {
+        if set.hits(from, to, frame) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bounds targeted per-submission settles to at most 4 per frame so a hot
+/// shared buffer cannot regress into 28 stalls/frame.
+fn take_targeted_budget() -> bool {
+    const MAX_PER_FRAME: u64 = 4;
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        COUNT.store(0, Ordering::Relaxed);
+    }
+    if COUNT.fetch_add(1, Ordering::Relaxed) < MAX_PER_FRAME {
+        true
+    } else {
+        TARGETED_STATS[2].fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// With `VICTORY_LATE_WAIT_TARGETED=1` and `LATE_WAIT=3`: at each present,
+/// ensures all flights started before the *previous* present have landed so
+/// unobserved CPU culling/visibility reads see fresh GPU results while keeping
+/// the current frame's flights pipelined.
+pub(crate) fn settle_targeted_present() {
+    if !late() || !late_free_present() || !late_targeted() {
+        return;
+    }
+    let now = STARTED.load(Ordering::Acquire);
+    let prev = LAST_PRESENT_STARTED.swap(now, Ordering::AcqRel);
+    if prev == 0 || FINISHED.load(Ordering::Acquire) >= prev {
+        return;
+    }
+    TARGETED_STATS[1].fetch_add(1, Ordering::Relaxed);
+    if relay() {
+        relay_wait(WHY_SYNC, |line| {
+            !line.settling && (FINISHED.load(Ordering::Acquire) >= prev || line.line.is_empty())
+        });
+        land();
+    } else {
+        settle_for_present();
+    }
+}
+
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
@@ -2739,6 +2924,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            if touches(written, src, src + len) {
+                                learn_targeted(src, src + len);
+                            }
+                            if touches(written, dst, dst + len) {
+                                learn_targeted(dst, dst + len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2747,6 +2938,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            learn_targeted(src, src + len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2756,6 +2948,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            learn_targeted(at, at + len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2844,6 +3037,7 @@ fn alias_note(flight: bool, reader: (u64, u64), range: (usize, usize), writer: O
     static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
     if flight {
         crate::quality::BUFFERS_EARLY.fetch_add(1, Ordering::Relaxed);
+        learn_targeted(range.0, range.1);
     }
     let n = SEEN[usize::from(flight)].fetch_add(1, Ordering::Relaxed);
     if n < 12 || n.is_multiple_of(1000) {
@@ -4015,6 +4209,20 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    if late_targeted() {
+        let t: Vec<f64> = TARGETED_STATS
+            .iter()
+            .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames)
+            .collect();
+        tracing::info!(
+            "targeted late waits per frame (VICTORY_LATE_WAIT_TARGETED=1): {:.1} hot-buffer settles ({:.1} capped), \
+             {:.1} present-frame bounds; {} learned ranges",
+            t[0],
+            t[2],
+            t[1],
+            TARGETED_LEN.load(Ordering::Relaxed),
         );
     }
     if card_gather() {
@@ -5526,6 +5734,10 @@ impl Host {
             return;
         };
         let told = !sent.writes.is_empty();
+        let flight_number = sent.number;
+        let hit_targeted = late_targeted()
+            && late_writes()
+            && writes_targeted(&sent.back, &sent.texture_back_ranges);
         let most = {
             let mut line = line();
             let Line {
@@ -5567,6 +5779,15 @@ impl Host {
         RELAY_MOVED.notify_one();
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
+        } else if hit_targeted && take_targeted_budget() {
+            TARGETED_STATS[0].fetch_add(1, Ordering::Relaxed);
+            if relay() {
+                relay_wait(WHY_WRITES, |line| {
+                    FINISHED.load(Ordering::Acquire) >= flight_number && !line.settling
+                });
+            } else {
+                self.settle(&mut submitted, WHY_WRITES);
+            }
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
@@ -9876,5 +10097,54 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod targeted_tests {
+    use super::TargetedSet;
+
+    #[test]
+    fn learns_merges_and_matches_4k_pages() {
+        let mut set = TargetedSet::new();
+        set.learn(0x10_0100, 0x10_010c, 1);
+        assert_eq!(set.len(), 1);
+        assert!(set.hits(0x10_0000, 0x10_0010, 2));
+        assert!(set.hits(0x10_0ff0, 0x10_1010, 2));
+        assert!(!set.hits(0x10_1000, 0x10_2000, 2));
+
+        // Adjacent 4 KiB page merges into a single interval.
+        set.learn(0x10_1200, 0x10_1210, 3);
+        assert_eq!(set.len(), 1);
+        assert!(set.hits(0x10_1f00, 0x10_2000, 3));
+    }
+
+    #[test]
+    fn remapped_evicts_overlapping_ranges() {
+        let mut set = TargetedSet::new();
+        set.learn(0x20_0000, 0x20_0040, 1);
+        set.learn(0x40_0000, 0x40_0040, 1);
+        assert_eq!(set.len(), 2);
+
+        set.remapped(0x20_0000, 0x1000);
+        assert_eq!(set.len(), 1);
+        assert!(!set.hits(0x20_0000, 0x20_0040, 2));
+        assert!(set.hits(0x40_0000, 0x40_0040, 2));
+    }
+
+    #[test]
+    fn ages_out_stale_ranges_and_caps_entries() {
+        let mut set = TargetedSet::new();
+        set.learn(0x10_0000, 0x10_0010, 1);
+        set.learn(0x30_0000, 0x30_0010, 400);
+        assert_eq!(set.len(), 1, "stale range from frame 1 aged out by frame 400");
+        assert!(!set.hits(0x10_0000, 0x10_0010, 400));
+        assert!(set.hits(0x30_0000, 0x30_0010, 400));
+
+        for i in 0..200usize {
+            let base = 0x100_0000 + i * 0x2_0000;
+            set.learn(base, base + 16, 400 + i as u64);
+        }
+        assert_eq!(set.len(), TargetedSet::MAX_ENTRIES);
     }
 }

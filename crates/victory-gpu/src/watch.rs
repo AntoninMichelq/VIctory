@@ -812,6 +812,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    crate::host::targeted_remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

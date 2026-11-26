@@ -816,8 +816,10 @@ extern "system" fn present(
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
+        // will write runs behind that flight, and nothing is settled here
+        // (except a 1-frame bound when `VICTORY_LATE_WAIT_TARGETED=1`).
         release_held(false);
+        crate::host::settle_targeted_present();
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
