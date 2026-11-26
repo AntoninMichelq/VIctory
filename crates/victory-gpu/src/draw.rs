@@ -1005,6 +1005,8 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        // `VICTORY_QUALITY_STATS`: the shaders the textures read next are for.
+        crate::quality::draw_shaders(|| p.stages.last().map(|s| s.shader.hash.clone()));
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return drop_why("a draw or mesh dispatch with another kind of pipeline");
@@ -3633,6 +3635,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
+            if drawn {
+                crate::quality::texture_read(*resource as This);
+            }
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();

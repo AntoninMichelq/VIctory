@@ -147,6 +147,25 @@ pub(crate) fn forget_views_of(old: &[*mut std::ffi::c_void]) -> usize {
     n
 }
 
+/// Title slots of texture views in the shader-visible heaps by what they
+/// show: host copy, grey stand-in, null view (`crate::quality`).
+#[cfg(windows)]
+pub(crate) fn shown_census() -> [u64; 3] {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = [0u64; 3];
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, under
+        // the lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            for (all, one) in n.iter_mut().zip(host.shown_census()) {
+                *all += one;
+            }
+        }
+    }
+    n
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {

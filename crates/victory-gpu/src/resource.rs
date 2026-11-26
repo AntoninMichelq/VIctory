@@ -2475,6 +2475,28 @@ pub(crate) fn host_tiled(this: This) -> Option<std::sync::Weak<HostTexture>> {
     host.tiled.is_some().then(|| std::sync::Arc::downgrade(&host))
 }
 
+/// For `VICTORY_QUALITY_STATS` (`crate::quality`): of title texture `this`,
+/// whether its host copy is made, made small (`VICTORY_EVICT_LESS`), cut
+/// (fewer levels than the title's: `VICTORY_TEXTURE_HALF`), and its console
+/// memory and bytes. Without making the copy.
+#[cfg(windows)]
+pub(crate) fn quality_of(this: This) -> Option<(bool, bool, bool, *const u8, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(h, _)| h.texture.clone());
+    let small = r.host.shrunk.load(Relaxed) > 0;
+    // SAFETY: a live resource.
+    let cut = made.as_ref().is_some_and(|t| unsafe { t.GetDesc() }.Width < r.desc.width);
+    let bytes = texture_layout(&r.desc).map_or(0, |t| t.planes[0].layout.size);
+    Some((made.is_some(), small, cut, r.data().cast_const(), bytes))
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {

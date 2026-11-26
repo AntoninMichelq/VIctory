@@ -31,6 +31,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// What each title slot of a texture view shows, for
+    /// `VICTORY_QUALITY_STATS` (`crate::quality`): 0 not a texture view's
+    /// (or not made), 1 its host copy, 2 the grey stand-in, 3 a null view.
+    shown: Vec<std::sync::atomic::AtomicU8>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -725,6 +729,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            shown: (0..count).map(|_| std::sync::atomic::AtomicU8::new(0)).collect(),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1246,6 +1251,7 @@ impl HostHeap {
         } else {
             self.unmake(&mut made, index);
         }
+        self.show(index, if grey { 2 } else { 3 });
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
@@ -1517,7 +1523,27 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
+    /// Notes what title slot `index` of a texture view shows ([`HostHeap::shown`]).
+    fn show(&self, index: u32, what: u8) {
+        if let Some(s) = self.shown.get(index as usize) {
+            s.store(what, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Title slots of texture views by what they show: host copy, grey
+    /// stand-in, null view (`VICTORY_QUALITY_STATS`).
+    pub(crate) fn shown_census(&self) -> [u64; 3] {
+        let mut n = [0u64; 3];
+        for s in &self.shown {
+            if let w @ 1..=3 = s.load(std::sync::atomic::Ordering::Relaxed) {
+                n[usize::from(w) - 1] += 1;
+            }
+        }
+        n
+    }
+
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.show(index, 0);
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -1788,10 +1814,19 @@ impl HostHeap {
             // slot that waits.
             let missing = least == u32::MAX || LEAST_MISSED.get();
             let grey = (later && wait_grey()) || (missing && (wait_grey() || evict_grey()));
-            if kept.is_none() && !self.sampler && !(grey && grey_for(&view, self.cpu(index))) {
+            let greyed = kept.is_none() && !self.sampler && grey && grey_for(&view, self.cpu(index));
+            if kept.is_none() && !self.sampler && !greyed {
                 null_for(&view, self.cpu(index));
             }
+            let shown = match (&kept, greyed) {
+                (Some(Some(_)), _) => 1,
+                (_, true) => 2,
+                _ => 3,
+            };
             self.keep(index, kept.flatten());
+            if is_texture_view(&view) {
+                self.show(index, shown);
+            }
         }
         Some(view)
     }

@@ -70,6 +70,8 @@ mod timeline;
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod quality;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod tiles;
