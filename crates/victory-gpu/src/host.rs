@@ -2684,6 +2684,9 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
 /// whose title memory another copy's shaders write ([`aliased_under_flights`]).
 fn alias_note(flight: bool, reader: (u64, u64), range: (usize, usize), writer: Option<(u64, u64)>) {
     static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    if flight {
+        crate::quality::BUFFERS_EARLY.fetch_add(1, Ordering::Relaxed);
+    }
     let n = SEEN[usize::from(flight)].fetch_add(1, Ordering::Relaxed);
     if n < 12 || n.is_multiple_of(1000) {
         tracing::warn!(
