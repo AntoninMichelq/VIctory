@@ -189,6 +189,11 @@ fn windows() -> bool {
 /// the host refuses a pipeline with a typeless target format. The usual
 /// typed member of each family; depth families by their depth format.
 fn typed_target(format: u32, depth: bool) -> u32 {
+    // `VICTORY_TYPED_TARGETS=0`: the formats as bound (before walls12).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_TARGETS").is_none_or(|v| v != "0")) {
+        return format;
+    }
     match (format, depth) {
         (1, _) => 2,     // R32G32B32A32 -> FLOAT
         (5, _) => 6,     // R32G32B32 -> FLOAT
@@ -697,6 +702,12 @@ impl State {
     /// pipeline's lookup takes a lock.
     fn host<'a>(&self) -> Option<&'a crate::pipeline::host::HostPipeline> {
         let targets = self.target_key.drawing(self.topology);
+        // `VICTORY_HOST_CACHE=0`: every ask goes to the pipeline (before walls12).
+        static CACHE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cache_on = *CACHE_ON.get_or_init(|| std::env::var_os("VICTORY_HOST_CACHE").is_none_or(|v| v != "0"));
+        if !cache_on {
+            return crate::pipeline::host_pipeline(self.pipeline as This, &targets);
+        }
         if let Some((pipeline, key, made)) = self.host_cache.get()
             && pipeline == self.pipeline
             && key == targets
@@ -4318,6 +4329,11 @@ fn parse_vrs(raw: &str) -> VrsConfig {
 /// toggleable live via `VICTORY_LIVE` without per-draw env syscalls, locks, or
 /// heap allocations).
 static VRS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Whether `VICTORY_VRS` asked for a coarse rate at least once in this run:
+/// until then [`State::apply_vrs`] records nothing (no `RSSetShadingRate`
+/// at all, as before VRS was added; with VRS off it used to set 1x1 again
+/// after every `host_state_lost`).
+static VRS_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static VRS_ACTIVE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(VRS_1X1);
 static VRS_CACHE: std::sync::RwLock<Option<VrsConfig>> = std::sync::RwLock::new(None);
 /// `[0]` draws shaded at a coarse VRS rate, `[1]` `RSSetShadingRate` calls.
@@ -4332,6 +4348,9 @@ fn vrs_refresh() {
     let raw = crate::live::var("VICTORY_VRS").unwrap_or_default();
     let cfg = parse_vrs(&raw);
     let rate = cfg.rate;
+    if rate != VRS_1X1 {
+        VRS_EVER.store(true, Ordering::Release);
+    }
     *VRS_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
     VRS_ACTIVE_RATE.store(rate, Ordering::Release);
     VRS_FRAME.store(frame, Ordering::Release);
@@ -4362,6 +4381,9 @@ impl State {
             return;
         }
         vrs_refresh();
+        if !VRS_EVER.load(Ordering::Acquire) {
+            return;
+        }
         let wanted = if self.targets.is_empty() || VRS_ACTIVE_RATE.load(Ordering::Acquire) == VRS_1X1 {
             VRS_1X1
         } else {

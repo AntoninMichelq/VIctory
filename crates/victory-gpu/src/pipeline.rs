@@ -1131,6 +1131,7 @@ pub(crate) fn create_from_words(
     }
     if let [cs] = found.as_slice()
         && cs.stage == "compute"
+        && precompiled_compute()
     {
         return (Some(hand_out(found.clone(), None, None, iid, out)), stages);
     }
@@ -1261,6 +1262,21 @@ fn unmade_graphics(found: &[Arc<Shader>], parsed: bool) {
 /// Whether graphics pipelines of method 0x1c8 are made (with the shader
 /// pack named); `VICTORY_PRECOMPILED_GRAPHICS=0` leaves them unmade, as
 /// before they were, and keeps the compute ones of 0x218.
+/// `VICTORY_PRECOMPILED_COMPUTE=0` leaves the compute pipelines of 0x218
+/// unmade, as before the shader pack was read (the title goes without
+/// them); on by default (cumul11e, to cut them in a crash hunt).
+#[cfg(windows)]
+fn precompiled_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRECOMPILED_COMPUTE").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("VICTORY_PRECOMPILED_COMPUTE=0: precompiled compute pipelines are left unmade");
+        }
+        on
+    })
+}
+
 #[cfg(windows)]
 fn precompiled_graphics() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

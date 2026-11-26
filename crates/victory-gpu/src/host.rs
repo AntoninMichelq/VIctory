@@ -2704,6 +2704,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 }
 
 /// `VICTORY_ALIAS_COPIES` (on; `=0` off): [`HostList::copy_aliased`].
+/// `VICTORY_CROSS_KEEP=0`: a list no longer holds the buffers of its cross
+/// copies until its reset (timeline4 f88a9b8, on by default; cumul11e, to
+/// cut it in a crash hunt).
+fn cross_keep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CROSS_KEEP").is_none_or(|v| v != "0"))
+}
+
 fn alias_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPIES").is_none_or(|v| v != "0"))
@@ -6995,9 +7003,11 @@ impl HostList {
         // submission: once the flight landed, the sweep could let it go
         // while the copy from it had still to run on the card (the device
         // was removed a minute into run timeline3, 2026-11-26 06:04).
-        for (reader, writer, ..) in &aliased {
-            self.keep(&reader.buffer);
-            self.keep(&writer.buffer);
+        if cross_keep() {
+            for (reader, writer, ..) in &aliased {
+                self.keep(&reader.buffer);
+                self.keep(&writer.buffer);
+            }
         }
         let Some((allocator, list)) = self
             .prelude
