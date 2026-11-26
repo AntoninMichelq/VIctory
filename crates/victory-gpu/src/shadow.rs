@@ -622,9 +622,8 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// submission waits for flights less often (`merge_under_writes`): where
 /// nothing tells which pages the title wrote (memory not write-watched,
 /// or the write watch gave no answer) every page of the busy ranges is
-/// compared, up to that many MB; changed runs less than 256 bytes apart go
-/// to the card as one; and up to 4,096 runs a submission instead of 512
-/// ([`merge_runs`]).
+/// compared, up to that many MB; and up to 4,096 runs a submission instead
+/// of 512 ([`merge_runs`]). (Runs are never joined: see the merge.)
 pub(crate) fn merge_more() -> u64 {
     static MB: crate::live::Switch = crate::live::Switch::new();
     MB.get("VICTORY_MERGE_MORE", |v, _| v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(1024))
@@ -2536,20 +2535,12 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let mut runs = changed_runs(title, held);
-                    if more > 0 {
-                        // Fewer, longer copies to the card: runs less than
-                        // 256 bytes apart are one (the bytes between are
-                        // equal, so copying them changes nothing).
-                        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-                        for (r, m) in runs {
-                            match joined.last_mut() {
-                                Some(last) if r < last.0 + last.1 + 256 => last.1 = r + m - last.0,
-                                _ => joined.push((r, m)),
-                            }
-                        }
-                        runs = joined;
-                    }
+                    // Never joined across bytes that did not change: equal
+                    // on the CPU's side, they may not be on the card's,
+                    // where shaders of a flight are writing this range (a
+                    // join sent the older bytes over the card's newer ones:
+                    // the device was removed a minute into run copies6).
+                    let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
                         crate::copytop::settle_cause(crate::copytop::S_RUNS);
                         return true;
