@@ -872,7 +872,7 @@ mod tests {
         let mut drops = 0;
         for _ in 0..120 {
             if let Some(s) = ctrl.on_frame(70.0, 50.0, [1920, 1080]) {
-                assert!(s >= 0.38 && s <= 0.5);
+                assert!((0.38..=0.5).contains(&s));
                 drops += 1;
             }
         }
@@ -883,7 +883,7 @@ mod tests {
         let mut raises = 0;
         for _ in 0..300 {
             if let Some(s) = ctrl.on_frame(20.0, 10.0, [1464, 824]) {
-                assert!(s >= 0.38 && s <= 0.5);
+                assert!((0.38..=0.5).contains(&s));
                 raises += 1;
             }
         }
