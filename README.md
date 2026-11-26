@@ -72,7 +72,7 @@ début du jeu (promenade WASD), images par seconde moyennes sur la durée indiqu
 | cumul9b (Jouer du 26/11) | FSR 0,42 + netteté, `JOURNAL_SHARED=2` | **8,87** | 112,8 | ~51 ms | 15 min sans plantage ; murs parfois absents |
 | cumul11e | + pack de shaders (murs) | 7,51 | – | – | 7 min sans plantage |
 | cumul12 + E1 | + `LATE_WAIT_WRITES=0` | 5,5 / 6,6 | – | ~90 ms | murs présents : beaucoup plus de décor dessiné |
-| **cumul14** | E1 + gains cool-fox + `MEM_GUARD` | _à compléter_ | _à compléter_ | _à compléter_ | _3 essais en cours_ |
+| **cumul14** (tout regroupé, cache plein) | E1 + gains cool-fox + `MEM_GUARD` | 3,1–5,0 | – | 103–121 ms | 3 essais sans plantage dont 16 min (promenade) ; décor complet ; lent à cause des attentes de relecture (E1), correctif en cours (attente ciblée) |
 
 Mémoire : ~21 Go de RAM pour le Jouer. Le premier lancement d'un nouvel exe refait le cache du pilote AMD
 (plus long) ; avec un cache pré-chauffé, l'arrivée dans le monde prend environ une minute.
@@ -97,6 +97,16 @@ set VICTORY_VRAM_HYSTERESIS=85,75
 À ne pas utiliser pour l'instant : `VICTORY_LATE_WAIT=2` (blocages de la carte), `VICTORY_ALIAS_AFTER_UPLOAD=1`
 (pertes de la carte), `VICTORY_ALIAS_ON_CARD=1` (non validé), `VICTORY_PLANE_PASS=written` (murs absents),
 `VICTORY_INDIRECT_WIDE=1` (au-delà de la limite D3D12, non essayé).
+
+## Lanceur à choix
+
+Un lanceur interactif (`Jouer VIctory (choix).bat`) propose trois modes au démarrage (sur la base de `cumul14`) :
+
+| Touche | Mode | Réglages principaux |
+|---|---|---|
+| `1` | **Équilibré (FSR)** | Réglages recommandés : `VICTORY_FFX_SCALE=0.42`, netteté RCAS `auto`, biais de mip `auto`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_HALF=2`. |
+| `2` | **Qualité** | Sans FSR (`VICTORY_FFX_SCALE`, `VICTORY_FFX_SHARPNESS` et `VICTORY_MIP_BIAS` non définis) pour privilégier la netteté native. |
+| `3` | **Léger (petites configs)** | `VICTORY_FFX_SCALE=0.33`, `VICTORY_TEXTURE_HALF=2`, `VICTORY_CARD_BUFFERS_MB=512`, `VICTORY_VRS=tiles`. |
 
 ## Problèmes connus
 

@@ -81,9 +81,9 @@ The user speaks **French**, is not very technical: answer in simple French, step
 - **Cache `C:\Users\4nto\victory-cache\cumul14`**, pre-warmed offline (`_work\outils\prewarm_cumul14.ps1`, launcher env): 25,758 shaders translated
   (227 known failures, none real), recipes of cumul11 + cumul7 merged = 3,937 → 3,935 pipelines, 0 failed. Translator key = victory-shader sources +
   `shader_cache.rs` + the switches listed there: a change to those needs a new cache and a new pre-warm.
-- Measured: _cumul14 figures to be filled in from the orchestrator's 3 runs_. Reference: cumul9b 8.87 img/s (walls often missing);
+- Measured (3 runs, full cache, walking): no crash (including a 16 min run), **3.1–5.0 img/s** (5.00 / 4.73 / 3.09), card **103–121 ms**, full scenery; slow due to synchronous readback waits (E1), targeted-wait fix in progress. Reference: cumul9b 8.87 img/s (walls often missing);
   cumul12 + E1 5.5 / 6.6 img/s with the walls drawn (card ~90 ms: much more scenery).
-- Fallback: `_work\Jouer precedent.bat`; the Desktop launcher of cumul9b stays until cumul14 is promoted (`_work\essais\promotion.md`).
+- Fallback: `_work\Jouer precedent.bat`; Desktop choice launcher `Jouer VIctory (choix).bat` (1 = Équilibré FSR 0.42, 2 = Qualité sans FSR, 3 = Léger FSR 0.33 / HALF=2 / CARD_BUFFERS_MB=512 / VRS=tiles).
 - Launcher env (`_work\Jouer essai cumul14 (temporaire).bat`; the Desktop « Essayer VIctory - tout regroupé (cumul14).bat » is written by the orchestrator):
 
 ```bat
