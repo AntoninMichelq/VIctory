@@ -183,6 +183,27 @@ pub(crate) fn in_air(n: u64, frames: u64) {
     AIR[4].fetch_max(frames, Ordering::Relaxed);
 }
 
+/// Why [`crate::host`]'s plan of alias copies on the card was refused,
+/// since the last table, by [`REFUSED_NAMES`].
+static REFUSED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const REFUSED_NAMES: [&str; 7] = [
+    "the compute queue",
+    "a landing under way",
+    "the reader not a plain copy",
+    "the reader written by the submission too",
+    "no write-watch asking covers the writer's pages",
+    "a writer's page not current",
+    "a part written by no flight the line lists",
+];
+
+/// Counts a refusal for reason `why` ([`REFUSED_NAMES`]); `None` to return.
+pub(crate) fn refused<T>(why: usize) -> Option<T> {
+    if let Some(c) = REFUSED.get(why) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+    None
+}
+
 /// A settle before a submission had cause `cause` ([`SETTLE_NAMES`]).
 pub(crate) fn settle_cause(cause: usize) {
     if let Some(c) = SETTLES.get(cause) {
@@ -259,6 +280,12 @@ pub(crate) fn line() {
         .map(|(name, n)| format!("{name} {:.1}", n.swap(0, Ordering::Relaxed) as f64 / frames))
         .collect();
     tracing::info!("copy stats, settles before a submission per frame, by cause: {}", settles.join(", "));
+    let refusals: Vec<String> = REFUSED_NAMES
+        .iter()
+        .zip(&REFUSED)
+        .map(|(name, n)| format!("{name} {:.2}", n.swap(0, Ordering::Relaxed) as f64 / frames))
+        .collect();
+    tracing::info!("copy stats, alias copies on the card refused per frame (VICTORY_ALIAS_ON_CARD), by reason: {}", refusals.join(", "));
     let air = AIR.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
     let presents = air[0].max(1) as f64;
     tracing::info!(
