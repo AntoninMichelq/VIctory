@@ -3898,6 +3898,8 @@ mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod rtstamps;
+#[cfg(test)]
+mod rtbench;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
