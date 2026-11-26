@@ -332,10 +332,12 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
 /// Whether [`alias`] copies a card-written source into a view whenever the
 /// list has not yet copied that source into it, not only at the view's
-/// first use in the list (`VICTORY_ALIAS_AFTER_UPLOAD`, on unless `0`).
+/// first use in the list (`VICTORY_ALIAS_AFTER_UPLOAD=1`, read live).
+/// OFF by default: cumul11b removed the device in 3 runs of 3 with it on,
+/// cumul11bx (it and CBV_CAP off) held (2026-11-26); cause not known yet.
 fn alias_after_upload() -> bool {
     static ON: crate::live::Switch = crate::live::Switch::new();
-    ON.get("VICTORY_ALIAS_AFTER_UPLOAD", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
+    ON.get("VICTORY_ALIAS_AFTER_UPLOAD", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Outcome of [`alias`] for a placed view over another host-written texture.
