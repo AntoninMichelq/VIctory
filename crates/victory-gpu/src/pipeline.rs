@@ -1129,7 +1129,9 @@ pub(crate) fn create_from_words(
         && precompiled_graphics()
         && let Some(d) = &parsed
         && let (Some(vs), Some(ps)) = (
-            found.iter().find(|s| s.stage == "vertex"),
+            found
+                .iter()
+                .find(|s| s.stage == "vertex" || (s.stage == "mesh" && precompiled_mesh())),
             found.iter().find(|s| s.stage == "pixel"),
         )
         && found.len() == 2
@@ -1142,12 +1144,17 @@ pub(crate) fn create_from_words(
         let dwords: Vec<u32> = section(crate::precompiled::Role::Registers)
             .map(|b| b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
             .unwrap_or_default();
-        let inputs = section(crate::precompiled::Role::Info)
-            .and_then(|b| crate::precompiled::input_layout(&b))
-            .unwrap_or_else(|| {
-                note_once("an info section without a readable input layout: none");
-                Vec::new()
-            });
+        // (A mesh program reads its vertices itself: no input layout.)
+        let inputs = if vs.stage == "mesh" {
+            Vec::new()
+        } else {
+            section(crate::precompiled::Role::Info)
+                .and_then(|b| crate::precompiled::input_layout(&b))
+                .unwrap_or_else(|| {
+                    note_once("an info section without a readable input layout: none");
+                    Vec::new()
+                })
+        };
         // Diagnostics: with `VICTORY_PRECOMPILED_DUMP=<dir>`, the registers
         // and info sections of every graphics description made, by its
         // shaders (`gfx-<vertex>-<pixel>-<n>-registers.bin`, a new `n` for
@@ -1184,7 +1191,58 @@ pub(crate) fn create_from_words(
         });
         return (Some(hand_out(shaders, None, Some(precompiled), iid, out)), stages);
     }
+    if slot == crate::precompiled::GRAPHICS_SLOT {
+        unmade_graphics(&found, parsed.is_some());
+    }
     (None, stages)
+}
+
+/// `VICTORY_PRECOMPILED_MESH=0`: graphics descriptions of a mesh and a
+/// pixel program stay unmade, as before. On by default (with the pack
+/// named): the world's static geometry is drawn by mesh programs, and
+/// those descriptions were a quarter of the title's (4,030 of 16,384 in run
+/// walls10), their draws missing. Their host pipelines are mesh pipelines
+/// (`HostPipeline::new` with a mesh stage), made at draws as the others.
+#[cfg(windows)]
+fn precompiled_mesh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRECOMPILED_MESH").is_none_or(|v| v != "0");
+        tracing::info!(on, "precompiled graphics pipelines of a mesh program made (VICTORY_PRECOMPILED_MESH)");
+        on
+    })
+}
+
+/// Counts a graphics description left unmade by what was found in it, and
+/// logs the counts at the first few and at powers of two.
+#[cfg(windows)]
+fn unmade_graphics(found: &[Arc<Shader>], parsed: bool) {
+    let why = if !parsed {
+        "description not read".to_owned()
+    } else if std::env::var_os("VICTORY_SHADER_PACK").is_none() {
+        "no shader pack named".to_owned()
+    } else if !precompiled_graphics() {
+        "VICTORY_PRECOMPILED_GRAPHICS=0".to_owned()
+    } else if found.is_empty() {
+        "no program found".to_owned()
+    } else {
+        let mut stages: Vec<&str> = found.iter().map(|s| s.stage).collect();
+        stages.sort_unstable();
+        format!("programs found: {}", stages.join("+"))
+    };
+    static WHY: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let mut all = WHY.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(HashMap::new);
+    let n = {
+        let n = all.entry(why).or_default();
+        *n += 1;
+        *n
+    };
+    if n <= 2 || n.is_power_of_two() {
+        let mut list: Vec<String> = all.iter().map(|(w, n)| format!("{n} {w}")).collect();
+        list.sort_unstable();
+        tracing::info!("precompiled graphics descriptions left unmade, by reason: {}", list.join("; "));
+    }
 }
 
 /// Whether graphics pipelines of method 0x1c8 are made (with the shader
