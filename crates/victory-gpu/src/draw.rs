@@ -183,6 +183,34 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// A render target's or depth target's format as a pipeline names it:
+/// typed. A target bound without a view description has its texture's
+/// format, which may be typeless (a texture also read as another type), and
+/// the host refuses a pipeline with a typeless target format. The usual
+/// typed member of each family; depth families by their depth format.
+fn typed_target(format: u32, depth: bool) -> u32 {
+    match (format, depth) {
+        (1, _) => 2,     // R32G32B32A32 -> FLOAT
+        (5, _) => 6,     // R32G32B32 -> FLOAT
+        (9, _) => 10,    // R16G16B16A16 -> FLOAT
+        (15, _) => 16,   // R32G32 -> FLOAT
+        (19, _) => 20,   // R32G8X24 -> D32_FLOAT_S8X24_UINT
+        (23, _) => 24,   // R10G10B10A2 -> UNORM
+        (27, _) => 28,   // R8G8B8A8 -> UNORM
+        (33, _) => 34,   // R16G16 -> FLOAT
+        (39, true) => 40, // R32 -> D32_FLOAT
+        (39, false) => 41, // R32 -> R32_FLOAT
+        (44, _) => 45,   // R24G8 -> D24_UNORM_S8_UINT
+        (48, _) => 49,   // R8G8 -> UNORM
+        (53, true) => 55, // R16 -> D16_UNORM
+        (53, false) => 54, // R16 -> R16_FLOAT
+        (60, _) => 61,   // R8 -> UNORM
+        (87 | 90, _) => 87, // B8G8R8A8 -> UNORM
+        (91, _) => 88,   // B8G8R8X8 -> UNORM
+        (f, _) => f,
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -200,6 +228,8 @@ pub(crate) struct State {
     /// precompiled graphics pipeline is made for
     /// ([`crate::precompiled::Targets`]).
     target_key: crate::precompiled::Targets,
+    /// The last answer of [`State::host`]: pipeline, key, host pipeline.
+    host_cache: std::cell::Cell<Option<(usize, crate::precompiled::Targets, usize)>>,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
     /// The title's primitive topology (the host's may differ).
@@ -657,13 +687,27 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        // (A pipeline let go and another made at its address: not this.)
+        self.host_cache.set(None);
     }
 
     /// The bound pipeline's host pipeline, for the targets bound and the
-    /// topology set ([`crate::pipeline::host_pipeline`]).
+    /// topology set ([`crate::pipeline::host_pipeline`]). The last answer
+    /// is kept: a draw asks two or three times, and a precompiled
+    /// pipeline's lookup takes a lock.
     fn host<'a>(&self) -> Option<&'a crate::pipeline::host::HostPipeline> {
         let targets = self.target_key.drawing(self.topology);
-        crate::pipeline::host_pipeline(self.pipeline as This, &targets)
+        if let Some((pipeline, key, made)) = self.host_cache.get()
+            && pipeline == self.pipeline
+            && key == targets
+        {
+            // SAFETY: host pipelines live as long as the process (made
+            // ones are never let go).
+            return Some(unsafe { &*(made as *const crate::pipeline::host::HostPipeline) });
+        }
+        let made = crate::pipeline::host_pipeline(self.pipeline as This, &targets)?;
+        self.host_cache.set(Some((self.pipeline, targets, std::ptr::from_ref(made) as usize)));
+        Some(made)
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -770,7 +814,10 @@ impl State {
             // SAFETY: a live host texture.
             let texture_desc = unsafe { texture.GetDesc() };
             samples = texture_desc.SampleDesc.Count;
-            formats.push(desc.map(|d| d.Format.0).filter(|&f| f != 0).unwrap_or(texture_desc.Format.0) as u32);
+            formats.push(typed_target(
+                desc.map(|d| d.Format.0).filter(|&f| f != 0).unwrap_or(texture_desc.Format.0) as u32,
+                false,
+            ));
             rtvs.push(host.rtv(Some(texture), desc.as_ref()));
         }
         self.depth = 0;
@@ -782,7 +829,10 @@ impl State {
             // SAFETY: a live host texture.
             let texture_desc = unsafe { texture.GetDesc() };
             samples = texture_desc.SampleDesc.Count;
-            depth_format = desc.map(|d| d.Format.0).filter(|&f| f != 0).unwrap_or(texture_desc.Format.0) as u32;
+            depth_format = typed_target(
+                desc.map(|d| d.Format.0).filter(|&f| f != 0).unwrap_or(texture_desc.Format.0) as u32,
+                true,
+            );
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {

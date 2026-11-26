@@ -480,6 +480,19 @@ pub(crate) fn host_pipeline<'a>(
     let Some(pre) = &p.precompiled else {
         return make::ready(&p.host);
     };
+    // A mesh pipeline draws triangles whatever topology the list last set
+    // (its stream names them): the topology is no part of its key, or a
+    // leftover one would make it again (and drop draws while it is made).
+    let mesh_key;
+    let targets = if p.shaders.iter().any(|s| s.stage == "mesh") {
+        mesh_key = crate::precompiled::Targets {
+            topology: windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32,
+            ..*targets
+        };
+        &mesh_key
+    } else {
+        targets
+    };
     let (variant, new) = pre.variants.get(targets, || {
         let state = host::GraphicsState::precompiled(&pre.registers, &pre.inputs, targets);
         make::Pending::new(p.shaders.clone(), Some(Box::new(state)))
