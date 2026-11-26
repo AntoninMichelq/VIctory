@@ -71,6 +71,8 @@ mod cpuframe;
 mod timeline;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod show_after;
 pub mod signature;
 #[cfg(windows)]
 mod prepstats;

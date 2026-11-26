@@ -145,6 +145,14 @@ pub(crate) fn in_air() -> (u64, u64) {
     (n, crate::frame::current().saturating_sub(oldest))
 }
 
+/// Submissions started and finished so far: a list's submission-time step
+/// (`HostList::defer_host`) runs after its submission was counted started,
+/// so the first number is one at least as late as that list's
+/// (`crate::show_after`).
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -215,6 +223,62 @@ pub(crate) fn residency_high(resource: &ID3D12Resource) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(error = %e, "a residency priority was refused"));
     }
+}
+
+/// `VICTORY_WAIT_RESIDENT=1` (off by default): host textures, the heaps of
+/// texture levels on demand and the host's card buffers are made not
+/// resident and then made resident with a wait (`MakeResident`) before
+/// anything names them. Made resident at once, their mapping into the
+/// card's address space is the system's work that runs later: lists sent
+/// after it wait for it, but lists already on the card read the view heap
+/// by index, and a slot written meanwhile names memory not mapped for them
+/// yet (a page fault). Idea from cool-fox-codec `0322b39`.
+fn wait_resident() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WAIT_RESIDENT").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!("VICTORY_WAIT_RESIDENT=1: new host memory is waited resident before anything names it");
+        }
+        on
+    })
+}
+
+/// The heap flag new memory is made with: not resident with
+/// [`wait_resident`], made so by [`resident`].
+pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// Times, microseconds in all and the longest of [`resident`].
+static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Memory made with [`not_resident`] is resident when this returns (an
+/// error: it is not, and must not be used).
+pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if !wait_resident() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let pageable: ID3D12Pageable = object.cast()?;
+    // SAFETY: a live heap or resource of the device.
+    let made = unsafe { device.MakeResident(&[Some(pageable)]) };
+    let us = started.elapsed().as_micros() as u64;
+    let n = RESIDENT[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let all = RESIDENT[1].fetch_add(us, Ordering::Relaxed) + us;
+    let most = RESIDENT[2].fetch_max(us, Ordering::Relaxed).max(us);
+    if n.is_power_of_two() || n.is_multiple_of(4096) {
+        tracing::info!(
+            times = n,
+            ms = all as f64 / 1000.0,
+            longest_ms = most as f64 / 1000.0,
+            "VICTORY_WAIT_RESIDENT: new memory waited resident, since the start"
+        );
+    }
+    if let Err(e) = &made {
+        tracing::warn!(error = %e, "new memory could not be made resident (VICTORY_WAIT_RESIDENT=1)");
+    }
+    made
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -6385,9 +6449,21 @@ impl Host {
                 }
             }
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        // `VICTORY_CHECK_SEPARATE=1` (off by default, fixes D3D12 error 538):
+        // submit the buffer comparison list in its own ExecuteCommandLists call
+        // before signalling the fence so implicitly promoted COPY_DEST buffers
+        // decay to COMMON between calls.
+        static CHECK_SEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let check_separate = *CHECK_SEP
+            .get_or_init(|| std::env::var_os("VICTORY_CHECK_SEPARATE").is_some_and(|v| v == "1"));
+        let separate_check = if check_separate {
+            card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)])
+        } else {
+            if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+                lists.push(Some(check));
+            }
+            None
+        };
         let prepared = std::time::Instant::now();
         crate::prepstats::add(crate::prepstats::P::Settles, settled);
         crate::prepstats::add(crate::prepstats::P::Whole, prepared - started);
@@ -6400,6 +6476,9 @@ impl Host {
                 // SAFETY: closed compute lists; our compute queue and fence.
                 let signalled = unsafe {
                     cq.ExecuteCommandLists(&lists);
+                    if let Some(check) = &separate_check {
+                        cq.ExecuteCommandLists(check);
+                    }
                     cq.Signal(cf, val)
                 };
                 if let Err(e) = signalled {
@@ -6424,6 +6503,9 @@ impl Host {
                 // SAFETY: closed lists; the fence is ours.
                 let signalled = unsafe {
                     self.queue.ExecuteCommandLists(&lists);
+                    if let Some(check) = &separate_check {
+                        self.queue.ExecuteCommandLists(check);
+                    }
                     self.queue.Signal(&self.fence, *submitted)
                 };
                 self.card_sent();
@@ -6506,6 +6588,11 @@ impl Host {
                 // SAFETY: closed compute lists; our compute queue, fence and event.
                 unsafe {
                     cq.ExecuteCommandLists(group);
+                    if i + 1 == groups.len()
+                        && let Some(check) = &separate_check
+                    {
+                        cq.ExecuteCommandLists(check);
+                    }
                     let waited = cq
                         .Signal(cf, val)
                         .and_then(|()| cf.SetEventOnCompletion(val, ce));
@@ -6524,6 +6611,11 @@ impl Host {
                 // SAFETY: closed lists; the fence and event are ours.
                 unsafe {
                     self.queue.ExecuteCommandLists(group);
+                    if i + 1 == groups.len()
+                        && let Some(check) = &separate_check
+                    {
+                        self.queue.ExecuteCommandLists(check);
+                    }
                     self.card_sent();
                     let waited = self
                         .queue
@@ -9744,7 +9836,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -9752,6 +9844,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9792,13 +9885,14 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                not_resident(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
                 &mut buffer,
             )
-        };
+        }
+        .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)));
         match made {
             Ok(()) => buffer,
             Err(e) => {

@@ -1877,6 +1877,43 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            // `VICTORY_SHOW_AFTER=1`: a host texture whose first upload has
+            // not run on the card yet is not shown (the lists on the card
+            // read the slot by index): the grey stand-in, or the old view
+            // of the same placed texture, until `super::make_waiting` makes
+            // the slot again before a later submission.
+            if !later
+                && !self.sampler
+                && crate::show_after::on()
+                && is_texture_view(&view)
+                && let Some(copy) = show_after_copy(&view)
+            {
+                use crate::show_after::{Hold, KEPT_OLD, STAND_IN, count, hold};
+                match hold(handle, key, &copy) {
+                    Hold::No => {}
+                    Hold::Again => return Some(view),
+                    Hold::First => {
+                        let old = made[index as usize];
+                        if old != 0
+                            && view_at(old as u32, (old >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
+                        {
+                            count(KEPT_OLD);
+                            return Some(view);
+                        }
+                        made[index as usize] = 0;
+                        let greyed = grey_for(&view, self.cpu(index));
+                        if !greyed {
+                            null_for(&view, self.cpu(index));
+                        }
+                        self.keep(index, None);
+                        self.show(index, if greyed { 2 } else { 3 });
+                        if greyed {
+                            count(STAND_IN);
+                        }
+                        return Some(view);
+                    }
+                }
+            }
             made[index as usize] = if later { 0 } else { key };
             // The level a texture uploaded in part is kept from, for this
             // record; another record written since drops it.
@@ -1949,6 +1986,16 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// The host copy of the texture a texture view shows (made now if it is
+/// not there: making the slot would make it), for `VICTORY_SHOW_AFTER`.
+fn show_after_copy(view: &View) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let placed = placed_texture(view);
+    let View::Shader(resource, _) = placed.as_ref().unwrap_or(view) else {
+        return None;
+    };
+    crate::resource::host_copy(*resource as crate::object::This)
 }
 
 /// Logs `what` the first time it happens.

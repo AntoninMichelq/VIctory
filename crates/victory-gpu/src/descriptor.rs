@@ -731,6 +731,15 @@ pub(crate) fn make_waiting() {
             }
         }
     }
+    // Slots that waited for their texture's upload to run
+    // (`VICTORY_SHOW_AFTER=1`): shown from this submission on.
+    for handle in crate::show_after::due() {
+        if let Some((heap, index)) = shader_slot(handle)
+            && let Some(Some(host)) = heap.host.get()
+        {
+            host.mirror(index, handle, true);
+        }
+    }
 }
 
 fn record(handle: u64, view: View) {

@@ -990,7 +990,10 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 10_000;
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST
+        .get_or_init(|| std::env::var_os("VICTORY_STAGING_FAST").is_some_and(|v| v == "1"));
+    let idle_ms: u64 = if fast { 5_000 } else { 10_000 };
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
@@ -1006,12 +1009,13 @@ pub(crate) fn let_go_idle() {
     // sampled lately kept one: with the world streamed in that was
     // gigabytes beside the textures themselves. The next change makes one
     // again (`Staging::detile`). `VICTORY_TEXTURE_KEEP_STAGING=1` keeps
-    // them, as before.
-    const QUIET_MS: u64 = 3_000;
+    // them, as before. `VICTORY_STAGING_FAST=1` lowers the quiet delay to 2 s.
+    let quiet_ms: u64 = if fast { 2_000 } else { 3_000 };
     const QUIET_FRAMES: u64 = 8;
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep_staging = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP_STAGING").is_some_and(|v| v == "1"));
-    let quiet = if crate::host::memory_short() { 0 } else { QUIET_MS };
+    let pressured = crate::host::memory_short() || (fast && crate::residency::pressured());
+    let quiet = if pressured { 0 } else { quiet_ms };
     let (mut dropped, mut dropped_bytes) = (0u64, 0u64);
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
@@ -1031,7 +1035,7 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(gone);
         }
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -1126,6 +1130,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
+        // (`VICTORY_SHOW_AFTER`: the host's own contents wait for nothing.)
+        if host_written
+            && crate::show_after::on()
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            crate::show_after::not_uploaded(&copy);
+        }
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -1158,6 +1169,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.keep(&buffer);
+    // The submission that carries it, for the slots that show it once it
+    // has run (`VICTORY_SHOW_AFTER`).
+    if crate::show_after::on()
+        && let Some(copy) = crate::resource::host_copy(resource)
+        && windows::core::Interface::as_raw(&copy.texture) == windows::core::Interface::as_raw(texture)
+    {
+        crate::show_after::recorded(list, &copy);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;

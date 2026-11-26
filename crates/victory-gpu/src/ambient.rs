@@ -36,10 +36,30 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// Where they write the indirect diffuse light (R9G9B9E5 as 32-bit
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
+/// Reflections history program (`VICTORY_AMBIENT_REFLECT=<cap>`, off by default).
+pub(crate) const REFLECTED: &[u8] = b"CS_UpdateHistory";
+/// Where `CS_UpdateHistory` writes reflections (R9G9B9E5 as 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 /// 0.6 looked balanced in run a2. `VICTORY_AMBIENT=off` leaves what the
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
+
+/// `VICTORY_AMBIENT_REFLECT=<part>` (0 or unset: off by default; e.g. `0.5`
+/// clamps unoccluded reflections to 0.5x ambient luminance, even when
+/// `VICTORY_AMBIENT=off`). Live (`crate::live`).
+fn reflect_cap() -> f32 {
+    static CAP: crate::live::Switch = crate::live::Switch::new();
+    let bits = CAP.get("VICTORY_AMBIENT_REFLECT", |v, _| {
+        let cap = v
+            .map(str::trim)
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|k| k.is_finite() && *k > 0.0)
+            .unwrap_or(0.0);
+        u64::from(cap.to_bits())
+    });
+    f32::from_bits(bits as u32)
+}
 
 /// The floor; `None` if off. Live (`crate::live`): tunable at runtime via
 /// `VICTORY_LIVE` (`VICTORY_AMBIENT=off|0|0.2|0.6|...`).
@@ -163,11 +183,12 @@ fn live_level() -> Option<f32> {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=9, b0), DescriptorTable(UAV(u0), SRV(t0))"
+#define RS "RootConstants(num32BitConstants=10, b0), DescriptorTable(UAV(u0), SRV(t0))"
 cbuffer Floor : register(b0) {
     float level; float3 tint;
     float strength; float radius; float near; float tan_y;
     uint floor_only;
+    float held;
 };
 RWTexture2D<uint> light : register(u0);
 Texture2D<float> depth : register(t0);
@@ -222,6 +243,17 @@ void main(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
+    if (held > 0.0) {
+        const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+        float3 seen_there = unpack(light[at.xy]);
+        if (!all(isfinite(seen_there))) seen_there = 0.0;
+        float most = dot(tint * level, LUMA) * held;
+        float has = dot(seen_there, LUMA);
+        if (has > most && has > 1e-6) {
+            light[at.xy] = pack(seen_there * (most / has));
+        }
+        return;
+    }
     // What the resolve left is not kept: without rays its inputs are never
     // written and it holds whatever their memory did (bright magenta on
     // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
@@ -328,7 +360,30 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// wrote it as an image. Whether it recorded anything (the list's bindings
 /// are then ours).
 pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
-    let (Some(level), Some(host)) = (level(), host()) else {
+    let Some(level) = level() else {
+        return false;
+    };
+    record(list, light, depth, level, 0.0)
+}
+
+/// Clamps unoccluded reflections in `image` to `VICTORY_AMBIENT_REFLECT` times
+/// the ambient luminance (works even when `VICTORY_AMBIENT=off`).
+pub(crate) fn hold(list: &HostList, image: This) -> bool {
+    let held = reflect_cap();
+    if held <= 0.0 {
+        return false;
+    }
+    let ref_level = level().unwrap_or(DEFAULT);
+    if !record(list, image, None, ref_level, held) {
+        return false;
+    }
+    static HELD: std::sync::Once = std::sync::Once::new();
+    HELD.call_once(|| tracing::info!(held, ref_level, "VICTORY_AMBIENT_REFLECT active: reflections clamped"));
+    true
+}
+
+fn record(list: &HostList, light: This, depth: Option<This>, level: f32, held: f32) -> bool {
+    let Some(host) = host() else {
         return false;
     };
     let Some(light) = crate::resource::host_resource(light) else {
@@ -403,8 +458,8 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
         let floor_only = f32::from_bits(u32::from(floor_only()));
-        let constants = [level, r, g, b, strength, radius, near, tan_y, floor_only];
-        l.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+        let constants = [level, r, g, b, strength, radius, near, tan_y, floor_only, held];
+        l.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
             D3D12_GPU_DESCRIPTOR_HANDLE {

@@ -65,6 +65,9 @@ pub(crate) struct Shader {
     /// (`crate::ambient::PROGRAM`), which the ambient light follows.
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// Its result is the final reflections history (`crate::ambient::REFLECTED`).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -118,6 +121,10 @@ pub(crate) fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                ends_reflections: bytes
+                    .windows(crate::ambient::REFLECTED.len())
+                    .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -237,6 +244,8 @@ pub(crate) fn merged_halves(vs: &Arc<Shader>, gs: &Arc<Shader>) -> Option<(Arc<S
                 hash: format!("{}.{stage}", of.hash),
                 container: of.container.clone(),
                 resolves_light: false,
+                #[cfg(windows)]
+                ends_reflections: false,
                 translated: OnceLock::from(Some(Translated {
                     host,
                     stores: program.as_ref().is_none_or(stores),
@@ -542,6 +551,7 @@ pub(crate) fn flat_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
             hash: format!("{}.flat", vs.hash),
             container: vs.container.clone(),
             resolves_light: false,
+            ends_reflections: false,
             translated: OnceLock::from(Some(Translated { host, used: base_vs.used.clone(), stores: base_vs.stores })),
         });
         let shaders: Vec<Arc<Shader>> =
