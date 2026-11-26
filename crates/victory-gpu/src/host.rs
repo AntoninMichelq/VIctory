@@ -2969,6 +2969,18 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from)).then_some(u64::MAX)
 }
 
+/// `VICTORY_FLUSH_PART=1` (off by default; read live): before a dispatch's
+/// declared write range of a copy, only the part of the copy's pending
+/// refresh inside that range is done ([`Batch::flush_part`]), not all of
+/// it. Every one of a frame's ~6,900 write steps refreshed its copy's whole
+/// pending range (the title's 174 MB heap: its envelope), and refresh steps
+/// in between made it pending again: run prep (2026-11-26 02:36), "batch
+/// flush (refreshes, textures)" 34 ms a frame.
+fn flush_part() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FLUSH_PART", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
 /// `VICTORY_FLIGHT_CHECKS_MAP=1` (off by default; read live): the check of
 /// a submission's refreshes against flights' writes takes each copy once
 /// ([`stale_under_flights_until`]), and the submission's one write-watch
@@ -7181,7 +7193,13 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
-                    batch.flush_one(shadow);
+                    if flush_part() {
+                        let parting = crate::copytop::start();
+                        batch.flush_part(shadow, *address, *address + *len);
+                        crate::copytop::time(crate::copytop::T_PART, parting);
+                    } else {
+                        batch.flush_one(shadow);
+                    }
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     let snapping = crate::copytop::start();
@@ -7290,6 +7308,48 @@ impl Batch {
         for &(from, to) in ranges {
             Self::update(shadow, from, to);
         }
+    }
+
+    /// With [`flush_part`], before shaders are given `[from, to)` of
+    /// `shadow`'s copy: of its pending refresh, the part inside that range
+    /// is done now (the snapshot of the range, or its being left alone by
+    /// refreshes while shaders write it, needs the title's bytes there
+    /// first); the rest stays pending for the next flush.
+    fn flush_part(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(&at) = self.index.get(&key) else {
+            return;
+        };
+        let ranges = &mut self.refreshes[at].1;
+        let mut now: Vec<(usize, usize)> = Vec::new();
+        let mut rest: Vec<(usize, usize)> = Vec::with_capacity(ranges.len() + 1);
+        for &(a, b) in ranges.iter() {
+            if b <= from || a >= to {
+                rest.push((a, b));
+                continue;
+            }
+            now.push((a.max(from), b.min(to)));
+            if a < from {
+                rest.push((a, from));
+            }
+            if b > to {
+                rest.push((to, b));
+            }
+        }
+        if now.is_empty() {
+            return;
+        }
+        if rest.is_empty() {
+            self.index.remove(&key);
+            self.refreshes.swap_remove(at);
+            // The last entry took its place.
+            if let Some(moved) = self.refreshes.get(at) {
+                self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            }
+        } else {
+            *ranges = rest;
+        }
+        Self::update_all(shadow, &now);
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending

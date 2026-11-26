@@ -101,9 +101,9 @@ pub(crate) fn merged(started: Option<std::time::Instant>) {
 
 /// Where the submitting thread's preparing goes, each counted alone (not
 /// inside another), microseconds since the last table: see [`TIMES`].
-static TIME_US: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static TIME_US: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Names of [`TIME_US`]'s counts, for the line.
-const TIMES: [&str; 12] = [
+const TIMES: [&str; 13] = [
     "all deferred steps (wall)",
     "flushes of refreshes (wall)",
     "write-watch asking ahead",
@@ -116,6 +116,7 @@ const TIMES: [&str; 12] = [
     "deferred runs of ours",
     "the submission's one write-watch asking",
     "checks against flights (stale, aliased; merges under writes included)",
+    "refreshes before write steps, their part only (VICTORY_FLUSH_PART)",
 ];
 pub(crate) const T_ALL: usize = 0;
 pub(crate) const T_FLUSH: usize = 1;
@@ -129,6 +130,7 @@ pub(crate) const T_TEXTURE: usize = 8;
 pub(crate) const T_RUN: usize = 9;
 pub(crate) const T_ONCE: usize = 10;
 pub(crate) const T_CHECKS: usize = 11;
+pub(crate) const T_PART: usize = 12;
 
 /// A start for [`time`], if the counts are on.
 pub(crate) fn start() -> Option<std::time::Instant> {
