@@ -2676,8 +2676,8 @@ impl TargetedSet {
     const PAGE: usize = 4096;
     const MERGE_GAP: usize = 16 * 1024;
     const MAX_SPAN: usize = 1024 * 1024;
-    const MAX_ENTRIES: usize = 1024;
-    const STALE_FRAMES: u64 = 300;
+    const MAX_ENTRIES: usize = 4096;
+    const STALE_FRAMES: u64 = 1200;
 
     const fn new() -> Self {
         Self { ranges: Vec::new() }
@@ -3087,10 +3087,31 @@ static ALIAS_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 ///
 /// Suspected for the pedestrians' hair drawn as long streaks and their
 /// bodies as spikes in some frames: vertices a frame apart.
+/// `VICTORY_VERTEX_TARGETED=1` (off by default): ensures aliased vertex/skinning
+/// buffers written by a flight still in the air (`aliased_under_flights`) always
+/// settle before the reading submission runs (never deferred to `present()` or
+/// bypassed by `VICTORY_ALIAS_SETTLE=0`), eliminating 1-frame-apart vertex spikes.
+fn vertex_targeted() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_VERTEX_TARGETED").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "targeted vertex/skinning alias settles enabled before reading submissions (VICTORY_VERTEX_TARGETED=1)"
+            );
+        }
+        on
+    })
+}
+
+static VERTEX_TARGETED_SETTLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     use std::sync::Arc;
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SETTLE").is_none_or(|v| v != "0"));
+    let vtargeted = vertex_targeted();
     let flights: Vec<(usize, usize)> = if behind { line().written.clone() } else { Vec::new() };
     // This submission's writes so far, by copy: (copy, from, to).
     // (With `VICTORY_ALIAS_COPIES` on they are copied on the card: in the
@@ -3122,6 +3143,10 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
                 _ => {}
             }
         }
+    }
+    if settle && vtargeted {
+        VERTEX_TARGETED_SETTLES.fetch_add(1, Ordering::Relaxed);
+        return true;
     }
     settle && on
 }
@@ -4291,6 +4316,16 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
+    }
+    if vertex_targeted() {
+        let vt = VERTEX_TARGETED_SETTLES.swap(0, Ordering::Relaxed);
+        if vt > 0 {
+            tracing::info!(
+                settles = vt,
+                per_frame = format_args!("{:.2}", vt as f64 / frames),
+                "targeted vertex/skinning alias settles (VICTORY_VERTEX_TARGETED=1)"
+            );
+        }
     }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -10372,15 +10407,16 @@ mod targeted_tests {
     #[test]
     fn ages_out_stale_ranges_and_caps_entries() {
         let mut set = TargetedSet::new();
+        let stale_frame = 1 + TargetedSet::STALE_FRAMES + 100;
         set.learn(0x10_0000, 0x10_0010, 1);
-        set.learn(0x30_0000, 0x30_0010, 400);
-        assert_eq!(set.len(), 1, "stale range from frame 1 aged out by frame 400");
-        assert!(!set.hits(0x10_0000, 0x10_0010, 400));
-        assert!(set.hits(0x30_0000, 0x30_0010, 400));
+        set.learn(0x30_0000, 0x30_0010, stale_frame);
+        assert_eq!(set.len(), 1, "stale range from frame 1 aged out by frame {stale_frame}");
+        assert!(!set.hits(0x10_0000, 0x10_0010, stale_frame));
+        assert!(set.hits(0x30_0000, 0x30_0010, stale_frame));
 
-        for i in 0..1200usize {
+        for i in 0..(TargetedSet::MAX_ENTRIES + 200) {
             let base = 0x1000_0000 + i * 0x20_0000;
-            set.learn(base, base + 16, 400 + (i as u64 % 200));
+            set.learn(base, base + 16, stale_frame + (i as u64 % 200));
         }
         assert_eq!(set.len(), TargetedSet::MAX_ENTRIES);
     }

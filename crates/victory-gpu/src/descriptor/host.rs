@@ -1871,8 +1871,7 @@ impl HostHeap {
             // time it got sharper.
             if later
                 && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
+                && can_keep_old(made[index as usize], &view, keep_shown())
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
@@ -1880,8 +1879,9 @@ impl HostHeap {
             // `VICTORY_SHOW_AFTER=1`: a host texture whose first upload has
             // not run on the card yet is not shown (the lists on the card
             // read the slot by index): the grey stand-in, or the old view
-            // of the same placed texture, until `super::make_waiting` makes
-            // the slot again before a later submission.
+            // (with `VICTORY_KEEP_SHOWN=1`, any valid previously shown texture
+            // while VRAM has room), until `super::make_waiting` makes the slot
+            // again before a later submission.
             if !later
                 && !self.sampler
                 && crate::show_after::on()
@@ -1894,9 +1894,7 @@ impl HostHeap {
                     Hold::Again => return Some(view),
                     Hold::First => {
                         let old = made[index as usize];
-                        if old != 0
-                            && view_at(old as u32, (old >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
-                        {
+                        if can_keep_old(old, &view, keep_shown()) {
                             count(KEPT_OLD);
                             return Some(view);
                         }
@@ -1986,6 +1984,72 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// `VICTORY_KEEP_SHOWN=1` (off by default, Belobug 81ebb7bd): when a texture
+/// slot is rewritten with a new texture whose first upload has not landed on
+/// the card yet, keep showing the previously bound texture view of matching
+/// dimension while VRAM has room instead of flashing the grey stand-in.
+fn keep_shown() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_KEEP_SHOWN").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "keeping previously shown texture views while new uploads land and VRAM has room (VICTORY_KEEP_SHOWN=1)"
+            );
+        }
+        on
+    })
+}
+
+/// D3D12 SRV dimension of a texture view, when explicitly described (`desc[1]`).
+fn texture_view_dimension(view: &View) -> Option<u32> {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => Some(desc[1]),
+        View::Shader(_, Some(desc)) => Some(desc[1]),
+        _ => None,
+    }
+}
+
+/// Whether two views target the same underlying texture (placed at the same
+/// title address or the same committed texture resource) with compatible view
+/// dimension.
+fn same_texture(a: &View, b: &View) -> bool {
+    if same_placed_texture(a, b) {
+        return true;
+    }
+    match (a, b) {
+        (View::Shader(r1, _), View::Shader(r2, _)) if r1 == r2 && is_texture_view(a) => {
+            texture_view_dimension(a) == texture_view_dimension(b)
+        }
+        (View::Placed(false, res_a, desc_a), View::Placed(false, res_b, desc_b))
+            if res_a[0] != 1 && res_b[0] != 1 && desc_a[10..12] == desc_b[10..12] =>
+        {
+            desc_a[1] == desc_b[1]
+        }
+        _ => false,
+    }
+}
+
+/// Whether the old descriptor in a slot (`old` key) can stay shown while the
+/// new texture view's upload is still pending (`VICTORY_SHOW_AFTER=1` or
+/// `later`), instead of overwriting the slot with the grey stand-in.
+fn can_keep_old(old: u64, view: &View, allow_any_texture: bool) -> bool {
+    if old == 0 {
+        return false;
+    }
+    let Some(old_view) = view_at(old as u32, (old >> 32) as u32) else {
+        return false;
+    };
+    if same_texture(&old_view, view) {
+        return true;
+    }
+    allow_any_texture
+        && is_texture_view(&old_view)
+        && is_texture_view(view)
+        && texture_view_dimension(&old_view) == texture_view_dimension(view)
+        && crate::resource::room(None)
 }
 
 /// The host copy of the texture a texture view shows (made now if it is
