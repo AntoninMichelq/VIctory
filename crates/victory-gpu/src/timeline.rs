@@ -54,6 +54,10 @@ pub(crate) fn mark(what: &'static str, n: u64) {
 /// The title presents: the frame's events are written out (while frames
 /// are being taken), and the taking starts once the start is reached.
 pub(crate) fn present() {
+    if crate::copytop::on() {
+        let (n, frames) = crate::host::in_air();
+        crate::copytop::in_air(n, frames);
+    }
     let Some((_, at)) = settings() else {
         return;
     };
@@ -66,6 +70,9 @@ pub(crate) fn present() {
         return;
     }
     mark("present", 0);
+    let (n, frames) = crate::host::in_air();
+    mark("in-air", n);
+    mark("frames-ahead", frames);
     let events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));
     let first = events.first().map_or(0.0, |e| e.0);
     let text: Vec<String> = events

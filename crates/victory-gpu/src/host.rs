@@ -128,6 +128,23 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The frame each of the last 1,024 submissions was prepared in, by its
+/// number modulo 1,024 ([`in_air`]).
+static SUBMISSION_FRAME: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+/// Submissions prepared and not yet landed (copied back), and how many
+/// frames back the oldest of them was prepared: how far ahead of the card
+/// and the copy-back the title is now.
+pub(crate) fn in_air() -> (u64, u64) {
+    let (started, finished) = (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire));
+    let n = started.saturating_sub(finished);
+    if n == 0 {
+        return (0, 0);
+    }
+    let oldest = SUBMISSION_FRAME[((finished + 1) % 1024) as usize].load(Ordering::Relaxed);
+    (n, crate::frame::current().saturating_sub(oldest))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -2910,7 +2927,7 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = crate::shadow::merge_runs();
         if !settle_partial() {
             return spans
                 .iter()
@@ -2941,8 +2958,30 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
 /// in run cumul4 ("title memory changed under shader writes"), so that
 /// preparing and copying back ran one after the other on every frame.
 fn settle_partial() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_SETTLE_PARTIAL").is_some_and(|v| v == "1"))
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_SETTLE_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// `VICTORY_FENCE_PARTIAL=1` (off by default; with the relay; read live):
+/// a title thread that blocks on a fence value behind flights waits until
+/// that value is set (the flight before its signal has landed), not until
+/// every flight in the air has landed.
+pub(crate) fn fence_partial() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_FENCE_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// [`settle_for_fence`] with [`fence_partial`]: until `reached` says the
+/// value is set, or nothing is in the air.
+pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
+    if !late() {
+        return;
+    }
+    if !fence_partial() {
+        settle_now(WHY_FENCE);
+        return;
+    }
+    relay_wait(WHY_FENCE, |line| reached() || (line.line.is_empty() && !line.settling));
 }
 
 /// Before a submission, with [`settle_partial`]: waits until the flights up
@@ -3103,9 +3142,6 @@ pub(crate) fn settle_now(why: usize) {
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
-}
-pub(crate) fn settle_for_fence() {
-    settle_now(WHY_FENCE);
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -5243,6 +5279,7 @@ impl Host {
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
         crate::timeline::mark("prep", this_submission);
+        SUBMISSION_FRAME[(this_submission % 1024) as usize].store(crate::frame::current(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
