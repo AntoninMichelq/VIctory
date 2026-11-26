@@ -440,6 +440,42 @@ impl Scheduler {
     }
 }
 
+/// Where the workers' time goes, for the streaming line ([`stream_log`]),
+/// in nanoseconds since the last line: inflating (zlib), unpacking
+/// (BCPack), waiting for the title's page numbers, opening the GPU side's
+/// guard on raw destinations, mapping a window on physical pages,
+/// telling the title's views of those pages they changed, and writing
+/// pages that are not consecutive through a buffer. Reading the file is
+/// `READING`. The bytes zlib and BCPack produced, too.
+static STAGE_NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static STAGE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+const ZLIB_NS: usize = 0;
+const BCPACK_NS: usize = 1;
+const PAGE_WAIT_NS: usize = 2;
+const GUARD_NS: usize = 3;
+const WINDOW_NS: usize = 4;
+const WRITTEN_NS: usize = 5;
+const BUFFERED_NS: usize = 6;
+
+/// Runs `f`, adding its time to stage `i`.
+fn timed<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    STAGE_NS[i].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
+/// Requests failed since the last streaming line ([`stream_log`]).
+static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_STREAM_LOG=1`: every 5 s of streaming, an INFO line with the
+/// requests finished and failed, the throughput, and what queues hold
+/// (the same sums are at debug level otherwise).
+fn stream_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STREAM_LOG").as_deref() == Ok("1"))
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -477,6 +513,38 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            if stream_log() {
+                // Everything held: enqueued, not submitted, running, and
+                // status entries waiting for earlier reads.
+                let held: usize = self.lanes.values().map(Lane::entries).sum();
+                // Worker-seconds per second in each stage.
+                let secs = elapsed.as_secs_f64();
+                let stage = |i: usize| STAGE_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e9 / secs;
+                let mb = |i: usize| STAGE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / secs;
+                tracing::info!(
+                    reading = format_args!("{:.2}", reading / secs),
+                    zlib = format_args!("{:.2} ({:.1} MB/s out)", stage(ZLIB_NS), mb(0)),
+                    bcpack = format_args!("{:.2} ({:.1} MB/s out)", stage(BCPACK_NS), mb(1)),
+                    page_wait = format_args!("{:.2}", stage(PAGE_WAIT_NS)),
+                    guard = format_args!("{:.2}", stage(GUARD_NS)),
+                    window = format_args!("{:.2}", stage(WINDOW_NS)),
+                    written = format_args!("{:.2}", stage(WRITTEN_NS)),
+                    buffered = format_args!("{:.2}", stage(BUFFERED_NS)),
+                    "dstorage: workers busy by stage, worker-seconds per second (VICTORY_STREAM_LOG)"
+                );
+                tracing::info!(
+                    requests = *requests,
+                    failed = FAILED.swap(0, Ordering::Relaxed),
+                    mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
+                    busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
+                    staging_waits = self.refused,
+                    waiting,
+                    held,
+                    queues = self.lanes.len(),
+                    "dstorage: requests finished in the last {:.1} s (VICTORY_STREAM_LOG)",
+                    elapsed.as_secs_f64()
+                );
+            }
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -535,6 +603,7 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                FAILED.fetch_add(1, Ordering::Relaxed);
             }
             lane.flush();
         }
@@ -829,8 +898,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
+        Some(tables) => timed(BCPACK_NS, || bcpack::decode(bc, &source, out, tables))
+            .map(|()| {
+                STAGE_BYTES[1].fetch_add(out.len() as u64, Ordering::Relaxed);
+                out.len()
+            })
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
@@ -847,11 +919,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    let n = timed(ZLIB_NS, || {
+        miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
+    })
+    .map_err(|status| {
+        tracing::debug!(?status, "dstorage: zlib stream");
+        INVALID_DATA
+    })?;
+    STAGE_BYTES[0].fetch_add(n as u64, Ordering::Relaxed);
+    Ok(n)
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -951,7 +1027,7 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        timed(GUARD_NS, || victory_gpu::kernel_will_write(request.destination as usize, len));
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -971,11 +1047,14 @@ fn into_destination(
     // then failed, and a model or an interior lacked parts). The array is
     // the title's own, so looking again sees what it wrote: wait for it,
     // half a second at most (a request it gave up stays unknown).
-    let mut waited = 0u32;
-    while waited < 250 && !super::xmem::pages_known(pages, offset, len) {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        waited += 1;
-    }
+    let waited = timed(PAGE_WAIT_NS, || {
+        let mut waited = 0u32;
+        while waited < 250 && !super::xmem::pages_known(pages, offset, len) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            waited += 1;
+        }
+        waited
+    });
     if waited > 0 {
         static LATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = LATE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -992,16 +1071,16 @@ fn into_destination(
     // place through one view.
     // Written through a view of our own: the title addresses showing these
     // pages must be told (`physical_written`), after the bytes landed.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = timed(WINDOW_NS, || super::xmem::page_window(pages, offset, len)) {
         let n = fill(window.bytes())?;
-        drop(window);
-        super::xmem::physical_written(pages, offset, n);
+        timed(WINDOW_NS, || drop(window));
+        timed(WRITTEN_NS, || super::xmem::physical_written(pages, offset, n));
         return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        super::xmem::physical_written(pages, offset, n);
+    if timed(BUFFERED_NS, || super::xmem::write_physical(pages, offset, &data[..n])) {
+        timed(WRITTEN_NS, || super::xmem::physical_written(pages, offset, n));
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
