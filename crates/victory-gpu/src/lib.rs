@@ -75,6 +75,8 @@ mod prepstats;
 #[cfg(windows)]
 mod quality;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod tiles;
