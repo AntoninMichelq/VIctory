@@ -513,25 +513,39 @@ pub(crate) const LEDGER_BYTES: u64 = LEDGER_ENTRIES as u64 * 16;
 /// Records in `list`, after the clamps of a run went to `ledger`'s first
 /// `entries` entries, which of them run ([`SETTLE`]). The ledger stays
 /// writable by shaders; the caller makes it readable as arguments.
-pub(crate) fn settle(list: &ID3D12GraphicsCommandList, ledger: &ID3D12Resource, entries: u32, budget: u64) -> bool {
+pub(crate) fn settle(
+    list: &ID3D12GraphicsCommandList,
+    ledger: &ID3D12Resource,
+    entries: u32,
+    budget_res: Option<&ID3D12Resource>,
+    budget: u64,
+) -> bool {
     let Some(c) = settle_pipeline() else {
         return false;
     };
     // SAFETY: an open list; our root signature and pipeline; a live ledger
-    // the clamps wrote before (the barrier).
+    // the clamps wrote before (the barrier) and the list's budget buffer.
     unsafe {
-        let barrier = if scoped_uav() {
-            uav_barrier_for(ledger)
+        if scoped_uav() {
+            match budget_res {
+                Some(b) => list.ResourceBarrier(&[uav_barrier_for(ledger), uav_barrier_for(b)]),
+                None => list.ResourceBarrier(&[uav_barrier_for(ledger), uav_barrier()]),
+            }
         } else {
-            uav_barrier()
-        };
-        list.ResourceBarrier(&[barrier]);
+            list.ResourceBarrier(&[uav_barrier()]);
+        }
         list.SetComputeRootSignature(&c.root);
         list.SetPipelineState(&c.pso);
         list.SetComputeRoot32BitConstants(0, 1, (&raw const entries).cast(), 0);
         list.SetComputeRootUnorderedAccessView(1, ledger.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, budget);
         list.Dispatch(1, 1, 1);
+        if scoped_uav() {
+            list.ResourceBarrier(&[match budget_res {
+                Some(b) => uav_barrier_for(b),
+                None => uav_barrier(),
+            }]);
+        }
     }
     true
 }
@@ -692,7 +706,10 @@ cbuffer Record : register(b0) {
 ByteAddressBuffer src_args : register(t0);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+#ifndef BUDGET_LOG2
+#define BUDGET_LOG2 27
+#endif
+static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint GROUPS = 1u << 20;
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
@@ -744,6 +761,7 @@ void main(uint lane : SV_GroupIndex) {
                 if (c > left) {
                     costs[i] = PAST;
                     left = 0;
+                    budget.InterlockedAdd(12, 1);
                 } else {
                     left -= c;
                     if (c > 0) {
@@ -821,10 +839,7 @@ pub(crate) fn bound_compact(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     let scoped = scoped_uav();
-    let first = [
-        if scoped { uav_barrier_for(src) } else { uav_barrier() },
-        transition(&dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    ];
+    let dst_to_uav = transition(&dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     let second = [
         if scoped { uav_barrier_for(budget_res) } else { uav_barrier() },
         transition(
@@ -835,7 +850,11 @@ pub(crate) fn bound_compact(
     ];
     // SAFETY: open list, live buffers, root signature and pipeline.
     unsafe {
-        l.ResourceBarrier(&first);
+        if scoped {
+            l.ResourceBarrier(&[uav_barrier_for(src), uav_barrier_for(budget_res), dst_to_uav]);
+        } else {
+            l.ResourceBarrier(&[uav_barrier(), dst_to_uav]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
@@ -1039,7 +1058,7 @@ fn record_clamp_flags_with(
         return true;
     }
     if scoped {
-        let mut first = Vec::with_capacity(3);
+        let mut first = Vec::with_capacity(4);
         if waits {
             first.push(uav_barrier_for(src));
             if let Some((cb, _)) = count
@@ -1047,6 +1066,10 @@ fn record_clamp_flags_with(
             {
                 first.push(uav_barrier_for(cb));
             }
+            first.push(match budget_res {
+                Some(b) => uav_barrier_for(b),
+                None => uav_barrier(),
+            });
         }
         first.push(transition(
             dst,
@@ -1272,10 +1295,10 @@ fn settle_later_with_res(
         l.SetComputeRootUnorderedAccessView(3, budget);
         l.Dispatch(1, 1, 1);
         if scoped_uav() {
-            l.ResourceBarrier(&[match budget_res {
-                Some(b) => uav_barrier_for(b),
-                None => uav_barrier(),
-            }]);
+            match budget_res {
+                Some(b) => l.ResourceBarrier(&[uav_barrier_for(chunk), uav_barrier_for(b)]),
+                None => l.ResourceBarrier(&[uav_barrier_for(chunk), uav_barrier()]),
+            }
         } else {
             l.ResourceBarrier(&[uav_barrier()]);
         }
