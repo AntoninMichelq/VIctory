@@ -565,6 +565,12 @@ impl Flights {
         }
     }
 
+    /// The newest submission that declared a range overlapping `[from,
+    /// to)`; `None` if none did.
+    fn newest_over(&self, from: usize, to: usize) -> Option<u64> {
+        self.0.iter().filter(|f| f.0.0 < to && f.0.1 > from).map(|f| f.2).max()
+    }
+
     /// One submission that declared `ranges` (each once) is copied back:
     /// the ranges no other submission still holds.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -2269,6 +2275,32 @@ impl Shadow {
     /// With [`relay`] several submissions may hold a range: `ranges` are
     /// those of one of them (each once), and a range is done with when the
     /// last submission that declared it is ([`Flights`]).
+    /// With [`relay`]: the submission after whose landing no flight's
+    /// shaders write `[address, address + len)` of the copy any more (the
+    /// newest that declared an overlapping range); `u64::MAX` if a range
+    /// shaders write there was declared before submissions were counted
+    /// (all flights must land); 0 if none writes there.
+    pub(crate) fn landed_free_after(&self, address: usize, len: usize) -> u64 {
+        let (from, to) = (address, address + len);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.iter().any(|&(a, e)| a < to && e > from) {
+            return 0;
+        }
+        if !relay() {
+            return u64::MAX;
+        }
+        let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        // Every pending range there must be one a flight counts.
+        let counted = pending
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .all(|r| flights.0.iter().any(|f| f.0 == *r));
+        if !counted {
+            return u64::MAX;
+        }
+        flights.newest_over(from, to).unwrap_or(u64::MAX)
+    }
+
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
             return;
@@ -2421,6 +2453,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            crate::copytop::settle_cause(crate::copytop::S_UNWATCHED);
             return true;
         }
         let base = start / PAGE;
@@ -2433,6 +2466,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                crate::copytop::settle_cause(crate::copytop::S_NO_ANSWER);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2472,6 +2506,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        crate::copytop::settle_cause(crate::copytop::S_RUNS);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2483,6 +2518,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        crate::copytop::settle_cause(crate::copytop::S_NO_SNAPSHOT);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
