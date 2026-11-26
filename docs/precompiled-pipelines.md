@@ -1,0 +1,262 @@
+# Precompiled pipelines (device methods 0x1c8 and 0x218)
+
+The title creates hundreds of pipelines through two device methods whose
+descriptions the console headers we work from do not give: vtable slots
+`0x1c8` (graphics) and `0x218` (compute), both called as
+`(device, description, interface id, out)`. This note records what their
+descriptions hold, as worked out on 2026-11-25 from the title's call sites,
+the descriptions it passed in runs, its shader pack and the FidelityFX
+upscaler library it ships. `crates/victory-gpu/src/precompiled.rs` reads
+them; its module comment has the same layout in short.
+
+## Call sites
+
+- `0x218` (title+0x24800d5): the description is part of a node of a hash
+  map the title keeps per pipeline (node: +0x08 next, +0x10 a 64-bit key,
+  +0x18 the description, 0x60 bytes in all). The title writes the root
+  signature into the node's first description word just before the call.
+  So the 12 words the device logged were one description (9 words) and the
+  start of the next node.
+- `0x1c8` (title+0x2477578): the description sits at +0x40 in an object of
+  the title's; its first word is likewise written just before the call.
+
+Both ask for `ID3D12PipelineState`; on failure the title goes without the
+pipeline, silently.
+
+## Description
+
+```text
+u64 root signature (one of our host root signature objects)
+(u64 address, u64 size) per section:
+  0x218  registers, info, code, map                      4 pairs
+  0x1c8  registers, info, code, map, code, map, (zeros)  6 pairs
+```
+
+In every graphics description looked at, the first program was a pixel
+shader and the second a vertex shader. The metadata sections of one
+description lie back to back in title memory; the code sections lie apart,
+in memory the GPU reads (256-byte aligned).
+
+| section   | compute                         | graphics                       |
+|-----------|---------------------------------|--------------------------------|
+| registers | 0x1c bytes, register values     | 0x184 or 0x18c bytes           |
+| info      | 0x14: u32 hash, u32 3, zeros    | 0x50-0xbc: u32 hash, u32 0x1000, ... |
+| code      | GFX10 machine code              | GFX10 machine code             |
+| map       | see below                       | u32 2, u32 size - 0xc, u32 (code dwords - 10 in both samples), ... |
+
+Compute map: u32 0x403, u32 size - 0x14, u32 code size in dwords (padding
+included), u32 0, u32 0, u16 0x440, u16 the number of 0x41 entries, then
+32-byte entries: 0x41 (user-data mapping), 0x42 (resource use), and a
+closing 0x43 entry holding the program's 128-bit hash.
+
+## The code
+
+The code sections are not DXBC containers, nor a different encoding: they
+are GFX10 machine code made from the native programs (`FSSM`, see
+`crates/victory-shader/src/native.rs`) of the title's own shader containers
+in `shaders.rpf`, with `s_code_end` (0xbf9f0000) padding after them. They
+are not those programs byte for byte (first believed, from 16-byte heads
+in logs; the dumped sections showed otherwise):
+
+- A program in a container begins with two 12-byte words, `v_nop` in its
+  VOP3 form (`xx xx 80 d5 xx xx fe/ff 03`) and a dword more, whose fields
+  the instruction ignores carry the program's 128-bit hash (the hash of
+  the map's closing 0x43 entry); then `s_inst_prefetch` and the program.
+  That is where the `80 d5` at bytes 2-3 and 14-15 come from.
+- In a description the same two words come first, then a third
+  (`d5800000 03fe0100 00000ac0` in all 192 dumped) and code that differs
+  from the container's from its first instructions on (the title's
+  run-time form of the program).
+
+So a description's program is found by its two hashed words. Offline, all
+192 programs of the 64 graphics and 64 compute descriptions dumped are
+found that way, each in a container of its own stage (pixel, vertex,
+compute); none of them by its first bytes past the hash. Of the pack's
+26,698 programs the hashed words name 25,321: 195 of them name two
+programs, an `Es` and a `Gs` one.
+
+The title never hands these containers to the known creation methods, which
+is why they did not match any container the device had seen.
+
+## FSPX
+
+The FidelityFX library (`amd_fidelityfx_upscaler_xbox.dll`) stores the same
+sections for its compute shaders in files of their own:
+
+```text
+"FSPX" u32 version (1), u32 section count, u32 file size,
+       then per section: u32 kind, u32 offset, u32 size, u32 0
+kinds  0 registers (0x1c), 1 info (0x14), 6 code, 7 map
+```
+
+No `FSPX` file, nor any whole pipeline, is stored in the title's packs: the
+title assembles the descriptions at run time from its containers.
+
+## What the device does with them
+
+`VICTORY_SHADER_PACK=<path of shaders.rpf>` (off by default) has the device
+index the pack's containers by their programs' hashed words
+(`precompiled::program_key`) on the first such call (the 411 MB pack is read whole and its 26,503 containers
+unpacked in parallel: about 0.45 s offline on the test machine, logged with
+its time), and find each description's
+program there when the title has not given us its container. A compute
+description whose program is found is made into a compute pipeline as
+`create_compute` makes one (the root signature is bound at dispatch, as for
+other pipelines).
+
+A graphics description whose vertex and pixel programs are both found (and
+only with `VICTORY_SHADER_PACK` set; `VICTORY_PRECOMPILED_GRAPHICS=0`
+leaves them unmade and keeps the compute ones) gets a pipeline object at once, whose
+host pipelines are made at its draws (`pipeline::Precompiled`): one per set
+of what the draw has bound, the render target formats as the host has them
+(the views' formats, else their textures'), their number, the depth format,
+the sample count, and the topology type of the topology set (rectangles
+their own; `precompiled::Targets`). Another set met later gets a host
+pipeline of its own; each is made by the pipeline workers as any other
+(`make::Pending`), so a first draw may be dropped while it is made. The
+state comes from the registers section as the table below reads it
+(`precompiled::GraphicsRegisters::decode`); what D3D12 cannot express
+exactly is logged once per kind ("precompiled graphics pipeline state the
+host has otherwise"). Descriptions not made log the stages found, as
+before. `VICTORY_UNKNOWN_PIPELINES=0` leaves both methods failing, as
+before.
+
+## Graphics registers (first look, 64 descriptions)
+
+`VICTORY_PRECOMPILED_DUMP=<dir>` (diagnostics) saves every section of the
+first 64 descriptions of each method, and the registers and info sections
+of every graphics description made, by its shaders
+(`gfx-<vertex>-<pixel>-<n>-registers.bin` and `-info.bin`, `n` counting
+the different registers sections of one pair). The graphics registers section is 97
+dwords (0x184). Most never change across the 64; the ones that do, read
+against GFX10's public register layouts:
+
+| dwords | values seen | reading |
+|--------|-------------|---------|
+| 14, 15 | `0x082c034x`, `0x12`/`0x14`/`0x18` | `SPI_SHADER_PGM_RSRC1/2` of the pixel program (VGPR/SGPR blocks, float mode `0xc0`, user SGPRs) |
+| 19, 20 | `0x022c[c]34x`, same | the same for the vertex program |
+| 31 | `0x00cc0010` (all) | `CB_COLOR_CONTROL`: normal mode, ROP3 copy (not read) |
+| 39 | `0x00080000` (all) | `PA_CL_CLIP_CNTL`: DX clip space; bits 26/27 (near/far clipping off) read as `DepthClipEnable` |
+| 40 | `0x00201a40` (54), `0x00201a42` (10) | `PA_SU_SC_MODE_CNTL`: bits 0/1 cull front/back (read), bit 2 front face (read: 0 counter-clockwise, as RADV writes Vulkan's numbering), bits 3-10 polygon mode and types (read: lines as wireframe), bit 11 front polygon offset on (read; set in all) |
+| 43-45 | `0` mostly; `0, 16.0, 1.0` (contact markers, entity masks); `0.003, 29.0, 0` (cascade shadow passes, hair strands included) | `PA_SU_POLY_OFFSET_CLAMP`, `_FRONT_SCALE`, `_FRONT_OFFSET` (read): `DepthBiasClamp`, `SlopeScaledDepthBias` = scale / 16 (as RADV writes it), `DepthBias` = offset. Every pair of shaders run 61 drew with the title's own pipelines (`VICTORY_PRECOMPILED_GRAPHICS=0`, which logs their bias) and run 50 dumped agrees exactly: (0.003, 29, 0) = slope 1.8125, clamp 0.003 (one of the title's four cascade biases for those shaders), (0, 16, 1) = slope 1, bias 1. `VICTORY_PRECOMPILED_DEPTH_BIAS=0` leaves it out |
+| 46 | `0x007007f0` (57), `0x007002f7`, `0x00200291`, ... | `DB_DEPTH_CONTROL` (read): stencil, depth, depth write, depth bounds, depth func (bits 4-6), two-sided stencil (7), stencil funcs (8-10, 20-22); `0x007007f0` = no depth test, no stencil; `0x7e2` = greater-or-equal test, no write |
+| 47 | `0` (62), `0x1001`, `0x80080` | `DB_STENCIL_CONTROL` (read): fail, depth-pass, depth-fail ops, front then back, 4 bits each (`0x80080` = add one wrapping on pass) |
+| 48, 49 | `0x0100ff00` (61), ... | `DB_STENCILREFMASK` and its back-face twin (read: mask, write mask; the test value is the draw's reference on the host; op value 1 = D3D12's increments) |
+| 51 | `0xffffffff` / `0` | `CB_TARGET_MASK` (read): 4 bits (RGBA) a target |
+| 52-59 | `0x80000000` (23), `0xe5040504` (25), ... | `CB_BLEND0..7_CONTROL` (read): colour source, function, destination (bits 0-4, 5-7, 8-12), the same for alpha (16-28), bit 29 separate alpha, bit 30 enable, bit 31 no ROP3; `0xe5040504` = source alpha / one minus source alpha |
+| 64-71 | `0x06000600` (23), `0x01540154` (25), ... | `SX_MRT0..7_BLEND_OPT`, matching dwords 52-59 (`6` = blending off; not read) |
+| 63 | `0` / `0x33333333` | not identified (0 where blending is on, `0x33333333` where it is off) |
+| 72 | `0x00100000` (all but 8 of 4,314 in run 50), `0x00e00441` | `PA_SC_CONSERVATIVE_RASTERIZATION_CNTL` (read): the default is RADV's (NULL_SQUAD_AA_MASK_ENABLE); bit 0 OVER_RAST_ENABLE on fog volume proxies, trail maps and `ps_light_proxy_conservative`: D3D12's conservative rasterization (where the host has it) |
+| 74 | `0x19fc0130` (47), `...01c0`, `...0120`, `...0131` | `DB_SHADER_CONTROL`: bit 0 Z export (the pixel shaders writing `SV_Depth`), Z order in bits 4-5, kill in bit 6; bit 11 (alpha to mask disable) never set; nothing D3D12 needs |
+| 92-96 | small counts, `0x10000a00` | not identified (vertex output or stream setup); the 3 sections of 99 dwords have 2 more here, the dwords above are where they are in the others |
+
+The eight blend controls and write masks become one description per
+target, independent only where they differ, and never when target 0
+blends with the pixel shader's second output (`SRC1_*` factors, e.g.
+`0xf1010f01` = one plus second source colour, the prison-yard window glass
+and the like): D3D12 allows dual-source blending on target 0 alone and
+refuses it with independent blending (`E_INVALIDARG`). Runs 50-52 lost
+those passes that way (the fence and glass of the window); offline, 1,746
+of run 50's dumped descriptions (400 pairs of shaders) are all made now.
+
+What the host pipeline gets beyond these: the input layout of the info
+section (below), sample mask all, no alpha to coverage, D3D12's nearest for what has no exact equal (constant alpha
+blend factors as the blend factor, stencil ops `ONES` and
+replace-by-op-value as replace, logic stencil ops as keep, both faces
+culled as none). A registers section shorter than 60 dwords or unreadable
+gets the console's reset state (no blending, all written, no depth or
+stencil test, no culling, solid, clipped), logged once.
+
+## Graphics info: the input layout
+
+The graphics info section (0x50-0xbc bytes) holds the vertex input layout
+(`precompiled::input_layout`), the formats in the title's DXGI numbering:
+
+```text
+0x00  u32 hash, u32 0x1000, ...
+0x38  u32 bytes of the layout (from 0x4c, padding not counted)
+0x4c  u32 element count, then per element:
+      u32 name length (its zero included), the name,
+      u32 semantic index, u32 format, u32 input slot,
+      u32 byte offset, u32 classification (1 per instance),
+      u32 instance step rate
+```
+
+In the 64 dumped: `POSITION` R32G32B32_FLOAT at 0, `COLOR` R8G8B8A8_UNORM
+at 12, `TEXCOORD` R32G32_FLOAT at 16 (the most common); `COLOR` at 0 and
+`POSITION` R32G32_FLOAT at 4; `POSITION` R32G32_FLOAT alone; none (a
+section of 0x50 bytes). Each names every input its vertex shader reads.
+Without it the host refuses a pipeline whose vertex shader reads inputs
+(`E_INVALIDARG`, with or without the rectangle geometry stage): run 47
+dropped the draws of 9 such pipelines drawn as rectangles. With it, all 64
+descriptions dumped are made offline as triangle and rectangle pipelines
+(the rectangles with their geometry stage). The header's other words are
+not read.
+
+**No render target or depth formats are in the description.** On the
+console they come with the targets bound at draw time; a host pipeline
+needs them at creation (`D3D12_RT_FORMAT_ARRAY`, the depth format). So a
+graphics pipeline of this method is made at its draws, keyed by the
+formats bound then (above).
+
+Checked against the title's own pipelines: in run 45 (no 0x1c8 pipeline
+made) the title drew the same shaders with pipelines it made another way,
+with D3D12's state, which its frame listings show. Every dumped
+description whose shaders run 45 drew decodes to the state run 45 shows
+for them (for example description 15, `e5010501`: one / one minus source
+alpha; 20 and 24, `e5040504`: source alpha over; 3: no depth, no culling).
+Two pairs of shaders differed in runs 47/48 and are not among the dumps:
+`e38865315b050ed9`/`62306a1922b106e8` (write mask 0 in run 45, 0xf here)
+and `1ce8ba2fe12072c1`/`4dd4a3d69c1bd8ca` (blending in run 45, none here);
+their registers were dumped in run 50 (`VICTORY_PRECOMPILED_DUMP`, 21,864
+graphics sections):
+
+- `e38865...` writes depth only: its pixel shader has no colour output
+  (`SV_Depth` alone), and its registers enable every target's writes
+  (dword 51 `ffffffff`) as those of many such passes do; the console
+  writes no colour without an export. The host would write undefined
+  values, so a precompiled pipeline now writes nothing to the targets its
+  pixel shader has no output for (`GraphicsState::host_blend_writing`).
+  That is also the other mask-0 pair of run 45 (`643101624bd14159`, no
+  output at all).
+- `1ce8ba...` has blending off in both its blend registers (`CB_BLEND0`
+  `0x80000000`, `SX_MRT0_BLEND_OPT` `0x06000600`) and a single registers
+  section: the title's description says no blending. Run 45's blended
+  pipeline of these shaders is another of the title's.
+
+Of the 89 states run 45 shows for shaders made precompiled in run 50, 80
+are matched in full by a decoded registers section of the same shaders,
+the write-mask pairs are explained above, and the rest (blend of
+`1ce8ba...`, culling of `ca5fa787aecf4e22`, two of `58d926085fca4999`, one
+of `a2f648245d70a85c`, a stencil enable of `5d3a25d932263bb7`) differ in
+one or two fields with no section of those shaders that agrees: pipelines
+the title made by the other method, or sections not dumped.
+
+The black loading and menu screens of
+runs 47/48 were not the state: the loading pictures and the full-screen
+rectangle pass that composes them were refused for want of an input layout
+(above) and dropped.
+
+## Open
+
+- The front face reading (bit 2 of dword 40): all run-45 states with
+  culling that a section matches agree with it (counter-clockwise front).
+- The words of the info section's header besides the layout's size.
+- Dwords 22-38, 61-63 and 92-96 of the graphics registers. In run 50's
+  21,864 sections (95 to 105 dwords; the dwords read above are at the same
+  positions in all, the extra ones at the end) none looks like a state
+  D3D12 takes at creation: no alpha-to-coverage enable is set anywhere
+  (`DB_SHADER_CONTROL` bit 11 never; no `DB_ALPHA_TO_MASK`-like dword),
+  the sample masks (dwords 60, 86) are all ones, as the host's default.
+  Dword 30 (`0xf`, `0xff`, `0xfff`) looks like `CB_SHADER_MASK`, but is
+  `0xf` for the depth-only hair shadow pass too (a null export).
+- The brighter hair of run 52 against run 51 (frame 4608): not the depth
+  bias (its units match the title's own pipelines, which run 43 drew
+  right) nor the rule writing nothing to targets a pixel shader has no
+  output for (in run 50's 21,864 sections it only touches pixel shaders
+  whose translation writes no colour at all: depth copies, shadow and
+  mask passes, passes writing through views). Not found here.
+- Host pipelines of precompiled pipelines are not started early in later
+  runs (their variants appear only at draws).
+- Whether the run-time code differs from the container's program in more
+  than its form (the container's program is what is translated).

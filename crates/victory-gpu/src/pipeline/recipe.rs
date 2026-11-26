@@ -84,6 +84,7 @@ pub(crate) fn clone_graphics(g: &GraphicsState) -> GraphicsState {
         samples: g.samples,
         title_depth_bounds: g.title_depth_bounds,
         depth_bounds: g.depth_bounds,
+        unwritten_masked: g.unwritten_masked,
     }
 }
 
@@ -205,7 +206,9 @@ fn encode_graphics(out: &mut Vec<u8>, g: &GraphicsState) {
     put_i32(out, g.depth_format.0);
     put_u32(out, g.samples.Count);
     put_u32(out, g.samples.Quality);
-    let flags = u8::from(g.title_depth_bounds) | (u8::from(g.depth_bounds) << 1);
+    let flags = u8::from(g.title_depth_bounds)
+        | (u8::from(g.depth_bounds) << 1)
+        | (u8::from(g.unwritten_masked) << 2);
     out.push(flags);
 }
 
@@ -358,6 +361,7 @@ fn decode_graphics(r: &mut Reader<'_>) -> Option<GraphicsState> {
         samples,
         title_depth_bounds,
         depth_bounds,
+        unwritten_masked: (flags & 4) != 0,
     })
 }
 

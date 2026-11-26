@@ -157,6 +157,11 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// The stages and hashes of `p`'s shaders, for the log.
+pub(crate) fn names(p: &Pending) -> String {
+    p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ")
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// or, with `VICTORY_PIPELINES_ALL_EARLY=1`, whatever it is: the title

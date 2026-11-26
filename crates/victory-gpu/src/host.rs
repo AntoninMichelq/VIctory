@@ -1159,7 +1159,34 @@ struct TwinUse {
     /// The depth plane's twin holds what the plane lacks although the list
     /// copied the twins since: the plane's pass waits for the list's close.
     late: bool,
+    /// A shader of the list wrote the depth plane's twin (an unordered
+    /// view of the depth plane, not of the stencil plane alone): see
+    /// [`plane_pass_written`].
+    plane_written: bool,
 }
+
+/// `VICTORY_PLANE_PASS=written`: the pass that draws the depth plane's
+/// twin into the depth plane of a depth-stencil texture runs only after a
+/// list whose shaders wrote that twin. Before, it ran whenever they wrote
+/// either twin. The depth plane's twin is never given the plane (see
+/// `record_twin_copy`), so after shaders wrote the stencil plane alone the
+/// pass put back an old depth over all that draws wrote to the plane since:
+/// the depth of walls and ceilings drawn before the stencil pass lost, the
+/// sky and what lies behind drawn there instead (prison D1). Default: as
+/// before.
+pub(crate) fn plane_pass_written() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_PLANE_PASS").as_deref() == Ok("written");
+        tracing::info!(on, "depth planes drawn from their twins only after shaders wrote them (VICTORY_PLANE_PASS=written)");
+        on
+    })
+}
+
+/// Passes of a depth plane's twin into its plane left out because only
+/// the stencil plane was written (`VICTORY_PLANE_PASS=written`), since the
+/// start.
+pub(crate) static PLANE_PASSES_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The pass that draws the twin of a depth plane into the plane: one
 /// triangle over each mip of each slice, its pixel shader writing the
@@ -4177,6 +4204,28 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU rasterizes conservatively (any tier).
+    pub(crate) fn conservative_raster(&self) -> bool {
+        static TIER: OnceLock<bool> = OnceLock::new();
+        *TIER.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok
+                && options.ConservativeRasterizationTier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            tracing::info!(supported, tier = options.ConservativeRasterizationTier.0, "host conservative rasterization");
+            supported
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         self.new_list_of(false)
@@ -6703,6 +6752,7 @@ impl HostList {
                 behind: [None; 2],
                 writing: false,
                 late: false,
+                plane_written: false,
             });
         let copy = match u.behind[side] {
             Some(behind) => behind,
@@ -6808,20 +6858,36 @@ impl HostList {
                     u.behind[0] = Some(false);
                 }
                 u.late = false;
-                (u.depth.clone(), u.twin.clone(), copy)
+                // (A compute list runs no pass: what it wrote waits.)
+                let plane = if self.compute { u.plane_written } else { std::mem::take(&mut u.plane_written) };
+                (u.depth.clone(), u.twin.clone(), copy, plane)
             })
             .collect();
         drop(twins);
-        for (depth, twin, copy) in &written {
+        for (depth, twin, copy, plane) in &written {
             if *copy {
                 self.twin_copy(depth, twin, false);
             }
-            if !self.compute {
+            if twin.plane.is_some() && !*plane && plane_pass_written() {
+                PLANE_PASSES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            } else if !self.compute {
                 // Nothing of the title's is recorded after this: the pass may
                 // leave its own pipeline and target set.
                 self.pass_plane(depth, twin);
             }
             self.settle(depth, SHADER_RESOURCE);
+        }
+    }
+
+    /// A shader of the draw or dispatch being prepared writes the depth
+    /// plane's twin of `resource` (an unordered view of its depth plane).
+    pub(crate) fn twin_plane_written(&self, resource: crate::object::This) {
+        let Some(twin) = crate::resource::twin(resource) else {
+            return;
+        };
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(&twin) as usize)) {
+            u.plane_written = true;
         }
     }
 
@@ -8915,6 +8981,9 @@ impl Meter {
                     crate::resource::TWINS[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[2].load(Ordering::Relaxed)
+                ) + &format!(
+                    ", {} depth planes' passes left out after shaders wrote the stencil plane alone (VICTORY_PLANE_PASS=written)",
+                    PLANE_PASSES_SKIPPED.load(Ordering::Relaxed)
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
