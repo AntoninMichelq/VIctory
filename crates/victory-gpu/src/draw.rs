@@ -997,8 +997,15 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches,
+    /// timed (`VICTORY_PREP_STATS`).
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let _timed = crate::prepstats::Timed::new(crate::prepstats::P::DrawPrepare);
+        self.prepare_untimed(list, indexed, mesh)
+    }
+
+    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    fn prepare_untimed(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1846,6 +1853,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let _timed = crate::prepstats::Timed::new(crate::prepstats::P::HeapTextures);
         let memory = crate::host::host().and_then(|h| h.video_memory());
         let mut per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);

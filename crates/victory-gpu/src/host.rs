@@ -2664,13 +2664,16 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                Step::GpuWrite(shadow, address, len) => {
+                // (With the copies made on the card, this submission's own
+                // writes are not looked for: a walk of all of them per
+                // refresh, for nothing.)
+                Step::GpuWrite(shadow, address, len) if !copied => {
                     own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
                 }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let me = Arc::as_ptr(shadow) as usize;
-                    if let Some(w) = own.iter().find(|w| !copied && w.0 != me && w.1 < to && w.2 > from) {
+                    if !copied && let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
@@ -5261,6 +5264,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        let asking = crate::prepstats::start();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -5306,6 +5310,10 @@ impl Host {
         } else if !behind {
             aliased_under_flights(runs, false);
         }
+        if let Some(at) = asking {
+            crate::prepstats::add(crate::prepstats::P::AskAndFlights, at.elapsed().saturating_sub(settled));
+        }
+        let computing = crate::prepstats::Timed::new(crate::prepstats::P::AsyncCompute);
         let on_compute =
             self.compute_queue.is_some() && !runs.is_empty() && runs.iter().all(|l| l.is_compute());
         // Collect unique textures touched by `runs` for cross-queue sync and
@@ -5385,17 +5393,24 @@ impl Host {
                 }
             }
         }
+        drop(computing);
+        let crossing = crate::prepstats::start();
         let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
+        crate::prepstats::done(crate::prepstats::P::CrossCopies, crossing);
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             let aliased = crossed.get_mut(n).map(std::mem::take).unwrap_or_default();
+            let preluding = crate::prepstats::start();
             if let Some(prelude) = list.prelude(aliased) {
                 lists.push(Some(prelude));
             }
+            crate::prepstats::done(crate::prepstats::P::Preludes, preluding);
             lists.push(list.list.cast().ok());
         }
+        let flushing = crate::prepstats::start();
         batch.flush();
+        crate::prepstats::done(crate::prepstats::P::BatchFlush, flushing);
         crate::watch::ask_once_end();
         // After a compute submission's lists: transition every texture it used
         // back to COMMON on the compute queue so the direct queue can safely
@@ -5448,6 +5463,7 @@ impl Host {
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            let _snapping = crate::prepstats::Timed::new(crate::prepstats::P::Snapshots);
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
@@ -5461,7 +5477,9 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        let carding = crate::prepstats::start();
         let card = self.card_before(runs, flown, on_compute);
+        crate::prepstats::done(crate::prepstats::P::CardBefore, carding);
         if self.compute_queue.is_some()
             && let Some(card) = &card
         {
@@ -5497,6 +5515,8 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        crate::prepstats::add(crate::prepstats::P::Settles, settled);
+        crate::prepstats::add(crate::prepstats::P::Whole, prepared - started);
         if late {
             let fence_val = if on_compute {
                 self.wait_compute_on_direct(need_direct);
@@ -7031,6 +7051,16 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            let _timed = crate::prepstats::Timed::new(match step {
+                Step::Copy(..) => crate::prepstats::P::TitleCopies,
+                Step::Fill(..) => crate::prepstats::P::Fills,
+                Step::Run(_) => crate::prepstats::P::TitleRuns,
+                Step::Host(_) => crate::prepstats::P::HostRuns,
+                Step::GpuWrite(..) => crate::prepstats::P::GpuWrites,
+                Step::Texture(_) => crate::prepstats::P::Textures,
+                // (Queued for the flush: its time is the flush's.)
+                _ => crate::prepstats::P::BatchFlush,
+            });
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8038,6 +8068,7 @@ impl Meter {
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         crate::overlay::frame_rate(hwnd, fps, ms);
         crate::tiles::status();
+        crate::prepstats::line(frames);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
