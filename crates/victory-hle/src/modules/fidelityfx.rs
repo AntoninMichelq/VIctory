@@ -709,6 +709,84 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     unsafe { (host.query)(context, desc) }
 }
 
+/// RCAS sharpening override from `VICTORY_FFX_SHARPNESS`:
+/// unset = pass through title values; `"off"` / `"0"` = disable;
+/// `"auto"` = scale-dependent RCAS (`0.25` at 0.5, `0.45` at 0.42, `0.55` at 0.38);
+/// or a float in `[0.0, 1.0]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SharpnessOverride {
+    Off,
+    Fixed(f32),
+    Auto,
+}
+
+fn sharpness_override() -> Option<SharpnessOverride> {
+    static OVERRIDE: OnceLock<Option<SharpnessOverride>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("VICTORY_FFX_SHARPNESS").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.eq_ignore_ascii_case("off") {
+            return Some(SharpnessOverride::Off);
+        }
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return Some(SharpnessOverride::Auto);
+        }
+        match trimmed.parse::<f32>() {
+            Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
+                if v == 0.0 {
+                    Some(SharpnessOverride::Off)
+                } else {
+                    Some(SharpnessOverride::Fixed(v))
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    value = trimmed,
+                    "VICTORY_FFX_SHARPNESS: expected 0.0..=1.0, auto, or off; ignored"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Computes auto RCAS sharpness from render/upscale ratio: `0.25` at 0.50,
+/// `0.45` at 0.42, `0.55` at 0.38 (capped at `0.75` to avoid RCAS halos).
+fn auto_sharpness_for_ratio(render_w: u32, upscale_w: u32) -> f32 {
+    let ratio = if render_w > 0 && upscale_w > 0 {
+        render_w as f32 / upscale_w as f32
+    } else {
+        0.5
+    };
+    (0.25 + (0.5 - ratio).clamp(0.0, 0.2) * 2.5).clamp(0.25, 0.75)
+}
+
+/// Applies `override_mode` to `DispatchUpscale.rest` (`rest[8]` =
+/// `enableSharpening`, `rest[9]` = `sharpness`). Returns `(enabled, sharpness)`.
+fn apply_sharpness_override(rest: &mut [u32; 18], mode: SharpnessOverride) -> (bool, f32) {
+    match mode {
+        SharpnessOverride::Off => {
+            rest[8] = 0;
+            rest[9] = 0.0f32.to_bits();
+            (false, 0.0)
+        }
+        SharpnessOverride::Fixed(s) => {
+            rest[8] = 1;
+            rest[9] = s.to_bits();
+            (true, s)
+        }
+        SharpnessOverride::Auto => {
+            let s = auto_sharpness_for_ratio(rest[4], rest[6]);
+            rest[8] = 1;
+            rest[9] = s.to_bits();
+            (true, s)
+        }
+    }
+}
+
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
@@ -728,6 +806,24 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
+    once!(
+        info,
+        render = ?[dispatch.rest[4], dispatch.rest[5]],
+        upscale = ?[dispatch.rest[6], dispatch.rest[7]],
+        title_sharpening = dispatch.rest[8] != 0,
+        title_sharpness = format_args!("{:.3}", f32::from_bits(dispatch.rest[9])),
+        dispatch_flags = format_args!("{:#x}", dispatch.rest[17]),
+        "FidelityFX: first dispatch parameters from title"
+    );
+    if let Some(mode) = sharpness_override() {
+        let (enable, sharpness) = apply_sharpness_override(&mut dispatch.rest, mode);
+        once!(
+            info,
+            enable,
+            sharpness = format_args!("{sharpness:.3}"),
+            "FidelityFX: RCAS sharpening override active (VICTORY_FFX_SHARPNESS)"
+        );
+    }
     // `renderSize` sits at `rest[4..6]` in `ffxDispatchDescUpscale`.
     dynamic_on_dispatch([dispatch.rest[4], dispatch.rest[5]]);
     let list = dispatch.list.cast::<Object>().cast_const();
@@ -890,5 +986,29 @@ mod tests {
         assert!(ctrl.title_followed);
         assert!(raises > drops, "scale should rise slower than it drops");
         assert!((ctrl.current_scale - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rcas_sharpness_override_updates_dispatch_rest() {
+        let mut rest = [0u32; 18];
+        rest[4] = 1612;
+        rest[5] = 907;
+        rest[6] = 3840;
+        rest[7] = 2160;
+        let (en, s) = apply_sharpness_override(&mut rest, SharpnessOverride::Auto);
+        assert!(en);
+        assert_eq!(rest[8], 1);
+        assert!((s - 0.45).abs() < 0.01);
+        assert_eq!(rest[9], s.to_bits());
+
+        let (en, s) = apply_sharpness_override(&mut rest, SharpnessOverride::Fixed(0.35));
+        assert!(en);
+        assert_eq!(rest[8], 1);
+        assert!((s - 0.35).abs() < 1e-6);
+
+        let (en, s) = apply_sharpness_override(&mut rest, SharpnessOverride::Off);
+        assert!(!en);
+        assert_eq!(rest[8], 0);
+        assert_eq!(s, 0.0);
     }
 }
