@@ -373,6 +373,26 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Counts the precompiled pipelines made at device methods 0x1c8 and
+/// 0x218 (`slot`) against the calls whose description was read, and logs
+/// both slots' counts at the first calls and at powers of two.
+#[cfg(windows)]
+fn tally_precompiled(slot: usize, made: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let i = usize::from(slot == crate::precompiled::COMPUTE_SLOT);
+    if made {
+        MADE[i].fetch_add(1, Ordering::Relaxed);
+    }
+    let n = CALLS[i].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        let count = |i: usize| (MADE[i].load(Ordering::Relaxed), CALLS[i].load(Ordering::Relaxed));
+        let ((g, gn), (c, cn)) = (count(0), count(1));
+        tracing::info!("precompiled pipelines: graphics made {g} of {gn} calls, compute made {c} of {cn}");
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -428,6 +448,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                         "a pipeline of a creation method whose description is not known: shader containers found in it"
                     );
                 }
+                tally_precompiled(SLOT, made.is_some_and(|hr| hr >= 0));
                 if let Some(hr) = made {
                     return hr;
                 }
