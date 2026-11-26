@@ -2581,8 +2581,9 @@ struct TargetedSet {
 
 impl TargetedSet {
     const PAGE: usize = 4096;
-    const MAX_SPAN: usize = 64 * 1024;
-    const MAX_ENTRIES: usize = 128;
+    const MERGE_GAP: usize = 16 * 1024;
+    const MAX_SPAN: usize = 1024 * 1024;
+    const MAX_ENTRIES: usize = 1024;
     const STALE_FRAMES: u64 = 300;
 
     const fn new() -> Self {
@@ -2606,7 +2607,10 @@ impl TargetedSet {
         let mut merged: Vec<(usize, usize, u64)> = Vec::with_capacity(self.ranges.len());
         for (s, e, f) in self.ranges.drain(..) {
             match merged.last_mut() {
-                Some(last) if s <= last.1 && e.saturating_sub(last.0) <= Self::MAX_SPAN => {
+                Some(last)
+                    if s <= last.1.saturating_add(Self::MERGE_GAP)
+                        && e.saturating_sub(last.0) <= Self::MAX_SPAN =>
+                {
                     last.1 = last.1.max(e);
                     last.2 = last.2.max(f);
                 }
@@ -2653,10 +2657,12 @@ impl TargetedSet {
 
 static TARGETED: std::sync::Mutex<TargetedSet> = std::sync::Mutex::new(TargetedSet::new());
 static TARGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// `[targeted_settles, present_frame_waits, capped_skips]`.
+/// `[hot_flights_marked, present_waits_for_hot, present_waits_for_prev]`.
 static TARGETED_STATS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static LAST_PRESENT_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Highest flight number in the current frame that wrote a learned hot range.
+static HOT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn learn_targeted(from: usize, to: usize) {
     if !late_targeted() || to <= from {
@@ -2698,41 +2704,37 @@ fn writes_targeted(back: &[Declared], tex_back: &[(usize, usize)]) -> bool {
     false
 }
 
-/// Bounds targeted per-submission settles to at most 4 per frame so a hot
-/// shared buffer cannot regress into 28 stalls/frame.
-fn take_targeted_budget() -> bool {
-    const MAX_PER_FRAME: u64 = 4;
-    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let frame = crate::frame::current();
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        COUNT.store(0, Ordering::Relaxed);
-    }
-    if COUNT.fetch_add(1, Ordering::Relaxed) < MAX_PER_FRAME {
-        true
-    } else {
-        TARGETED_STATS[2].fetch_add(1, Ordering::Relaxed);
-        false
-    }
+/// Records `flight_number` as the latest flight in the current frame writing
+/// a learned hot buffer; all such flights are waited for together in ONE
+/// grouped wait at `present()` ([`settle_targeted_present`]).
+fn note_hot_flight(flight_number: u64) {
+    HOT_FLIGHT.fetch_max(flight_number, Ordering::Release);
+    TARGETED_STATS[0].fetch_add(1, Ordering::Relaxed);
 }
 
 /// With `VICTORY_LATE_WAIT_TARGETED=1` and `LATE_WAIT=3`: at each present,
-/// ensures all flights started before the *previous* present have landed so
-/// unobserved CPU culling/visibility reads see fresh GPU results while keeping
-/// the current frame's flights pipelined.
+/// waits ONCE for `max(prev_present_started, hot_flight)` so every submission
+/// of the current frame that wrote a learned hot buffer (plus any older flight
+/// from the previous frame) has landed before the CPU starts the next frame.
 pub(crate) fn settle_targeted_present() {
     if !late() || !late_free_present() || !late_targeted() {
         return;
     }
     let now = STARTED.load(Ordering::Acquire);
     let prev = LAST_PRESENT_STARTED.swap(now, Ordering::AcqRel);
-    if prev == 0 || FINISHED.load(Ordering::Acquire) >= prev {
+    let hot = HOT_FLIGHT.swap(0, Ordering::AcqRel);
+    let target = prev.max(hot);
+    if target == 0 || FINISHED.load(Ordering::Acquire) >= target {
         return;
     }
-    TARGETED_STATS[1].fetch_add(1, Ordering::Relaxed);
+    if hot >= prev && hot > 0 {
+        TARGETED_STATS[1].fetch_add(1, Ordering::Relaxed);
+    } else {
+        TARGETED_STATS[2].fetch_add(1, Ordering::Relaxed);
+    }
     if relay() {
         relay_wait(WHY_SYNC, |line| {
-            !line.settling && (FINISHED.load(Ordering::Acquire) >= prev || line.line.is_empty())
+            !line.settling && (FINISHED.load(Ordering::Acquire) >= target || line.line.is_empty())
         });
         land();
     } else {
@@ -4217,11 +4219,11 @@ fn late_line(frames: f64) {
             .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames)
             .collect();
         tracing::info!(
-            "targeted late waits per frame (VICTORY_LATE_WAIT_TARGETED=1): {:.1} hot-buffer settles ({:.1} capped), \
-             {:.1} present-frame bounds; {} learned ranges",
+            "targeted late waits per frame (VICTORY_LATE_WAIT_TARGETED=1): {:.1} hot flights batched into {:.1} present waits \
+             (+ {:.1} 1-frame bounds); {} learned ranges",
             t[0],
-            t[2],
             t[1],
+            t[2],
             TARGETED_LEN.load(Ordering::Relaxed),
         );
     }
@@ -5777,17 +5779,11 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
+        if hit_targeted {
+            note_hot_flight(flight_number);
+        }
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
-        } else if hit_targeted && take_targeted_budget() {
-            TARGETED_STATS[0].fetch_add(1, Ordering::Relaxed);
-            if relay() {
-                relay_wait(WHY_WRITES, |line| {
-                    FINISHED.load(Ordering::Acquire) >= flight_number && !line.settling
-                });
-            } else {
-                self.settle(&mut submitted, WHY_WRITES);
-            }
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
@@ -10141,9 +10137,9 @@ mod targeted_tests {
         assert!(!set.hits(0x10_0000, 0x10_0010, 400));
         assert!(set.hits(0x30_0000, 0x30_0010, 400));
 
-        for i in 0..200usize {
-            let base = 0x100_0000 + i * 0x2_0000;
-            set.learn(base, base + 16, 400 + i as u64);
+        for i in 0..1200usize {
+            let base = 0x1000_0000 + i * 0x20_0000;
+            set.learn(base, base + 16, 400 + (i as u64 % 200));
         }
         assert_eq!(set.len(), TargetedSet::MAX_ENTRIES);
     }
