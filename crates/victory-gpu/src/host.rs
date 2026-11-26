@@ -5706,6 +5706,9 @@ impl Host {
     }
 
     pub(crate) fn execute_sync(&self, runs: &[&HostList], sync: QueueSync) {
+        // Behind what the queues were given before it and have not run yet
+        // (`crate::queue::behind`).
+        crate::queue::before_sync();
         let _ = self.submit(runs, false, sync);
     }
 
@@ -5802,6 +5805,7 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList, sync: QueueSync) -> u64 {
+        crate::queue::before_sync();
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], true, sync) else {
             return 0;
