@@ -3834,9 +3834,11 @@ unsafe impl Send for FlatBuffers {}
 unsafe impl Sync for FlatBuffers {}
 
 /// `VICTORY_FLAT_RECT4=1`: see [`flat_record_fits`]. Off by default.
+/// Live (`crate::live`): each record looked at reads it, as
+/// `VICTORY_FLAT_INSTANCES`.
 fn flat_rect4() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FLAT_RECT4").is_some_and(|v| v == "1"))
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FLAT_RECT4", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
 }
 
 /// Whether the indexed record at `arguments` (title memory, not written on
