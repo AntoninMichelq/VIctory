@@ -29,26 +29,16 @@ use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
-/// Live per-frame cache for `VICTORY_SCOPED_UAV` and `VICTORY_INDIRECT_COMPACT`
-/// (avoids `GetEnvironmentVariableW` per draw while staying toggleable live).
-static LIVE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-static LIVE_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
+/// `VICTORY_SCOPED_UAV` (bit 1) and `VICTORY_INDIRECT_COMPACT` (bit 2),
+/// read live (`crate::live`, the `VICTORY_LIVE` file or the environment):
+/// each barrier and each indirect call reads them, and either way each is
+/// correct on its own (a scoped barrier or the global one; a compacted
+/// call or the plain one).
 fn live_flags() -> u8 {
-    let frame = crate::frame::current();
-    if LIVE_FRAME.load(Ordering::Relaxed) != frame {
-        let mut flags = 0u8;
-        if std::env::var_os("VICTORY_SCOPED_UAV").is_some_and(|v| v == "1") {
-            flags |= 1;
-        }
-        if std::env::var_os("VICTORY_INDIRECT_COMPACT").is_some_and(|v| v == "1") {
-            flags |= 2;
-        }
-        LIVE_FLAGS.store(flags, Ordering::Relaxed);
-        LIVE_FRAME.store(frame, Ordering::Relaxed);
-        return flags;
-    }
-    LIVE_FLAGS.load(Ordering::Relaxed)
+    static SCOPED: crate::live::Switch = crate::live::Switch::new();
+    static COMPACT: crate::live::Switch = crate::live::Switch::new();
+    let on = |v: Option<&str>, _| u64::from(v.is_some_and(|v| v.trim() == "1"));
+    (SCOPED.get("VICTORY_SCOPED_UAV", on) | COMPACT.get("VICTORY_INDIRECT_COMPACT", on) << 1) as u8
 }
 
 /// `VICTORY_SCOPED_UAV=1` (PR #2168 `0f616aea`): replace global NULL-resource
