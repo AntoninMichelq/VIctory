@@ -4240,7 +4240,8 @@ fn vrs_refresh() {
     if VRS_FRAME.load(Ordering::Relaxed) == frame {
         return;
     }
-    let raw = std::env::var("VICTORY_VRS").unwrap_or_default();
+    // Through `crate::live`: a VICTORY_LIVE file change applies (read once a frame).
+    let raw = crate::live::var("VICTORY_VRS").unwrap_or_default();
     let cfg = parse_vrs(&raw);
     let rate = cfg.rate;
     *VRS_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
