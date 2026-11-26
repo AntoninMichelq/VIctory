@@ -22,6 +22,8 @@ mod capture;
 pub mod tour_hooks;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

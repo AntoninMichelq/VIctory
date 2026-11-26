@@ -793,10 +793,44 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Retail PresentX adds source-rectangle and destination pointers, a color
+/// space and seven option words after the common prefix (72-byte stride,
+/// cool-fox `1ad6e67`). Fixes Series S two-plane black screen where the UI is
+/// on plane 1.
+#[cfg(windows)]
+#[repr(C)]
+struct RetailPlane {
+    prefix: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<RetailPlane>() == 72);
+
+#[cfg(windows)]
+fn overlay_resource(parameters: *const Plane) -> Option<This> {
+    let second = parameters.cast::<RetailPlane>().wrapping_add(1).cast::<u8>();
+    let mut prefix = [0; size_of::<Plane>()];
+    if !crate::host::read_into(second, &mut prefix) {
+        return None;
+    }
+    // SAFETY: the prefix has the C layout above and its bytes were copied.
+    let plane = unsafe { prefix.as_ptr().cast::<Plane>().read_unaligned() };
+    let mut pointer = [0; size_of::<This>()];
+    if plane.count == 0
+        || plane.resources.is_null()
+        || !crate::host::read_into(plane.resources.cast(), &mut pointer)
+    {
+        return None;
+    }
+    let resource = usize::from_ne_bytes(pointer) as This;
+    crate::resource::is_resource(resource).then_some(resource)
+}
+
+/// Shows the first plane's first resource in our window, compositing the
+/// second plane (interface over scene, Series S) when present.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -873,12 +907,34 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let wait_compute = crate::resource::host_copy(resource)
+        let mut wait_compute = crate::resource::host_copy(resource)
             .map_or(0, |c| c.last_compute.load(Ordering::Relaxed));
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame, wait_compute);
+        let overlay = (planes > 1)
+            .then(|| overlay_resource(plane_parameters))
+            .flatten()
+            .filter(|&over_res| over_res != resource)
+            .and_then(|over_res| {
+                let over_tex = crate::resource::host_resource(over_res)?;
+                let over_wait = crate::resource::host_copy(over_res)
+                    .map_or(0, |c| c.last_compute.load(Ordering::Relaxed));
+                wait_compute = wait_compute.max(over_wait);
+                let over_state = crate::resource::host_transition(over_res, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                Some((over_res, over_tex, over_state))
+            });
+        let shown = host.present_planes(
+            texture,
+            state,
+            overlay.map(|(_, tex, st)| (tex, st)),
+            frame,
+            wait_compute,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some((over_res, _, over_state)) = overlay {
+            crate::resource::host_transition(over_res, over_state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
