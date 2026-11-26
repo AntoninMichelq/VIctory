@@ -54,9 +54,17 @@ pub(crate) enum P {
     DrawPrepare,
     /// The pass over textures picked by index (`State::heap_textures`).
     HeapTextures,
+    /// Waits for the write-watch journal's lock (`crate::watch::writes`),
+    /// summed over the threads that refresh.
+    JournalWait,
+    /// `crate::watch::writes` whole (lock wait included), summed over the
+    /// threads.
+    JournalWrites,
+    /// `Step::Refresh` (and any other step): queued for the batch flush.
+    RefreshQueued,
 }
 
-const N: usize = 17;
+const N: usize = 20;
 const NAMES: [&str; N] = [
     "write-watch asking + flight checks",
     "async compute bookkeeping",
@@ -75,6 +83,9 @@ const NAMES: [&str; N] = [
     "whole preparing",
     "draw preparation (title threads, summed)",
     "textures picked by index pass (title threads, summed)",
+    "write-watch journal lock waits (threads, summed)",
+    "write-watch journal answers (threads, summed)",
+    "refresh steps queued (for the flush)",
 ];
 
 static US: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -154,6 +165,6 @@ mod tests {
 
     #[test]
     fn names_cover_every_piece() {
-        assert_eq!(NAMES.len(), P::HeapTextures as usize + 1);
+        assert_eq!(NAMES.len(), P::RefreshQueued as usize + 1);
     }
 }

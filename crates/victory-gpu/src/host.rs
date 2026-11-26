@@ -7058,8 +7058,8 @@ impl HostList {
                 Step::Host(_) => crate::prepstats::P::HostRuns,
                 Step::GpuWrite(..) => crate::prepstats::P::GpuWrites,
                 Step::Texture(_) => crate::prepstats::P::Textures,
-                // (Queued for the flush: its time is the flush's.)
-                _ => crate::prepstats::P::BatchFlush,
+                // (Queued for the flush, which does the work.)
+                _ => crate::prepstats::P::RefreshQueued,
             });
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
