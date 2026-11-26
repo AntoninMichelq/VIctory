@@ -2696,7 +2696,7 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
                     if !copied && let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
-                    if !shadow.writes_pending() && touches(&flights, from, to) {
+                    if !alias_parts(shadow, from, to, &flights).is_empty() {
                         alias_note(true, shadow.span(), (from, to), None);
                         settle = true;
                     }
@@ -3035,21 +3035,280 @@ pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
         settle_now(WHY_FENCE);
         return;
     }
-    relay_wait(WHY_FENCE, |line| reached() || (line.line.is_empty() && !line.settling));
+    // The value set, and the landing that set it over (the signal is set
+    // before the landing's last steps and its line rebuilt: review 4, 4.1).
+    relay_wait(WHY_FENCE, |line| !line.settling && (reached() || line.line.is_empty()));
 }
 
 /// Before a submission, with [`settle_partial`]: waits until the flights up
 /// to submission `until` have landed (all of them if `u64::MAX`), and only
 /// for that, unless the copies the flights alias were written (`aliased`,
 /// then all of them as before).
-fn settle_stale(host: &Host, submitted: &mut u64, until: u64, aliased: bool) {
-    if aliased || until == u64::MAX {
+fn settle_stale(
+    host: &Host,
+    submitted: &mut u64,
+    runs: &[&HostList],
+    until: Option<u64>,
+    aliased: bool,
+) -> Vec<Vec<CrossCopy>> {
+    // A full settle lands everything: nothing is aliased under flights
+    // after it, and no copy is planned (review 6, 2.3: copies planned before
+    // a wait carried older bytes over the newer ones the refresh then took).
+    let full_alias_wait = aliased && !alias_on_card() && !alias_partial();
+    if full_alias_wait || until == Some(u64::MAX) {
         host.settle(submitted, WHY_STALE);
-        return;
+        return Vec::new();
     }
-    crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
-    crate::timeline::mark("partial-until", until);
-    relay_wait(WHY_STALE, |_| FINISHED.load(Ordering::Acquire) >= until);
+    // Stale memory first: until the flights up to `until` have landed, and
+    // the landing that took them is over (`FINISHED` is set before its line
+    // is rebuilt); then the submission's refreshes are looked at again: a
+    // span merged before one that could not be may be under a flight that
+    // landed since, and spans not looked at yet are now (review 4, 2.1-2.2).
+    let mut until = until;
+    let mut rounds = 0;
+    while let Some(u) = until {
+        if u == u64::MAX || rounds == 8 {
+            host.settle(submitted, WHY_STALE);
+            return Vec::new();
+        }
+        crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
+        crate::timeline::mark("partial-until", u);
+        relay_wait(WHY_STALE, |line| FINISHED.load(Ordering::Acquire) >= u && !line.settling);
+        until = stale_under_flights_until(runs);
+        rounds += 1;
+    }
+    if !aliased || alias_ranges(runs).is_empty() {
+        return Vec::new();
+    }
+    // Then aliased refreshes, as the flights still in the air are now: taken
+    // from their writer copies on the card, behind them on the queue,
+    // instead of a wait ([`alias_on_card`]) where that can be shown right.
+    if alias_on_card() {
+        if let Some(planned) = plan_alias_copies(host, runs) {
+            crate::copytop::settle_cause(crate::copytop::S_ALIAS_CARD);
+            crate::timeline::mark("alias-on-card", planned.iter().map(|c| c.len() as u64).sum());
+            return planned;
+        }
+        crate::timeline::mark("alias-on-card-refused", 0);
+        if !alias_partial() {
+            host.settle(submitted, WHY_STALE);
+            return Vec::new();
+        }
+    }
+    // Until no flight in the air writes what the refreshes of other copies
+    // of the same title memory read ([`aliased_under_flights`]), and no
+    // landing is under way (its line is rebuilt at its end).
+    let ranges = alias_ranges(runs);
+    crate::copytop::settle_cause(crate::copytop::S_ALIAS_PARTIAL);
+    crate::timeline::mark("alias-partial", ranges.len() as u64);
+    relay_wait(WHY_STALE, |line| {
+        !line.settling && ranges.iter().all(|&(from, to)| !touches(&line.written, from, to))
+    });
+    Vec::new()
+}
+
+/// `VICTORY_ALIAS_STRICT=1` (off by default; on with `VICTORY_ALIAS_PARTIAL`
+/// or `VICTORY_ALIAS_ON_CARD`): a refresh counts as aliased under flights by
+/// its parts outside the ranges its own copy's shaders write, not only if
+/// its copy has no shader writes at all (review 4, 3.1: a copy written by
+/// flights in one range, refreshed in another that a flight writes
+/// through another copy, read the older bytes there).
+fn alias_strict() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_ALIAS_STRICT", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+        || alias_partial()
+        || alias_on_card()
+}
+
+/// The parts of `[from, to)` of `shadow`'s copy that flights write through
+/// other copies (`flights`: what flights' shaders may write), outside the
+/// ranges `shadow`'s own shaders write: with [`alias_strict`]; without it,
+/// all of `[from, to)` if the copy has no shader writes and flights touch
+/// it, else nothing (as before).
+fn alias_parts(shadow: &crate::shadow::Shadow, from: usize, to: usize, flights: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if from >= to || !touches(flights, from, to) {
+        return Vec::new();
+    }
+    if !alias_strict() {
+        return if shadow.writes_pending() { Vec::new() } else { vec![(from, to)] };
+    }
+    let mut parts = vec![(from, to)];
+    for (a, e) in shadow.pending_ranges() {
+        parts = parts
+            .into_iter()
+            .flat_map(|(f, t)| {
+                if e <= f || a >= t {
+                    return vec![(f, t)];
+                }
+                let mut rest = Vec::with_capacity(2);
+                if f < a {
+                    rest.push((f, a));
+                }
+                if e < t {
+                    rest.push((e, t));
+                }
+                rest
+            })
+            .collect();
+    }
+    parts.retain(|&(f, t)| touches(flights, f, t));
+    parts
+}
+
+/// `VICTORY_ALIAS_ON_CARD=1` (off by default; with the relay; read live):
+/// a submission that refreshes a host copy from title memory that flights
+/// in the air write through another copy ([`aliased_under_flights`]) does
+/// not wait for them: its lists' preludes copy those ranges from the
+/// writers' copies to the reader's on the card ([`plan_alias_copies`]),
+/// behind the flights on the same queue, so the reader gets the flights'
+/// bytes before its shaders read it, as it would have from title memory
+/// after their copy-back. Where that cannot be shown to hold, it waits as
+/// before.
+fn alias_on_card() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_ALIAS_ON_CARD", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// For [`alias_on_card`]: per list of `runs`, the copies (reader, writer,
+/// from, to) that give the reader's aliased refreshes the bytes flights in
+/// the air write there, newest flight last; `None` (wait as before) unless
+/// every one can be: the reader is a plain copy (PC memory, not placed);
+/// neither the submission nor the writing flights use the compute queue
+/// (the copy must be behind them on one queue); and every page of the
+/// writer's copy in the range is current with title memory (as the
+/// submission's write-watch asking says; the title's later bytes there were
+/// put in beside the writes, `merge_under_writes`, and go to a card side
+/// before these lists), so outside what the flights' shaders write the
+/// writer's bytes are title memory's.
+fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCopy>>> {
+    use std::sync::Arc;
+    if host.compute_queue.is_some() && runs.iter().any(|l| l.is_compute()) {
+        return None;
+    }
+    // Copies this submission's own shaders write: their snapshots are taken
+    // on the CPU before the prelude's copy would run (review 6, 2.4).
+    let mut own: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, ..) = step {
+                own.insert(Arc::as_ptr(shadow) as usize);
+            }
+        }
+    }
+    let (written, flights) = {
+        let line = line();
+        // A landing under way has taken its flights off the line before
+        // their bytes are in title memory: they would be missed (review 6,
+        // 2.1).
+        if line.settling {
+            return None;
+        }
+        let flights: Vec<(bool, Vec<Declared>)> = line
+            .line
+            .iter()
+            .filter_map(|item| match item {
+                Late::Run(f) => Some((f.on_compute, f.back.clone())),
+                _ => None,
+            })
+            .collect();
+        (line.written.clone(), flights)
+    };
+    let mut out: Vec<Vec<CrossCopy>> = Vec::with_capacity(runs.len());
+    for list in runs {
+        let mut copies: Vec<CrossCopy> = Vec::new();
+        for step in &list.deferred().copies {
+            let Step::Refresh(reader, address, len) = step else {
+                continue;
+            };
+            let (rs, rl) = reader.span();
+            let (from, to) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
+            // As `aliased_under_flights` picks them (strict: parts outside
+            // the reader's own shader writes).
+            let parts = alias_parts(reader, from, to, &written);
+            if parts.is_empty() {
+                continue;
+            }
+            if !reader.plain() || own.contains(&(Arc::as_ptr(reader) as usize)) {
+                return None;
+            }
+            let planned_from = copies.len();
+            for (on_compute, back) in &flights {
+                for (writer, ranges) in back {
+                    if Arc::ptr_eq(writer, reader) {
+                        continue;
+                    }
+                    let (ws, wl) = writer.span();
+                    for &(a, b) in ranges {
+                        for &(pf, pt) in &parts {
+                            let (lo, hi) = (a.max(pf).max(ws as usize), b.min(pt).min((ws + wl) as usize));
+                            if lo >= hi {
+                                continue;
+                            }
+                            if *on_compute {
+                                return None;
+                            }
+                            // Every page of the writer's copy there current.
+                            if writer.current_parts(lo, hi)? != [(lo, hi)] {
+                                return None;
+                            }
+                            copies.push((reader.clone(), writer.clone(), lo, hi));
+                        }
+                    }
+                }
+            }
+            // Every part a flight writes must have a copy (else a flight
+            // the line does not list writes it).
+            let mut covered: Vec<(usize, usize)> = copies[planned_from..].iter().map(|c| (c.2, c.3)).collect();
+            covered.sort_unstable();
+            let mut joined: Vec<(usize, usize)> = Vec::new();
+            for (a, b) in covered {
+                match joined.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => joined.push((a, b)),
+                }
+            }
+            for &(pf, pt) in &parts {
+                for &(wa, wb) in &written {
+                    let (lo, hi) = (wa.max(pf), wb.min(pt));
+                    if lo < hi && !joined.iter().any(|&(a, b)| a <= lo && hi <= b) {
+                        return None;
+                    }
+                }
+            }
+        }
+        out.push(copies);
+    }
+    Some(out)
+}
+
+/// `VICTORY_ALIAS_PARTIAL=1` (off by default; with the relay; read live):
+/// when a submission refreshes a host copy from title memory that flights'
+/// shaders write through another copy of it ([`aliased_under_flights`]), it
+/// waits until no flight in the air writes those ranges (the flights land
+/// in order, and what is still in the air is known after each landing), not
+/// until every flight has landed. The timeline of run cumul6 (2026-11-26
+/// 03:16): every stale settle was this case, two a frame, ~40 ms each at
+/// the start of a frame, waiting for the whole previous frame and its
+/// copy-back while the card had nothing new; `VICTORY_SETTLE_PARTIAL` never
+/// applied to it.
+fn alias_partial() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_ALIAS_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// The ranges [`aliased_under_flights`] settles for: refreshes of copies no
+/// flight writes, of title memory a flight writes through another copy.
+fn alias_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let flights = line().written.clone();
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step {
+                out.extend(alias_parts(shadow, *address, *address + *len, &flights));
+            }
+        }
+    }
+    out
 }
 
 /// Counts which of the two checks before a submission settles flights
@@ -5348,6 +5607,9 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         let asking = crate::prepstats::start();
+        // With `VICTORY_ALIAS_ON_CARD`: copies on the card standing for a
+        // wait for flights ([`plan_alias_copies`]).
+        let mut alias_extra: Vec<Vec<CrossCopy>> = Vec::new();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -5400,7 +5662,7 @@ impl Host {
             crate::copytop::time(crate::copytop::T_CHECKS, checking);
             if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
-                settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
+                alias_extra = settle_stale(self, &mut submitted, runs, until, aliased);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             } else if !behind {
@@ -5411,7 +5673,7 @@ impl Host {
             && settle_cause(until.is_some(), aliased)
         {
             let settling = std::time::Instant::now();
-            settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
+            alias_extra = settle_stale(self, &mut submitted, runs, until, aliased);
             settled += settling.elapsed();
         } else if !behind {
             aliased_under_flights(runs, false);
@@ -5503,6 +5765,19 @@ impl Host {
         let crossing = crate::prepstats::start();
         let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
         crate::prepstats::done(crate::prepstats::P::CrossCopies, crossing);
+        // Copies from flights' writer copies on the card instead of a wait
+        // (`VICTORY_ALIAS_ON_CARD`): after the lists' own cross copies.
+        // All in the first list's prelude, before any list of the submission
+        // runs and before its own lists' cross copies (review 6, 2.2: older
+        // flights' bytes after them overwrote this submission's newer ones),
+        // with the buffers as the earlier submissions left them.
+        let extra: Vec<CrossCopy> = alias_extra.into_iter().flatten().collect();
+        if !extra.is_empty() && !runs.is_empty() {
+            crossed.resize_with(runs.len(), Vec::new);
+            let first = std::mem::take(&mut crossed[0]);
+            crossed[0] = extra;
+            crossed[0].extend(first);
+        }
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
