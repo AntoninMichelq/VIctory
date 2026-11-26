@@ -88,6 +88,17 @@ pub(crate) fn card_refused(cause: usize, bytes: u64) {
     }
 }
 
+/// Microseconds spent merging what shaders wrote into title memory (the
+/// CPU's part of "copying back": compare, read, merge, write), all threads.
+static MERGE_US: AtomicU64 = AtomicU64::new(0);
+
+/// A merge begun at `started` (with the counts on) has ended.
+pub(crate) fn merged(started: Option<std::time::Instant>) {
+    if let Some(t) = started {
+        MERGE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Frames since the last table.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -124,7 +135,7 @@ pub(crate) fn line() {
     let [not_ready, cap, full, host] = [0, 1, 2, 3].map(refused);
     tracing::info!(
         "copy stats per frame (VICTORY_COPY_STATS=1), {} copies moved bytes: up {:.1} MB, sent to the card {:.1} MB, \
-         declared shader writes {:.1} MB, snapshotted {:.1} MB, back {:.1} MB, not sent as unchanged {:.1} MB; big buffers refused a card copy since the \
+         declared shader writes {:.1} MB, snapshotted {:.1} MB, back {:.1} MB ({:.1} ms merging on the CPU), not sent as unchanged {:.1} MB; big buffers refused a card copy since the \
          last line: card not ready {} ({} MB), at VICTORY_CARD_BUFFERS_MB {} ({} MB), card past 80% of its budget {} ({} MB), \
          host refused {} ({} MB); the top {}:",
         all.len(),
@@ -133,6 +144,7 @@ pub(crate) fn line() {
         mb(sums[DECLARED]),
         mb(sums[SNAP]),
         mb(sums[BACK]),
+        MERGE_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
         mb(sums[SAVED]),
         not_ready.0,
         not_ready.1,
