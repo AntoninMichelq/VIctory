@@ -6864,6 +6864,17 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && aliased.is_empty() {
             return None;
         }
+        // The copies' buffers are held until this list is reset (after its
+        // submission has run): a copy dropped meanwhile lets its buffer go
+        // at once (`Drop for Shadow` retires nothing), and a flight's writer
+        // copy (`VICTORY_ALIAS_ON_CARD`) is held by no list of this
+        // submission: once the flight landed, the sweep could let it go
+        // while the copy from it had still to run on the card (the device
+        // was removed a minute into run timeline3, 2026-11-26 06:04).
+        for (reader, writer, ..) in &aliased {
+            self.keep(&reader.buffer);
+            self.keep(&writer.buffer);
+        }
         let Some((allocator, list)) = self
             .prelude
             .get_or_init(|| host().and_then(|h| h.make_prelude_of(self.compute)))
