@@ -22,44 +22,99 @@ developer or publisher.
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Results on an AMD Radeon RX 7600 (this fork's `main`, 2026-11-25)
+## En bref (English summary)
 
-Measured on one PC: Windows, AMD Radeon RX 7600 (8 GB), 32 GB RAM, Series X
-profile, in the prison at the start of the game.
+This fork targets **one modest AMD PC: Radeon RX 7600 8 GB, 32 GB of RAM**. On top of
+upstream VIctory and the fxceless line it adds: a fix for walls and ceilings that were not
+drawn (the title read back GPU culling results before they were handed back to it), a
+lifetime fix for host copies freed while a submission still used them (device removals),
+precompiled pipelines read from the title's shader pack (ported from Felix2180), an
+offline pre-warm of every shader of the game, CPU-side savings and memory guards ported
+from cool-fox-codec, faster shader math for small GPUs (`VICTORY_LEAN_MATH`) and host FSR
+upscaling with sharpening. Measured results are in the table below. Everything is opt-in
+through `VICTORY_*` environment switches; the recommended set is listed further down.
 
-| | Result |
-|---|---|
-| Frame rate in the world | about 6.2-6.4 fps, with the game's AMD FSR upscaling from 1080p to 4K |
-| Memory | about 21 GB of RAM, steady over a 10-minute run |
-| Loading | about one minute to reach the world once shaders are cached; the very first run spends a long time preparing shaders (white screen) |
-| Stability | no driver crash or device loss in a 10-minute test run |
-| Picture | lit prison: buildings, cells, characters with hair and skin, sky; the stray triangle lines, the purple fog and the black skin are fixed |
+## Ce que ce fork apporte (AMD 8 Go)
 
-Settings used: `VICTORY_FFX_SCALE=0.5` (FSR), `VICTORY_TEXTURE_HALF=2`,
-`VICTORY_STAGING_POOL_MB=1024`, `VICTORY_VRAM_HYSTERESIS=85,75`, `VICTORY_AMBIENT=off`.
+Ce fork vise **un PC AMD modeste : Radeon RX 7600 8 Go, 32 Go de RAM**. Il part de VIctory et de la
+ligne fxceless, puis ajoute :
 
-Known issues: textures can arrive late and walls stay flat-coloured for a moment, and
-some objects stream in late. On top of the upstream fork, this branch adds
-fixes for GPU hangs on AMD, mesh triangle assembly, out-of-bounds shader
-views, DirectStorage page copies, memory use and frame pacing.
+- **Murs et plafonds qui manquaient** : le jeu relit des résultats calculés par la carte (culling,
+  visibilité) en boucle, sans attendre de fence. Nos soumissions envoyées en avance les lui rendaient
+  trop tard : des pièces entières étaient jugées cachées et pas dessinées. Une soumission qui écrit ces
+  valeurs de fin de pipe est maintenant réglée tout de suite (`VICTORY_LATE_WAIT_WRITES=0`).
+- **Pipelines précompilées** du jeu (méthodes du device `0x1c8` et `0x218`) lues dans son pack de shaders
+  (`VICTORY_SHADER_PACK`) : le jeu s'en passait en silence. Portage du travail de Felix2180.
+- **Correctif de durée de vie** : une copie hôte libérée par un nettoyage alors qu'une soumission pas encore
+  partie l'utilisait encore faisait perdre la carte (page fault). La libération attend désormais
+  16 soumissions de plus (`VICTORY_RETIRE_AHEAD`, `0` = comme avant).
+- **Pré-chauffe hors jeu de tous les shaders** du jeu (`victory prewarm --all-shaders`, ~26 000 conteneurs)
+  et de toutes les recettes de pipelines connues : moins de saccades en arrivant dans une zone nouvelle.
+- **Gains CPU et garde-fous mémoire de cool-fox-codec**, réécrits sur notre arbre : rendus de cibles non
+  répétés, constantes non alignées copiées une fois, déclarations dédupliquées, et `VICTORY_MEM_GUARD`
+  (attente après un refus de mémoire, garde sur le commit Windows, plafond du staging sous 32 Go).
+- **Eau et missions suivantes** : recopie vers la mémoire du jeu des textures d'eau écrites par la carte
+  (`VICTORY_TEXTURE_BACK`, les bateaux ne coulent plus).
+- **Petite carte** : maths des shaders allégées (`VICTORY_LEAN_MATH`, −8 à −18 ms sur la RX 7600),
+  textures en demi-résolution, éviction et hystérésis VRAM pour 8 Go, **FSR hôte** (`VICTORY_FFX_SCALE`,
+  netteté RCAS `VICTORY_FFX_SHARPNESS`, biais de mip `VICTORY_MIP_BIAS`).
+- **Préparation CPU** : copies, recopies et rafraîchissements regroupés ou parallélisés (relais, recopie par
+  blocs, journal d'écriture partagé), pour qu'image après image le CPU attende moins la carte.
 
-## Status of this fork (2026-11-25)
+## Performances mesurées (2026-11-26)
 
-Upstream fork's notes, measured on another machine: Windows 11, Intel
-i7-14700KF, NVIDIA RTX 4070 12 GB, 32 GB RAM. **2.5 to 4 frames per second,
-and shadowed areas are black.** The Series X profile is used throughout.
+PC de test : Windows 11, **AMD Radeon RX 7600 8 Go**, 32 Go de RAM, profil Series X, dans la prison au
+début du jeu (promenade WASD), images par seconde moyennes sur la durée indiquée.
 
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+| Version | Réglages | img/s | ms/image | Carte | Remarques |
+|---|---|---|---|---|---|
+| Peau3 (25/11) | FSR 0,5 | 6,2-6,4 | ~160 | ~70 ms | ancien Jouer |
+| cumul9b (Jouer du 26/11) | FSR 0,42 + netteté, `JOURNAL_SHARED=2` | **8,87** | 112,8 | ~51 ms | 15 min sans plantage ; murs parfois absents |
+| cumul11e | + pack de shaders (murs) | 7,51 | – | – | 7 min sans plantage |
+| cumul12 + E1 | + `LATE_WAIT_WRITES=0` | 5,5 / 6,6 | – | ~90 ms | murs présents : beaucoup plus de décor dessiné |
+| **cumul14** | E1 + gains cool-fox + `MEM_GUARD` | _à compléter_ | _à compléter_ | _à compléter_ | _3 essais en cours_ |
 
-### What this fork changed (summary)
+Mémoire : ~21 Go de RAM pour le Jouer. Le premier lancement d'un nouvel exe refait le cache du pilote AMD
+(plus long) ; avec un cache pré-chauffé, l'arrivée dans le monde prend environ une minute.
+
+## Réglages recommandés (lanceur « tout regroupé »)
+
+Base du lanceur du Bureau, plus :
+
+```bat
+set VICTORY_LATE_WAIT=3
+set VICTORY_RELAY=2
+set VICTORY_LATE_WAIT_WRITES=0
+set VICTORY_SHADER_PACK=<dossier du jeu>\shaders.rpf
+set VICTORY_MEM_GUARD=1
+set VICTORY_MIP_BIAS_SCOPE=aniso
+set VICTORY_LEAN_MATH=247
+set VICTORY_FFX_SCALE=0.42
+set VICTORY_TEXTURE_HALF=2
+set VICTORY_VRAM_HYSTERESIS=85,75
+```
+
+À ne pas utiliser pour l'instant : `VICTORY_LATE_WAIT=2` (blocages de la carte), `VICTORY_ALIAS_AFTER_UPLOAD=1`
+(pertes de la carte), `VICTORY_ALIAS_ON_CARD=1` (non validé), `VICTORY_PLANE_PASS=written` (murs absents),
+`VICTORY_INDIRECT_WIDE=1` (au-delà de la limite D3D12, non essayé).
+
+## Problèmes connus
+
+- Tout ce qui est dans l'ombre reste noir : l'éclairage par rayons du jeu ne tourne pas encore.
+- Reflets « chrome » sur certains vêtements clairs (cause à l'étude : matériau ou réflexions).
+- Les pertes de la carte sont devenues rares, mais un plantage intermittent reste possible lors de longues sessions.
+- Avec tous les murs dessinés, la carte travaille plus (~90 ms) : la vitesse dépend surtout d'elle sur une RX 7600.
+
+## Crédits supplémentaires
+
+- **fxceless/victory-fork** : la ligne dont ce fork part (attentes tardives, relais, copies sur la carte) et les correctifs
+  plafond des vues de constantes, lookup cache, recopie de textures écrites par la carte.
+- **Felix2180/VIctory** : lecture des pipelines précompilées (`0x1c8`/`0x218`), tests de rayons « structures vides ».
+- **ComputerScape04/cool-fox-codec** (codec_d, avatarmanz) : idées des gains CPU, des garde-fous mémoire et de `TEXTURE_BACK`
+  (Geckomacabre via fxceless), réécrites ici.
+- **Belobug**, **myokex/victory-amd** : premiers travaux AMD (éclairage ambiant de secours, garde des vues).
+
+## Historique : les premiers correctifs du fork (2026-11-25)
 
 Rendering:
 - Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
@@ -85,14 +140,6 @@ Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
-
-### Known problems
-
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.

@@ -1,8 +1,8 @@
-# VIctory on an RX 7600 — project handoff (2026-11-25)
+# VIctory on an RX 7600 — project handoff (2026-11-26)
 
 ## Résumé en français (pour 4nto)
 
-- **Ce qui marche aujourd'hui** : le raccourci du Bureau « Jouer VIctory (tout cumulé).bat » lance **Peau3** (commit `b74ac64`, branche `jouer/peau3`). La prison est éclairée, avec bâtiments, personnages, peau et cheveux. Environ **6,2 à 6,5 images/s**, environ 21 Go de RAM, sur la RX 7600 avec FSR (rendu 1080p).
+- **Ce qui marche aujourd'hui** : le Jouer du Bureau lance **cumul9b** (8,9 img/s, mais murs parfois absents). Le candidat **cumul14** (`jouer/cumul14` `53ca6f2`) dessine les murs et plafonds, avec les gains CPU de cool-fox et un cache pré-chauffé de tous les shaders ; il est en test (sections 4 et 7).
 - **Le gros défaut qui reste** : des reflets « chrome » ou des taches noires au hasard sur les habits et la peau. Cause trouvée : quand la carte graphique (8 Go) est pleine, des textures attendent ou sont retirées, et le jeu lisait des zéros à leur place. Premier correctif essayé le 25/11 au soir (branche `fix/wait-grey`, `89e0bb6`) : la chemise redevient mate, mais il reste des affiches noires, des visages noirs et du chrome. Il n'est donc pas dans Jouer. La vraie solution : retirer beaucoup moins de textures (voir section 8).
 - **Pour aller plus vite** : l'« essai groupé » (`essai/groupe`) passe de ~6,4 à ~7 images/s, mais il donne une tête flottante et des taches argentées. Il n'est donc pas encore dans Jouer.
 - **Règles à garder** : un seul jeu lancé à la fois. Ne jamais fermer le jeu de force pendant que tu joues. Toujours garder un « Jouer precedent ». Ne jamais publier de fichiers du jeu.
@@ -70,29 +70,25 @@ The user speaks **French**, is not very technical: answer in simple French, step
 - "Missing" objects: wait for full stream-in before calling an object missing.
 - Offline translation check of the whole title shader set: `victory translate --pipelines` over `_work\prison\shaders\*.bin` (19,105 dumps; private, never publish).
 
-## 4. Current Jouer = cumul9b (promoted 2026-11-26 06:54)
+## 4. Current Jouer = cumul14 (candidate, 2026-11-26 afternoon — promotion pending the orchestrator's 3 runs)
 
-- Exe `_work\victory-play-cumul9b.exe` built from **`jouer/cumul9b` = `7479227`** = `jouer/cumul9` cf5a068 + prep4 (`perf/prep3` 6842074,
-  `JOURNAL_SHARED=2` with review-4 fixes, review 8: safe). Line of integrations: cumul (groupe-fix, overhead, loading-full, depth-bounds,
-  uploads, evict-less) → cumul2 (copies, FSR dynamic) → cumul3 (live switches, async compute, hot shaders, dropped-draw report, prewarm)
-  → cumul4 (plan-reuse, copies3, cpu-frame, loading-full streak, missing-walls diag) → cumul5 (copies4, levels) → cumul6 (copies5, quality, levels2)
-  → cumul7 (loading/PHYS_INDEX, ports1/CODE_TABLE_AFTER, lower-size, copies6 fixed, prep2) → cumul8 (ports2, prep3, fsrdyn2, texuploads)
-  → cumul9 (timeline3 with ALIAS_ON_CARD **off**, fsrsharp) → cumul9b (prep4). Every fiche: `_work\essais\cumulN.md`.
-- **Cache `C:\Users\4nto\victory-cache\cumul7`** (translator changed in cumul7: ports1 adds `CODE_TABLE_AFTER` to the cache key).
-- Measured (T41, 15 min): **8.87 img/s, 112.8 ms/frame, card ~51 ms**, no crash; quality stats: 0 texture reads null / partial / waiting.
-  A/B live: `JOURNAL_SHARED=2` −5.5 to −5.9 ms, `INDIRECT_COMPACT` neutral. (Peau3 was 6.15–6.5 fps, card ~70 ms.)
-- Fallback: `_work\Jouer precedent.bat` = **Peau3** (`b74ac64`, `victory-play-peau3.exe`, cache tout3q2); Peau2 kept as `_work\Jouer precedent (peau2).bat`.
-- Candidate not promoted: cumul9c (`jouer/cumul9c` ceb0abc = 9b + review-7 fix of ALIAS_ON_CARD, launcher `_work\Jouer candidat cumul9c (temporaire).bat`) —
-  **suspended**: timeline3 (ALIAS_ON_CARD) removed the device ~60 s into the world. Procedure for a promotion: `_work\essais\promotion.md`.
-- Next integration built, not promoted: cumul10 (`jouer/cumul10` f1fbbb5 = cumul9c + volum + walls9, new cache `cumul10`, pre-warmed offline;
-  ALIAS_ON_CARD=0 there).
-
-Jouer env (exact, from the Desktop shortcut; `CARD_BUFFERS_MB` is set twice, the second, 1024, wins):
+- Exe `_work\victory-play-cumul14.exe` built from **`jouer/cumul14` = `53ca6f2`** = `jouer/cumul12` `e900630` + `perf/cpu-petits` `40f5ae6`
+  + `fix/plus-loin` `739a5b6`. **No ASYNC_SUBMIT** (that is `jouer/cumul13` `231d68c`, measured separately).
+- Line of integrations since cumul9b: cumul10 (walls9, volum) → cumul11 (timeline4 lifetime fix, vgpr, VRS, smallcmds, ports-gpu, RT_MISS,
+  LOOKUP_CACHE, CBV_CAP, ALIAS_AFTER_UPLOAD, prewarm-all, walls11, eblouissement) → cumul11b/c/e (walls12/13, switches for the crash hunt)
+  → **cumul12** (VRS inert unless asked, ALIAS_AFTER_UPLOAD off, sweep lifetime fix `RETIRE_AHEAD`) → cumul14. Every fiche: `_work\essais\cumul11.md`,
+  `cumul13.md`, `cumul14.md`.
+- **Cache `C:\Users\4nto\victory-cache\cumul14`**, pre-warmed offline (`_work\outils\prewarm_cumul14.ps1`, launcher env): 25,758 shaders translated
+  (227 known failures, none real), recipes of cumul11 + cumul7 merged = 3,937 → 3,935 pipelines, 0 failed. Translator key = victory-shader sources +
+  `shader_cache.rs` + the switches listed there: a change to those needs a new cache and a new pre-warm.
+- Measured: _cumul14 figures to be filled in from the orchestrator's 3 runs_. Reference: cumul9b 8.87 img/s (walls often missing);
+  cumul12 + E1 5.5 / 6.6 img/s with the walls drawn (card ~90 ms: much more scenery).
+- Fallback: `_work\Jouer precedent.bat`; the Desktop launcher of cumul9b stays until cumul14 is promoted (`_work\essais\promotion.md`).
+- Launcher env (`_work\Jouer essai cumul14 (temporaire).bat`; the Desktop « Essayer VIctory - tout regroupé (cumul14).bat » is written by the orchestrator):
 
 ```bat
 set DISABLE_VULKAN_OBS_CAPTURE=1
-set VICTORY_LOG=info
-set VICTORY_CACHE_DIR=C:\Users\4nto\victory-cache\cumul7
+set VICTORY_CACHE_DIR=C:\Users\4nto\victory-cache\cumul14
 set VICTORY_LATE_WAIT=3
 set VICTORY_WIDE_BACK=1
 set VICTORY_WIDE_MERGE=1
@@ -114,6 +110,11 @@ set VICTORY_FFX_SCALE=0.42
 set VICTORY_WIDE_TEXTURES=1
 set VICTORY_CARD_GATHER=1
 set VICTORY_NO_COMPILE=none
+set VICTORY_INDIRECT_WIDE=0
+set VICTORY_MEM_GUARD=1
+set VICTORY_MIP_BIAS_SCOPE=aniso
+set VICTORY_LATE_WAIT_WRITES=0
+set VICTORY_SHADER_PACK=C:\Users\4nto\Downloads\GameFolder\shaders.rpf
 set VICTORY_LEAN_MATH=247
 set VICTORY_HOIST_CLAMPS=9
 set VICTORY_FLAT_INSTANCES=e732a8b4
@@ -155,21 +156,11 @@ set VICTORY_MIP_BIAS=auto
 set VICTORY_ASK_ONCE=1
 set VICTORY_ALIAS_ON_CARD=0
 set VICTORY_JOURNAL_SHARED=2
-"_work\victory-play-cumul9b.exe" run "C:\Users\4nto\Downloads\GameFolder\game_scarlett_master.exe" --execute > "_work\runs\run-%TS%-jouer.log" 2>&1
 ```
 
-Notes on that env:
-- The shortcut refuses to start only if a **game** runs (`victory-play-*.exe` with ` run ` on its command line), not for `victory.exe` tools.
-- `FFX_SCALE=0.42` (1612x907) + `FFX_SHARPNESS=auto` (RCAS) + `MIP_BIAS=auto` (−2.25): card 55 → 38 ms against 0.5, sharpness back to the 0.5 level
-  (gradient energy −0.6 %). `FFX_DYNAMIC=33` does nothing useful: the title reads its scale once (fsrdyn2.md).
-- OFF on purpose (reviews 4/5, crash-cumul7): `LEVELS_ON_DEMAND`, `SETTLE_PARTIAL`, `FENCE_PARTIAL`, `SCOPED_UAV`, `TEXTURE_UPLOAD_BANDS`,
-  `ALIAS_ON_CARD`; absent: `MERGE_MORE`, `ALIAS_PARTIAL`, `VRS`. All are read live (below) for A/B once their authors fix them.
-- `TEXTURE_HALF=2` stays: `TEXTURE_HALF=0` does not fit 8 GB (cumul5 L0 device removed at 6,948/6,965 MB; cumul6 L0 ran but over budget, 7,147/6,910 MB).
-- `NO_COMPILE=none`, `CARD_BUFFERS_MIN_MB=1` + `CARD_BUFFERS_MB` must stay, as before.
-- **Live switches** (`VICTORY_LIVE=<file>`, tools/live-switches): `NAME=value` lines read every second, applied at the next frame, logged
-  `live switch NAME=value at frame N`; the fps line carries `live=<n>`. Which switches are live and which are read at the start: each cumulN.md
-  (`À chaud` section). Translation switches (`LEAN_MATH`, `HOT_SHADERS`, `CODE_TABLE_AFTER`), `DEPTH_BOUNDS`, `FFX_SCALE`, `ASYNC_COMPUTE`,
-  `WIDE_THREADS`, `CARD_GATHER`, `ALIAS_COPIES`, `LATE_WAIT`, `PHYS_INDEX`, `MIP_BIAS` are start-only.
+Not to use yet: `LATE_WAIT=2` (card hangs: walls13y, cumul12e2), `ALIAS_AFTER_UPLOAD=1` (device removals in cumul11b, 3/3), `ALIAS_ON_CARD=1`
+(not validated in a long run), `PLANE_PASS=written` (walls missing), `INDIRECT_WIDE=1` (indirect dispatches past the D3D12 limit of 65,535
+groups, never tried; on by default in the code on AMD, set to 0 in the launcher), `LATE_FRAMES=1` (walls16: 1 crash in 2, not faster).
 
 ## 5. Rejected / never do
 
@@ -209,31 +200,28 @@ Notes on that env:
 | `feat/map-tour-2` / `nuit/tour-3b` `54d8982` | teleport tour of the map to pre-warm shaders (`VICTORY_TOUR`) | paused by user; resume on tour-3b |
 | `fix/series-s-boot` `a92bc87` | Series S memory figures | did not fix the stall |
 
-## 7. Last results (night of 2026-11-25/26, ~07:00 Paris)
+## 7. Last results (2026-11-26, day)
 
-- **Promoted cumul9b** (see section 4): 8.87 img/s, 112.8 ms/frame, card ~51 ms, 15 min stable. The user asked to stop after it:
-  remaining work in `_work\essais\A-FAIRE.md`; every event of the night in `_work\essais\EVENEMENTS.log`.
-- **ALIAS_ON_CARD** (perf/copies6 → timeline2/3/4): aliased refreshes take the flights' bytes by card copies instead of a wait.
-  timeline2: **−20 ms/frame** (104 vs 125 ms, wait 48 → 1 ms). But **timeline3 removed the device ~60 s into the world**; the review-7 fix
-  (7345a5da) is in cumul9c/cumul10, untested in a long run. Keep it off until a review + run say otherwise.
-- **FSR 0.42** (cumul7): card 55 → 38 ms, frame 130 → 116 ms (8.64 img/s); with fsrsharp the image is as sharp as 0.5.
-- **prep4** `JOURNAL_SHARED=2` (kernel write-watch call outside the journal lock): −5.5 to −7 ms/frame, review 8 safe → in Jouer.
-- **Crashes LEVELS / HALF=0** (`_work\essais\crash-cumul7.md`): cumul5 L0 and cumul7's cold first launch died the same way — DEVICE_HUNG,
-  no breadcrumbs, the frame collapsing to 0.1–0.4 img/s under extreme load (full-size textures or cold pipeline compiles), with
-  LEVELS_ON_DEMAND and ASYNC_COMPUTE on. Suspect (not proven): LEVELS tiles given back to the pool and remapped on the direct queue while a
-  compute-queue list still reads the old texture. The device-removed line said `VICTORY_RELAY=1` whatever the mode (text fixed in cumul8).
-  For the next cold run set `VICTORY_D3D12_DRED=1` (works in release).
-- **Missing walls** (walls2–walls9 fiches): the title does submit the walls; they are lost **on our side** at render time, depending on timing
-  (not the indirect budget: 0 records emptied; not untranslated mesh shaders: 6,685/6,685 translate). walls9 (`RECOPY_ALL_EVERY` without
-  touching card-written copies) is in cumul10, not yet run. Live A/B of 8 switches on cumul6 moved fps ±4 %, captures still to compare.
-- Frame now ≈ preparing ~72 ms + card ~50–55 ms **in series** (copies7 A/B): the CPU side is the next target (prep/copies threads).
-- **Tools** (all in `_work\outils`): `live_ab.ps1` (one run, A/B steps written into the VICTORY_LIVE file, one switch per step, `-Avant 180`),
-  `live_stats.ps1 -Log <run> -Etapes <runs\<tag>-live.txt>` (per step: medians of ms/frame, GPU, preparing, copies, copying back, draws;
-  B vs the A around it; log times are UTC, local = UTC+1), `comparer_captures.py` (image comparison of captures, gradient energy),
-  `derive_bat.py` (derive a test/candidate launcher from another), `essai.ps1` (fixed-name test runs), `prewarm` (`victory-play-<x>.exe prewarm
-  --cache <new> --from <old>`, offline pipeline pre-warm, paused during tests).
-- Builds: sccache in `~/.cargo/config.toml` (its `rustc-wrapper` path must be a TOML literal string, single quotes); compiling is allowed at any
-  time (the test script pauses rustc/link during a run).
+- **Missing walls (D1) solved**: the title reads back GPU results (culling / visibility) a few frames later without waiting for a fence;
+  with `LATE_WAIT=3` + relay our flights handed them back too late, so whole rooms were judged hidden and not submitted (walls15 X:
+  0 "buffers read before their copy landed" and walls back with `LATE_WAIT=0`). **E1 = `LATE_WAIT_WRITES=0`** settles a submission that
+  writes bottom-of-pipe values at once: walls back at ~6-6.6 img/s. The precompiled pipelines (device methods 0x1c8/0x218, from the shader
+  pack, port of Felix2180; walls10-13) also draw what the title used to go without.
+- **Device removals of cumul11b (4/4)**: DRED (cumul11bd) = page fault in the range of our host copies but in none of them, first unfinished
+  command a prelude; gone with `SWEEP=0` or `TEXTURE_SWEEP=0`. Cause: `host::retire` freed sweep victims as soon as no submission was running,
+  while lists recorded but not yet submitted could name them unheld. **Fix `e900630`**: retire waits 16 more submissions (`RETIRE_AHEAD`).
+  `ALIAS_AFTER_UPLOAD` (#1241) also made it worse (cumul11bx held with it off) → off by default. VRS called `RSSetShadingRate(1x1)` after every
+  `host_state_lost` even when off → now inert unless asked.
+- **LATE_WAIT=2** hangs the card (0x887A0006, walls13y, cumul12e2): its present is a synchronous settle point; low priority, we stay on 3.
+- **cool-fox-codec** compared (`docs/notes/cool-fox-comparaison.md`): their lead is CPU-side (preparation in parallel with the card).
+  Ported: `ASYNC_SUBMIT` (cumul13, off by default, being measured), `BIND_CACHE` / `SCRATCH_FILL_ONCE` / `DECLARE_ONCE` / `MEM_GUARD`
+  (cpu-petits), `TEXTURE_BACK` / `INDIRECT_REST` / `INDIRECT_WIDE` (plus-loin). `JOIN_PARTS` deferred (joins parts across a title wait and across
+  queues: unsafe with our async compute without barriers).
+- **Upstream (Marvisak)**: ~340 commits not in our line; a full merge = 492 conflicts in 51 files, and the targeted fixes touch code our fork
+  no longer has. Nothing ported. Forks looked at: Felix2180 (ported: precompiled pipelines, RT_MISS), fxceless (ported: CBV cap, lookup cache,
+  #1241), Belobug-AMD and others (nothing).
+- **Shaders**: `prewarm --all-shaders` translates all 25,985 unique containers of the game (0 real failure: 195 GS translate as ES+GS pairs,
+  29 unused SM5, 3 without native code).
 
 ## 8. Open problems, ranked
 
