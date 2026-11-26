@@ -63,6 +63,84 @@ static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     inflight: Vec::new(),
 });
 
+/// Rung when a range leaves [`Journal::inflight`] (its kernel answer is
+/// in the journal): the count of such moments.
+static INFLIGHT_DONE: (Mutex<u64>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// The journal, for writing, once no page of `[first, last)` (any page,
+/// with `None`) is in flight ([`writes_outside`]): an asking of the kernel
+/// resets what it finds written, and an answer reads what is recorded, so
+/// neither may run over pages whose kernel answer is not recorded yet
+/// (revue 4 of 2026-11-26, 1.1). Waits on [`INFLIGHT_DONE`], not by
+/// spinning on the lock (1.2).
+fn journal_clear_of(range: Option<(usize, usize)>) -> std::sync::RwLockWriteGuard<'static, Journal> {
+    loop {
+        let seen = *INFLIGHT_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+        let j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        let blocked = match range {
+            Some((first, last)) => j.inflight.iter().any(|&(a, b)| a < last && first < b),
+            None => !j.inflight.is_empty(),
+        };
+        if !blocked {
+            return j;
+        }
+        drop(j);
+        let done = INFLIGHT_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *done == seen {
+            // (A bound, should a ring be missed.)
+            let _ = INFLIGHT_DONE.1.wait_timeout(done, std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+/// A range in [`Journal::inflight`]: taken out (and the waiters rung) when
+/// dropped, by [`Inflight::finish`] or on an unwind.
+struct Inflight {
+    range: (usize, usize),
+}
+
+impl Inflight {
+    /// Records the kernel's answer `pages` for the range and takes the
+    /// range out, in one hold of the lock: the answer for the range.
+    fn finish(self, pages: Option<Vec<usize>>) -> Option<(u64, Vec<(usize, u64)>)> {
+        let (first, last) = self.range;
+        let answer = {
+            let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+            let answer = pages.map(|pages| {
+                j.asked += 1;
+                let now = j.asked;
+                for page in pages {
+                    j.written.insert(page, now);
+                }
+                (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
+            });
+            take_inflight(&mut j, self.range);
+            answer
+        };
+        std::mem::forget(self);
+        ring_inflight();
+        answer
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        take_inflight(&mut JOURNAL.write().unwrap_or_else(|e| e.into_inner()), self.range);
+        ring_inflight();
+    }
+}
+
+fn take_inflight(j: &mut Journal, range: (usize, usize)) {
+    if let Some(at) = j.inflight.iter().position(|&r| r == range) {
+        j.inflight.swap_remove(at);
+    }
+}
+
+fn ring_inflight() {
+    *INFLIGHT_DONE.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    INFLIGHT_DONE.1.notify_all();
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -87,7 +165,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_clear_of(None);
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -180,7 +258,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_clear_of(None);
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -314,33 +392,15 @@ fn writes_outside(first: usize, last: usize, guarded: bool) -> Option<(u64, Vec<
     thread_local! {
         static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let overlaps = |j: &Journal| j.inflight.iter().any(|&(a, b)| a < last && first < b);
-    loop {
+    let inflight = {
         let waiting = crate::prepstats::start();
-        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        let mut j = journal_clear_of(Some((first, last)));
         crate::prepstats::done(crate::prepstats::P::JournalWait, waiting);
-        if !overlaps(&j) {
-            if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-                return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
-            }
-            j.inflight.push((first, last));
-            break;
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
         }
-        drop(j);
-        std::thread::yield_now();
-    }
-    let done = |pages: Option<Vec<usize>>| {
-        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = j.inflight.iter().position(|&r| r == (first, last)) {
-            j.inflight.swap_remove(at);
-        }
-        let pages = pages?;
-        j.asked += 1;
-        let now = j.asked;
-        for page in pages {
-            j.written.insert(page, now);
-        }
-        Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        j.inflight.push((first, last));
+        Inflight { range: (first, last) }
     };
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     let mut granularity = 0;
@@ -367,7 +427,7 @@ fn writes_outside(first: usize, last: usize, guarded: bool) -> Option<(u64, Vec<
         None if guarded => guard(first * PAGE, last * PAGE),
         None => None,
     };
-    done(pages)
+    inflight.finish(pages)
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -414,7 +474,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return writes_outside(first, last, guarded);
     }
     let waiting = if journal_shared() { crate::prepstats::start() } else { waiting };
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    // (Pages in flight from mode 2, before a live switch: waited for.)
+    let mut j = journal_clear_of(Some((first, last)));
     crate::prepstats::done(crate::prepstats::P::JournalWait, waiting);
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -1215,5 +1276,28 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+
+    /// A range in flight is taken out when its guard is dropped (an unwind
+    /// included), and finishing it records the pages under one asking.
+    #[test]
+    fn inflight_ranges_leave_on_drop_and_finish() {
+        // Page numbers far from any test's memory.
+        let range = (usize::MAX / 2, usize::MAX / 2 + 4);
+        journal_clear_of(Some(range)).inflight.push(range);
+        drop(Inflight { range });
+        assert!(!JOURNAL.read().unwrap().inflight.contains(&range));
+        let range = (usize::MAX / 2 + 8, usize::MAX / 2 + 12);
+        journal_clear_of(Some(range)).inflight.push(range);
+        let (now, pages) = Inflight { range }.finish(Some(vec![range.0 + 1])).unwrap();
+        assert_eq!(pages, vec![(range.0 + 1, now)]);
+        assert!(!JOURNAL.read().unwrap().inflight.contains(&range));
+        // Nothing in flight there: not waited for.
+        drop(journal_clear_of(Some(range)));
     }
 }
