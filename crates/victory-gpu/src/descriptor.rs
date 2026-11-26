@@ -244,6 +244,18 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// Equality key for render-target/depth bind deduplication
+    /// (`VICTORY_BIND_CACHE=1`): resource pointer, whether a view description
+    /// was supplied, and the description words when present.
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, u32, [u32; 6]) {
+        (
+            self.resource as usize,
+            self.described,
+            if self.described != 0 { self.desc } else { [0; 6] },
+        )
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1249,5 +1261,37 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_record_key_ignores_desc_when_undescribed() {
+        let a = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: 0x1000usize as This,
+            desc: [1, 2, 3, 4, 5, 6],
+        };
+        let b = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: 0x1000usize as This,
+            desc: [9, 9, 9, 9, 9, 9],
+        };
+        let c = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [28, 4, 0, 0, 0, 0],
+        };
+        let d = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [29, 4, 0, 0, 0, 0],
+        };
+        assert_eq!(a.key(), b.key());
+        assert_ne!(a.key(), c.key());
+        assert_ne!(c.key(), d.key());
     }
 }

@@ -217,6 +217,9 @@ fn typed_target(format: u32, depth: bool) -> u32 {
 }
 
 /// What one title list has set, and what its host list was last given.
+/// Equality key for render-target/depth bind deduplication (`VICTORY_BIND_CACHE=1`).
+type TargetKey = (usize, u32, [u32; 6]);
+
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -263,6 +266,8 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Current `D3D12_SHADING_RATE` set on the host list (`0` = `1X1`).
     host_vrs: u32,
+    /// Last render targets and depth bound on the host list (`VICTORY_BIND_CACHE=1`).
+    host_targets: Option<(Vec<Option<TargetKey>>, Option<TargetKey>)>,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -644,9 +649,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -789,6 +792,17 @@ impl State {
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
         self.targets_set = true;
+        let cache = crate::host::bind_cache().then(|| {
+            let rtv_keys = handles
+                .iter()
+                .map(|&h| crate::descriptor::rtv_record(h).map(|r| r.key()))
+                .collect();
+            let dsv_key = crate::descriptor::dsv_record(depth).map(|r| r.key());
+            (rtv_keys, dsv_key)
+        });
+        if cache.is_some() && self.host_targets == cache {
+            return;
+        }
         self.targets.clear();
         let mut rtvs = Vec::new();
         // Formats of the views bound and the samples of their textures.
@@ -863,6 +877,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.host_targets = cache;
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -930,6 +945,7 @@ impl State {
         // must re-emit `RSSetShadingRate` even when it wants `1x1`.
         (self.host_pipeline, self.host_roots, self.host_heaps, self.host_vrs) =
             (0, [0; 2], [usize::MAX; 2], u32::MAX);
+        self.host_targets = None;
     }
 
     pub(crate) fn replay(&mut self, list: &HostList) {
@@ -937,6 +953,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_vrs = 0;
+        self.host_targets = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1257,7 +1274,9 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = pso;
         }
-        if pipeline_changed || (crate::host::tex_upload_pool() && root_changed) {
+        if pipeline_changed
+            || ((crate::host::tex_upload_pool() || crate::host::bind_cache()) && root_changed)
+        {
             list.keep_pipeline(p);
         }
         let _aliases = crate::texture::HoldAliases::new(list);
@@ -1959,8 +1978,20 @@ impl State {
             return;
         }
         let _timed = crate::prepstats::Timed::new(crate::prepstats::P::HeapTextures);
+        let bake = PASS_BUDGET.get().is_some_and(|b| b.2);
+        if !crate::residency::admit_texture_pass(bake) {
+            return;
+        }
         let memory = crate::host::host().and_then(|h| h.video_memory());
         let mut per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+        if crate::residency::enabled() && !bake {
+            per_frame = crate::residency::prefetch_limit(
+                per_frame,
+                crate::residency::pressured(),
+                crate::residency::limited_host_ram(),
+                crate::texture::staged_now()[1],
+            );
+        }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         // With `VICTORY_WIDE_TEXTURES=1`: the bytes are a budget per 150 ms
@@ -2089,7 +2120,10 @@ impl State {
         let _unshrink = Unshrink;
         for (index, write) in due {
             crate::resource::shrinking(false);
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most
+                || began.elapsed() > span
+                || crate::residency::upload_refused()
+            {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in

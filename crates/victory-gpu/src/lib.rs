@@ -53,6 +53,8 @@ pub mod precompiled;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

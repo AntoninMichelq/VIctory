@@ -2192,6 +2192,12 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Unaligned root-view scratch copies already recorded since the last
+    /// title write (`VICTORY_SCRATCH_FILL_ONCE=1`): (source, bytes) -> GPU address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Buffer ranges already declared as GPU-written since the last title
+    /// write (`VICTORY_DECLARE_ONCE=1`): (host copy, address, bytes).
+    written: std::collections::HashSet<(usize, usize, usize)>,
     /// Card copies made between host copies of the same title memory
     /// ([`HostList::copy_aliased`]): (reader, write step, from, to).
     aliased: std::collections::HashSet<(usize, usize, usize, usize)>,
@@ -2214,6 +2220,14 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// Clears per-list deduplication caches that depend on title memory
+    /// staying unchanged between commands.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.filled.clear();
+        self.written.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2222,6 +2236,27 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+}
+
+/// `VICTORY_BIND_CACHE=1`: skip redundant `OMSetRenderTargets` and repeated
+/// pipeline retain/naming within the same command list (off by default).
+pub(crate) fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_SCRATCH_FILL_ONCE=1`: copy each unaligned root constant buffer
+/// into scratch memory once per list until title memory is written (off by default).
+pub(crate) fn scratch_fill_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_FILL_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_DECLARE_ONCE=1`: record each `(shadow, address, len)` GPU write
+/// once per list until title memory is written (off by default).
+pub(crate) fn declare_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
 }
 
 impl Drop for Deferred {
@@ -7168,7 +7203,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7177,6 +7212,31 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// Copies `len` bytes of title memory at `src` into 256-byte aligned
+    /// scratch memory, returning its GPU address. With
+    /// `VICTORY_SCRATCH_FILL_ONCE=1`, reuses the same scratch copy for
+    /// identical `(src, len)` until title memory is written in this list.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if scratch_fill_once()
+            && let Some(&gpu) = self.deferred().filled.get(&key)
+        {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        if scratch_fill_once() {
+            if let Some(&existing) = deferred.filled.get(&key) {
+                return Some(existing);
+            }
+            deferred.filled.insert(key, gpu);
+        }
+        deferred
+            .copies
+            .push(Step::Fill(to as usize, src as usize, len as usize));
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7283,7 +7343,20 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        if declare_once() {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if !deferred.written.insert(key) {
+                // If an aliased card copy already ran against the earlier
+                // write step, let a subsequent aliased read re-copy the new
+                // GPU write without duplicating `Step::GpuWrite`.
+                if alias_copies() && !deferred.aliased.is_empty() {
+                    deferred.aliased.clear();
+                }
+                return;
+            }
+        }
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -7661,9 +7734,10 @@ impl HostList {
     }
 
     /// Retains a pipeline and root-signature pair (once per recording when
-    /// `VICTORY_TEX_UPLOAD_POOL=1`, else on every pipeline change as before).
+    /// `VICTORY_TEX_UPLOAD_POOL=1` or `VICTORY_BIND_CACHE=1`, else on every
+    /// pipeline change as before).
     pub(crate) fn keep_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
-        if tex_upload_pool() {
+        if tex_upload_pool() || bind_cache() {
             let pair = (p.pso.as_raw() as usize, p.root.as_raw() as usize);
             let mut deferred = self.deferred();
             if !deferred.bound_pipelines.insert(pair) {
@@ -7699,8 +7773,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8720,6 +8795,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }

@@ -2402,6 +2402,7 @@ fn host_texture(
         )
     };
     if let Err(e) = made {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
