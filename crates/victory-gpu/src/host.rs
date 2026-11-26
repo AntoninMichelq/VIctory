@@ -1944,15 +1944,13 @@ fn card_gather() -> bool {
 /// 10.5 MB of the PC's memory per plan in the air). With 64, about 515
 /// pieces a frame were still fetched beside 410 gathered (run T1b,
 /// 2026-11-25).
+/// Live (`crate::live`): plans made after a change get the new room; a
+/// gather kept for reuse with another room is let go ([`Gather::cap`]).
 fn gather_cap() -> u32 {
-    static CAP: OnceLock<u32> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("VICTORY_CARD_GATHER_PIECES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(160)
-            .clamp(1, 16_000)
-    })
+    static CAP: crate::live::Switch = crate::live::Switch::new();
+    CAP.get("VICTORY_CARD_GATHER_PIECES", |v, _| {
+        u64::from(v.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(160).clamp(1, 16_000))
+    }) as u32
 }
 
 /// Since the last frame-rate line, with [`card_gather`]: pieces merged
@@ -4141,6 +4139,8 @@ impl Host {
             // Memory for the gathered pieces, its counter at 0.
             let gather = if flown && work.gather.is_some() {
                 let cap = gather_cap();
+                // Kept gathers with another room (the switch changed) go.
+                work.gathers.retain(|g| g.cap == cap);
                 work.gathers.pop().or_else(|| {
                     let size = u64::from(GATHER_DATA) + u64::from(cap) * u64::from(GATHER_STRIDE);
                     let (buffer, data) = self.shared_buffer(size)?;
