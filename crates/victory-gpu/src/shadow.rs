@@ -77,6 +77,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Shaders have written the copy, or may (a range declared written,
+    /// or an unordered view of a heap shows it): `recopy_tick` leaves it
+    /// alone, since the card's bytes there may never have been copied
+    /// back to title memory.
+    gpu_written: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1896,7 +1901,13 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            gpu_written: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Shaders may write the copy ([`recopy_tick`] then leaves it alone).
+    pub(crate) fn mark_gpu_written(&self) {
+        self.gpu_written.store(true, Ordering::Relaxed);
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1924,6 +1935,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.mark_gpu_written();
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -1940,6 +1952,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.mark_gpu_written();
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -3328,15 +3341,13 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 /// `VICTORY_RECOPY_ALL_EVERY=<seconds>`: every that many seconds, every
-/// host copy of title memory (buffers' and windows') is marked as never
-/// copied, so the next refresh of any range of it copies it again from
+/// host copy of title memory (buffers' and windows') that the card does
+/// not write is marked as never copied, so the next refresh of any range of it copies it again from
 /// title memory, whatever write watching says. A test of copies that
 /// went stale for good (a buffer whose first copy was taken before the
 /// title or a read filled it, then never seen written: geometry drawn
 /// from zeros), and a stopgap if it is that. Ranges shaders are writing
 /// are skipped as by any refresh. Off (unset or 0): as before.
-/// shortcut: what shaders wrote into a copy and that was never copied
-/// back (a heap-picked unordered view) is replaced by title memory.
 pub(crate) fn recopy_tick() {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| {
@@ -3365,14 +3376,25 @@ pub(crate) fn recopy_tick() {
     }
     let mut copies: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
     copies.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    let all = copies.len();
+    // Only copies the card does not write: not one shaders have written or
+    // may write (their bytes may be the card's, never copied back: run
+    // walls7b lost the device four minutes in when those were replaced),
+    // not one in place, and not one a submission in flight writes now.
+    copies.retain(|c| {
+        c.place.is_none()
+            && !c.gpu_written.load(Ordering::Relaxed)
+            && c.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    });
     let bytes: u64 = copies.iter().map(|c| c.len).sum();
     for copy in &copies {
         copy.copied.lock().unwrap_or_else(|e| e.into_inner()).fill(0);
     }
     tracing::info!(
         copies = copies.len(),
+        left_alone = all - copies.len(),
         mb = bytes >> 20,
-        "every host copy marked to be copied again from title memory (VICTORY_RECOPY_ALL_EVERY)"
+        "host copies the card does not write marked to be copied again from title memory (VICTORY_RECOPY_ALL_EVERY)"
     );
 }
 
