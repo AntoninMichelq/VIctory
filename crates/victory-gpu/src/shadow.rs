@@ -2392,6 +2392,35 @@ impl Shadow {
 
     /// The ranges shaders write that are not copied back yet (title
     /// addresses, end excluded).
+    /// The parts of title memory `[from, to)` (inside the copy) whose pages
+    /// the copy holds as title memory has them now: copied (or the title's
+    /// bytes put in) after the last write the submission's write-watch
+    /// asking knows of. `None` if that asking does not cover the range (it
+    /// cannot be told). Pages only partly in the copy count as not current.
+    pub(crate) fn current_parts(&self, from: usize, to: usize) -> Option<Vec<(usize, usize)>> {
+        if from >= to || self.place.is_some() {
+            return None;
+        }
+        let (_, written) = crate::watch::asked(from, to)?;
+        let last: std::collections::HashMap<usize, u64> = written.into_iter().collect();
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut parts: Vec<(usize, usize)> = Vec::new();
+        for page in from / PAGE..=(to - 1) / PAGE {
+            let current = page >= base
+                && copied.get(page - base).is_some_and(|&at| at != 0 && last.get(&page).is_none_or(|&w| w <= at));
+            if !current {
+                continue;
+            }
+            let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            match parts.last_mut() {
+                Some(p) if p.1 == a => p.1 = b,
+                _ => parts.push((a, b)),
+            }
+        }
+        Some(parts)
+    }
+
     pub(crate) fn pending_ranges(&self) -> Vec<(usize, usize)> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
