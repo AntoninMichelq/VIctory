@@ -671,13 +671,24 @@ pub(crate) fn tally_drop(this: This, why: &'static str) {
 /// execution once) are counted by pipeline, and every 5 s an INFO line
 /// gives the 30 pipelines that drew most, per frame, with their shaders:
 /// which shaders draw a scene (and which are missing from it).
+/// `VICTORY_DRAW_CENSUS=all`: every pipeline that drew, not only 30.
 #[cfg(windows)]
 fn census_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_DRAW_CENSUS").as_deref() == Ok("1");
-        tracing::info!(on, "draws counted by pipeline (VICTORY_DRAW_CENSUS)");
-        on
+    census_most() > 0
+}
+
+/// The pipelines a census line lists: 0 with no census.
+#[cfg(windows)]
+fn census_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = match std::env::var("VICTORY_DRAW_CENSUS").as_deref() {
+            Ok("1") => 30,
+            Ok("all") => usize::MAX,
+            _ => 0,
+        };
+        tracing::info!(on = most > 0, all = most == usize::MAX, "draws counted by pipeline (VICTORY_DRAW_CENSUS)");
+        most
     })
 }
 
@@ -710,7 +721,7 @@ fn census_report(frames: f64) {
     let mut top: Vec<(String, u64)> = census.into_values().collect();
     top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let top: Vec<String> =
-        top.iter().take(30).map(|(shaders, n)| format!("{:.1} {shaders}", *n as f64 / frames)).collect();
+        top.iter().take(census_most()).map(|(shaders, n)| format!("{:.1} {shaders}", *n as f64 / frames)).collect();
     tracing::info!(
         "draws run per frame by pipeline (VICTORY_DRAW_CENSUS): {:.0} in all, {pipelines} pipelines; the most: {}",
         all as f64 / frames,

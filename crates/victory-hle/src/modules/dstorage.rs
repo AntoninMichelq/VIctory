@@ -440,6 +440,17 @@ impl Scheduler {
     }
 }
 
+/// Requests failed since the last streaming line ([`stream_log`]).
+static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_STREAM_LOG=1`: every 5 s of streaming, an INFO line with the
+/// requests finished and failed, the throughput, and what queues hold
+/// (the same sums are at debug level otherwise).
+fn stream_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STREAM_LOG").as_deref() == Ok("1"))
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -477,6 +488,23 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            if stream_log() {
+                // Everything held: enqueued, not submitted, running, and
+                // status entries waiting for earlier reads.
+                let held: usize = self.lanes.values().map(Lane::entries).sum();
+                tracing::info!(
+                    requests = *requests,
+                    failed = FAILED.swap(0, Ordering::Relaxed),
+                    mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
+                    busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
+                    staging_waits = self.refused,
+                    waiting,
+                    held,
+                    queues = self.lanes.len(),
+                    "dstorage: requests finished in the last {:.1} s (VICTORY_STREAM_LOG)",
+                    elapsed.as_secs_f64()
+                );
+            }
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -535,6 +563,7 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                FAILED.fetch_add(1, Ordering::Relaxed);
             }
             lane.flush();
         }
