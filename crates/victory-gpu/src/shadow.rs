@@ -2548,9 +2548,14 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asking = crate::copytop::start();
+            let writes = crate::watch::writes(from, to, true);
+            crate::copytop::time(crate::copytop::T_ASK, asking);
+            if let Some((now, written)) = writes {
                 self.watched.store(1, Ordering::Relaxed);
+                let copying = crate::copytop::start();
                 let copied = self.copy_stale(from, to, now, &written);
+                crate::copytop::time(crate::copytop::T_COPY, copying);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2565,7 +2570,9 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let copying = crate::copytop::start();
         self.copy(from, to);
+        crate::copytop::time(crate::copytop::T_COPY, copying);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from

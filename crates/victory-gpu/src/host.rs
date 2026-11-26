@@ -6309,6 +6309,13 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        let all = crate::copytop::start();
+        self.run_deferred_steps(batch);
+        crate::copytop::time(crate::copytop::T_ALL, all);
+    }
+
+    /// [`HostList::run_deferred`]'s steps.
+    fn run_deferred_steps(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -6321,7 +6328,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    let copying = crate::copytop::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::copytop::time(crate::copytop::T_TITLE, copying);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6332,7 +6341,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    let filling = crate::copytop::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::copytop::time(crate::copytop::T_FILL, filling);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -6348,7 +6359,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let running = crate::copytop::start();
                     work();
+                    crate::copytop::time(crate::copytop::T_RUN, running);
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -6370,7 +6383,9 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    let snapping = crate::copytop::start();
                     shadow.writing(*address, *len);
+                    crate::copytop::time(crate::copytop::T_SNAP, snapping);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -6383,7 +6398,9 @@ impl HostList {
                         if wide_textures() {
                             batch.due_textures.push(staging.clone());
                         } else {
+                            let refreshing = crate::copytop::start();
                             staging.refresh();
+                            crate::copytop::time(crate::copytop::T_TEXTURE, refreshing);
                         }
                     }
                     continue;
@@ -6513,6 +6530,13 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let flushing = crate::copytop::start();
+        self.flush_now();
+        crate::copytop::time(crate::copytop::T_FLUSH, flushing);
+    }
+
+    /// [`Batch::flush`], untimed.
+    fn flush_now(&mut self) {
         // The textures, several at a time ([`wide_textures`]): a refresh
         // reads the texture's title memory and writes its own staging
         // buffer, under its own lock. The time counted is the time it took,
@@ -6543,6 +6567,7 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::copytop::time(crate::copytop::T_AHEAD, crate::copytop::on().then_some(started));
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
