@@ -26,12 +26,20 @@ pub struct PrewarmOptions {
     /// and `early-recipes.bin` from.
     pub from: Option<PathBuf>,
     /// Number of worker threads (default: `VICTORY_PIPELINE_WORKERS` or half the
-    /// logical cores, clamped to 2..=8).
+    /// logical cores, clamped to 2..=8 for pipelines, up to 16 for `--all-shaders`).
     pub jobs: Option<usize>,
+    /// Optional pre-extracted unique DXBC containers (`--all-shaders`): every
+    /// container is translated into `cache_dir/shaders/` in parallel before
+    /// recipe pipeline compilation, without needing pipeline recipes.
+    pub all_shaders: Vec<Vec<u8>>,
 }
 
 /// Summary of an offline pre-warm run.
 pub struct PrewarmReport {
+    pub all_shaders_total: usize,
+    pub all_shaders_hits: u64,
+    pub all_shaders_translated: u64,
+    pub all_shaders_failed: usize,
     pub recipes_total: usize,
     pub from_recipes_file: usize,
     pub compute_matched_from_early: usize,
@@ -66,6 +74,90 @@ pub fn prewarm(opts: PrewarmOptions) -> Result<PrewarmReport, String> {
         return Err("no host D3D12 device available".into());
     };
     crate::descriptor::host::probe_view_limit();
+
+    // Optional `--all-shaders` pass: translate and cache every unique DXBC
+    // container in parallel into `cache_dir/shaders/` (DXIL cache only; no
+    // graphics render state required). Uses the exact same host device wave
+    // width and view heap limit probed above so cache keys match live runs.
+    let all_shaders_total = opts.all_shaders.len();
+    let (all_hits_before, all_misses_before) = crate::shader_cache::counts();
+    let all_shaders_failed = AtomicUsize::new(0);
+    if !opts.all_shaders.is_empty() {
+        let shader_threads = opts
+            .jobs
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16))
+            })
+            .clamp(1, 32);
+        let next_shader = AtomicUsize::new(0);
+        let done_shader = AtomicUsize::new(0);
+        let last_shader_log = Mutex::new(Instant::now());
+        let all_started = Instant::now();
+        tracing::info!(
+            shaders = all_shaders_total,
+            threads = shader_threads,
+            "prewarm translating all shaders into DXIL cache"
+        );
+        std::thread::scope(|s| {
+            for i in 0..shader_threads.min(all_shaders_total) {
+                let all_shaders = &opts.all_shaders;
+                let next_shader = &next_shader;
+                let done_shader = &done_shader;
+                let all_shaders_failed = &all_shaders_failed;
+                let last_shader_log = &last_shader_log;
+                std::thread::Builder::new()
+                    .name(format!("victory-shaders-{i}"))
+                    .spawn_scoped(s, move || {
+                        while let Some(bytes) =
+                            all_shaders.get(next_shader.fetch_add(1, Ordering::Relaxed))
+                        {
+                            if let Err(e) = crate::shader_cache::host_shader(bytes) {
+                                all_shaders_failed.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(error = %e, bytes = bytes.len(), "prewarm shader skipped");
+                            }
+                            let n = done_shader.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n == all_shaders_total
+                                || n.is_multiple_of(1000)
+                                || last_shader_log
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .elapsed()
+                                    >= Duration::from_secs(10)
+                            {
+                                let mut t = last_shader_log
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                *t = Instant::now();
+                                drop(t);
+                                let (h, m) = crate::shader_cache::counts();
+                                tracing::info!(
+                                    done = n,
+                                    total = all_shaders_total,
+                                    hits = h - all_hits_before,
+                                    translated = m - all_misses_before,
+                                    failed = all_shaders_failed.load(Ordering::Relaxed),
+                                    elapsed_s = all_started.elapsed().as_secs(),
+                                    "prewarm all-shaders progress"
+                                );
+                            }
+                        }
+                    })
+                    .ok();
+            }
+        });
+    }
+    let (all_hits_after, all_misses_after) = crate::shader_cache::counts();
+    let all_shaders_hits = all_hits_after - all_hits_before;
+    let all_shaders_translated = all_misses_after - all_misses_before;
+
+    // Index in-memory containers by 16-hex BLAKE3 hash so recipes can also
+    // resolve shaders extracted from game archives without `_work/prison/shaders`.
+    let memory_index: HashMap<String, usize> = opts
+        .all_shaders
+        .iter()
+        .enumerate()
+        .map(|(idx, bytes)| (blake3::hash(bytes).to_hex()[..16].to_owned(), idx))
+        .collect();
 
     // Load recipes and early keys from the target cache and optional `--from`.
     let mut recipes_by_key: HashMap<String, Recipe> = HashMap::new();
@@ -117,8 +209,8 @@ pub fn prewarm(opts: PrewarmOptions) -> Result<PrewarmReport, String> {
         .filter(|k| !recipes_by_key.contains_key(*k))
         .collect();
     let mut compute_matched_from_early = 0usize;
-    if !uncovered.is_empty() && !container_index.is_empty() {
-        for hash in container_index.keys() {
+    if !uncovered.is_empty() && (!container_index.is_empty() || !memory_index.is_empty()) {
+        for hash in container_index.keys().chain(memory_index.keys()) {
             let mut h = blake3::Hasher::new();
             h.update(b"compute");
             h.update(hash.as_bytes());
@@ -175,6 +267,8 @@ pub fn prewarm(opts: PrewarmOptions) -> Result<PrewarmReport, String> {
             for i in 0..threads.min(recipes_total) {
                 let recipes = &recipes;
                 let container_index = &container_index;
+                let memory_index = &memory_index;
+                let all_shaders = &opts.all_shaders;
                 let next = &next;
                 let done = &done;
                 let failed = &failed;
@@ -190,7 +284,14 @@ pub fn prewarm(opts: PrewarmOptions) -> Result<PrewarmReport, String> {
                             let mut shaders = Vec::with_capacity(r.shaders.len());
                             let mut all_found = true;
                             for (stage, hash) in &r.shaders {
-                                match load_shader(stage, hash, container_index, loaded_shaders) {
+                                match load_shader(
+                                    stage,
+                                    hash,
+                                    container_index,
+                                    memory_index,
+                                    all_shaders,
+                                    loaded_shaders,
+                                ) {
                                     Some(sh) => shaders.push(sh),
                                     None => {
                                         all_found = false;
@@ -270,6 +371,10 @@ pub fn prewarm(opts: PrewarmOptions) -> Result<PrewarmReport, String> {
         .unwrap_or(0);
 
     Ok(PrewarmReport {
+        all_shaders_total,
+        all_shaders_hits,
+        all_shaders_translated,
+        all_shaders_failed: all_shaders_failed.load(Ordering::Relaxed),
         recipes_total,
         from_recipes_file,
         compute_matched_from_early,
@@ -303,6 +408,8 @@ fn load_shader(
     stage: &str,
     hash: &str,
     index: &HashMap<String, PathBuf>,
+    memory_index: &HashMap<String, usize>,
+    all_shaders: &[Vec<u8>],
     cache: &Mutex<HashMap<(String, String), Option<Arc<Shader>>>>,
 ) -> Option<Arc<Shader>> {
     let key = (stage.to_owned(), hash.to_owned());
@@ -310,21 +417,28 @@ fn load_shader(
         return found.clone();
     }
     let stage_static = static_stage(stage)?;
-    let loaded = index.get(hash).and_then(|path| {
-        let bytes = std::fs::read(path).ok()?;
-        let sh = super::shader(stage_static, &bytes);
-        if sh.hash == hash {
-            Some(sh)
-        } else {
-            tracing::warn!(
-                path = %path.display(),
-                expected = hash,
-                actual = %sh.hash,
-                "shader container hash mismatch"
-            );
-            None
-        }
-    });
+    let loaded = index
+        .get(hash)
+        .and_then(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let sh = super::shader(stage_static, &bytes);
+            if sh.hash == hash {
+                Some(sh)
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    expected = hash,
+                    actual = %sh.hash,
+                    "shader container hash mismatch"
+                );
+                None
+            }
+        })
+        .or_else(|| {
+            let &idx = memory_index.get(hash)?;
+            let sh = super::shader(stage_static, &all_shaders[idx]);
+            (sh.hash == hash).then_some(sh)
+        });
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
