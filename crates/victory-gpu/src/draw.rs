@@ -3779,6 +3779,12 @@ unsafe impl Send for FlatBuffers {}
 // SAFETY: as above.
 unsafe impl Sync for FlatBuffers {}
 
+/// `VICTORY_FLAT_RECT4=1`: see [`flat_record_fits`]. Off by default.
+fn flat_rect4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLAT_RECT4").is_some_and(|v| v == "1"))
+}
+
 /// Whether the indexed record at `arguments` (title memory, not written on
 /// the card since: what the refresh copies is what runs) is one a flat draw
 /// stands for: `indices` indices per instance, from index, vertex and
@@ -3794,7 +3800,12 @@ fn flat_record_fits(args: &crate::shadow::Shadow, arguments: u64, indices: u32) 
     let r: [u32; 5] =
         std::array::from_fn(|k| unsafe { (arguments as *const u32).add(k).read_unaligned() });
     let [count, instances, start, base, first] = r;
-    let fits = count == indices
+    // A rectangle list of four indices is one rectangle (the fourth index
+    // starts no primitive): drawn from its first three, as the flat draw's
+    // pattern does (`VICTORY_FLAT_RECT4=1`). The title's tile grid
+    // (`e732a8b4`) has such records, which were drawn as before: one host
+    // instance at a time, ~8.6 ms of the card a frame.
+    let fits = (count == indices || indices == 3 && count == 4 && flat_rect4())
         && (1..=crate::indirect::FLAT_MOST).contains(&instances)
         && start == 0
         && base == 0
