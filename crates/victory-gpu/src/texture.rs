@@ -330,6 +330,14 @@ unsafe impl Sync for Through {}
 /// The copy buffers of [`alias`], by the placed view's texture.
 static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
+/// Whether [`alias`] copies a card-written source into a view whenever the
+/// list has not yet copied that source into it, not only at the view's
+/// first use in the list (`VICTORY_ALIAS_AFTER_UPLOAD`, on unless `0`).
+fn alias_after_upload() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_ALIAS_AFTER_UPLOAD", |v, _| u64::from(v.is_none_or(|v| v.trim() != "0"))) == 1
+}
+
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
@@ -437,7 +445,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read (fxceless
+    // 19a45d19, fork PR #1241). `VICTORY_ALIAS_AFTER_UPLOAD=0` (read live):
+    // as before, the view's first use in the list stands for the copy owed.
     let first = list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
+    let new_source = if alias_after_upload() { new_source } else { first };
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -452,7 +466,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
