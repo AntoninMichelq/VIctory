@@ -324,6 +324,253 @@ unsafe impl Sync for Through {}
 /// The copy buffers of [`alias`], by the placed view's texture.
 static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
+/// Outcome of [`alias`] for a placed view over another host-written texture.
+pub(crate) enum Alias {
+    /// Not copied (fallback to title memory upload).
+    None,
+    /// Already copied immediately (or up to date); caller still ensures read state.
+    Copied,
+    /// Queued in [`HoldAliases`]; both the copy and final read-state transition
+    /// are emitted together when the batch flushes.
+    Deferred,
+}
+
+/// `[batched_copies, batches]`.
+static ALIAS_BATCH_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Reads and clears the batched alias-copy counters for the periodic log.
+pub(crate) fn take_alias_batch_stats() -> [u64; 2] {
+    [
+        ALIAS_BATCH_STATS[0].swap(0, std::sync::atomic::Ordering::Relaxed),
+        ALIAS_BATCH_STATS[1].swap(0, std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
+/// `VICTORY_ALIAS_BATCH=1`: groups texture alias copies (`alias`) recorded
+/// within a draw/dispatch bind or heap-texture pass into one 3-phase pass
+/// (one barrier batch in, all `from -> through` copies, one mid barrier batch,
+/// all `through -> to` copies, one barrier batch out). Off (the default): each
+/// alias copy records its own barriers as before. Live (`crate::live`).
+pub(crate) fn alias_batch() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_ALIAS_BATCH", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if first {
+            tracing::info!(
+                on,
+                "texture alias copies grouped into one 3-phase pass (VICTORY_ALIAS_BATCH)"
+            );
+        }
+        u64::from(on)
+    }) == 1
+}
+
+struct PendingSource {
+    source: This,
+    from: ID3D12Resource,
+    before: Option<u32>,
+    copy_state: u32,
+}
+
+struct PendingAlias {
+    placed: This,
+    to: ID3D12Resource,
+    from: ID3D12Resource,
+    through: Arc<Through>,
+    final_state: u32,
+}
+
+#[derive(Default)]
+struct PendingAliases {
+    sources: Vec<PendingSource>,
+    items: Vec<PendingAlias>,
+}
+
+thread_local! {
+    static HELD_ALIASES: std::cell::RefCell<Option<PendingAliases>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While it lives (and [`alias_batch`] is on), texture alias copies recorded on
+/// this thread are queued and emitted together in one 3-phase pass on drop (or
+/// earlier if a view touches a pending source or destination texture).
+pub(crate) struct HoldAliases<'a>(Option<&'a HostList>);
+
+impl<'a> HoldAliases<'a> {
+    pub(crate) fn new(list: &'a HostList) -> Self {
+        if !alias_batch() {
+            return Self(None);
+        }
+        // Nested scopes keep the outer batch; only the outermost owns flush.
+        let nested = HELD_ALIASES.with_borrow_mut(|held| {
+            if held.is_some() {
+                true
+            } else {
+                *held = Some(PendingAliases::default());
+                false
+            }
+        });
+        Self((!nested).then_some(list))
+    }
+}
+
+impl Drop for HoldAliases<'_> {
+    fn drop(&mut self) {
+        let Some(list) = self.0 else {
+            return;
+        };
+        if let Some(pending) = HELD_ALIASES.with_borrow_mut(|held| held.take())
+            && !pending.items.is_empty()
+        {
+            flush_alias_batch(list, pending.sources, pending.items);
+        }
+    }
+}
+
+/// Flushes any queued alias copies if `resource` is a pending source or
+/// destination, so subsequent state transitions on `resource` stay ordered.
+pub(crate) fn flush_aliases_if(list: &HostList, resource: This) {
+    let taken = HELD_ALIASES.with_borrow_mut(|held| {
+        let pending = held.as_mut()?;
+        if pending.items.is_empty() {
+            return None;
+        }
+        let touches = pending.items.iter().any(|it| it.placed == resource)
+            || pending.sources.iter().any(|s| s.source == resource);
+        if touches {
+            Some(std::mem::take(pending))
+        } else {
+            None
+        }
+    });
+    if let Some(pending) = taken {
+        flush_alias_batch(list, pending.sources, pending.items);
+    }
+}
+
+fn flush_alias_batch(list: &HostList, sources: Vec<PendingSource>, items: Vec<PendingAlias>) {
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
+    const COPY_DEST: u32 = 0x400;
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |buffer: &ID3D12Resource, row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+
+    // Phase 1: transition all sources -> COPY_SOURCE, placed -> COPY_DEST, through -> COPY_DEST.
+    let mut barriers_in = Vec::with_capacity(sources.len() + items.len() * 2);
+    for s in &sources {
+        if let Some(before) = s.before {
+            barriers_in.push(crate::host::transition(
+                &s.from,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(s.copy_state as i32),
+            ));
+        }
+    }
+    for it in &items {
+        if let Some((texture, before)) = list.transition(it.placed, COPY_DEST) {
+            let state = list.legal_state(texture, COPY_DEST);
+            barriers_in.push(crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            ));
+        }
+        barriers_in.push(crate::host::transition(&it.through.buffer, common, written));
+    }
+
+    // Phase 3: transition all through buffers COPY_DEST -> COPY_SOURCE.
+    let barriers_mid: Vec<_> = items
+        .iter()
+        .map(|it| crate::host::transition(&it.through.buffer, written, read))
+        .collect();
+
+    // Phase 5: transition all through -> COMMON, placed -> final_state, restore writable sources.
+    let mut barriers_out = Vec::with_capacity(items.len() * 2 + sources.len());
+    for it in &items {
+        barriers_out.push(crate::host::transition(&it.through.buffer, read, common));
+        if let Some((texture, before)) = list.transition(it.placed, it.final_state) {
+            let state = list.legal_state(texture, it.final_state);
+            barriers_out.push(crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            ));
+        }
+    }
+    for s in &sources {
+        if let Some(before) = s.before
+            && before & TARGET_OR_UNORDERED != 0
+            && let Some((texture, cur)) = list.transition(s.source, before)
+        {
+            let state = list.legal_state(texture, before);
+            barriers_out.push(crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(cur as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            ));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy batch of {} textures", items.len()));
+    // SAFETY: an open list and live resources; each through buffer is distinct
+    // (placed textures are deduplicated per batch) and rests in COMMON between copies.
+    unsafe {
+        if !barriers_in.is_empty() {
+            list.list.ResourceBarrier(&barriers_in);
+        }
+        for it in &items {
+            for (index, (of_written, _)) in it.through.parts.iter().enumerate() {
+                list.list.CopyTextureRegion(
+                    &rows(&it.through.buffer, of_written),
+                    0,
+                    0,
+                    0,
+                    &part(&it.from, index),
+                    None,
+                );
+            }
+        }
+        list.list.ResourceBarrier(&barriers_mid);
+        for it in &items {
+            for (index, (_, of_read)) in it.through.parts.iter().enumerate() {
+                list.list.CopyTextureRegion(
+                    &part(&it.to, index),
+                    0,
+                    0,
+                    0,
+                    &rows(&it.through.buffer, of_read),
+                    None,
+                );
+            }
+        }
+        list.list.ResourceBarrier(&barriers_out);
+    }
+    for it in &items {
+        list.keep(&it.through.buffer);
+    }
+    ALIAS_BATCH_STATS[0].fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    ALIAS_BATCH_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
@@ -332,9 +579,10 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// the list reads the view
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
-/// as [`upload`] does. False if the copy cannot be made: the caller fills
+/// as [`upload`] does (or in `final_state` when batched by [`HoldAliases`]).
+/// Returns [`Alias::None`] if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
-pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+pub(crate) fn alias(list: &HostList, placed: This, source: This, final_state: u32) -> Alias {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -342,9 +590,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
     ) else {
-        return false;
+        return Alias::None;
     };
-    let Some(host) = host() else { return false };
+    let Some(host) = host() else { return Alias::None };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
@@ -364,7 +612,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 };
                 let parts = count(&of_from);
                 if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
-                    return false;
+                    return Alias::None;
                 }
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
@@ -400,10 +648,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                             == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
                 });
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
-                    return false;
+                    return Alias::None;
                 }
                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
+                    return Alias::None;
                 };
                 crate::host::name(&buffer, || {
                     format!(
@@ -431,6 +679,45 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
+    let queued = HELD_ALIASES.with_borrow_mut(|held| {
+        let pending = held.as_mut()?;
+        if pending.items.iter().any(|it| it.placed == placed) {
+            return Some(Alias::Deferred);
+        }
+        let first = list.first_use(placed as usize);
+        let source_before = if let Some(s) = pending.sources.iter().find(|s| s.source == source) {
+            s.before
+        } else {
+            let trans = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+                (before, crate::host::legal_state(texture, COPY_SOURCE))
+            });
+            let (before, copy_state) = match trans {
+                Some((b, s)) => (Some(b), s),
+                None => (None, COPY_SOURCE),
+            };
+            pending.sources.push(PendingSource {
+                source,
+                from: from.clone(),
+                before,
+                copy_state,
+            });
+            before
+        };
+        if !first && source_before.is_none() {
+            return Some(Alias::Copied);
+        }
+        pending.items.push(PendingAlias {
+            placed,
+            to: to.clone(),
+            from: from.clone(),
+            through: through.clone(),
+            final_state,
+        });
+        Some(Alias::Deferred)
+    });
+    if let Some(outcome) = queued {
+        return outcome;
+    }
     let first = list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
@@ -447,7 +734,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         before
     });
     if !first && before.is_none() {
-        return true;
+        return Alias::Copied;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -500,7 +787,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     {
         crate::list::ensure_state(list, source, before);
     }
-    true
+    Alias::Copied
 }
 
 /// Whether a texture refresh can proceed while the runtime remaps title

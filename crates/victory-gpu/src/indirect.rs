@@ -29,15 +29,11 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #ifdef BATCH
-// Clamps of one source, count buffer, kind and stride batched (mode 9):
+// Clamps of one source, count buffer, destination and ledger batched (mode 9):
 // one dispatch, a job per row of groups (`jobs`, 32 bytes each: arguments'
 // offset, records, has_count, count's offset, destination offset, ledger
-// entry offset), into one destination buffer and one ledger.
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), SRV(t2), UAV(u0), UAV(u1)"
-cbuffer Run : register(b0) {
-    uint kind;
-    uint stride;
-};
+// entry offset, kind, stride), into one destination buffer and one ledger.
+#define RS "SRV(t0), SRV(t1), SRV(t2), UAV(u0), UAV(u1)"
 ByteAddressBuffer jobs : register(t2);
 #else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -81,13 +77,15 @@ static const uint FLAT_MOST = 32768u;
 void main(uint3 id : SV_DispatchThreadID) {
 #ifdef BATCH
     uint4 job = jobs.Load4(id.y * 32);
-    uint2 job_at = jobs.Load2(id.y * 32 + 16);
+    uint4 job_at = jobs.Load4(id.y * 32 + 16);
     uint args_offset = job.x;
     uint records = job.y;
     uint has_count = job.z;
     uint count_offset = job.w;
     uint dst_base = job_at.x;
     uint entry = job_at.y;
+    uint kind = job_at.z;
+    uint stride = job_at.w;
 #else
     uint dst_base = 0;
     uint entry = 0;
@@ -366,12 +364,105 @@ struct Clamp {
 const BATCH_MOST: usize = 4096;
 
 /// Hoisted clamps waiting to be recorded as one dispatch (mode 9): what
-/// they share (source, count buffer or 0, kind, stride, destination and
-/// ledger addresses), a row per clamp, and the most records of one.
+/// they share (source, destination and ledger addresses; optional count
+/// buffer), a row per clamp, and the most records of one.
 pub(crate) struct Batch {
-    key: (u64, u64, u32, u32, u64, u64),
+    base: (u64, u64, u64),
+    count_gpu: u64,
+    legacy_ks: Option<(u32, u32)>,
     jobs: Vec<[u32; 8]>,
     most: u32,
+}
+
+/// `[batched_jobs, batched_dispatches, unbatched_clamps]`.
+static CLAMP_MERGE_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Reads and clears the hoisted-clamp batching counters for the periodic log.
+pub(crate) fn take_clamp_merge_stats() -> [u64; 3] {
+    [0, 1, 2].map(|i| CLAMP_MERGE_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `VICTORY_CLAMP_MERGE=1`: in hoisted mode 9, merges all clamps of a list
+/// that share `(src, dst, ledger)` and compatible count buffer across
+/// interleaved draws, kinds and strides into one dispatch per buffer group,
+/// flushed together at `clamp_end` with a single pipeline bind and scratch
+/// allocation. Off (the default): flushes whenever consecutive clamps differ.
+/// Live (`crate::live`).
+pub(crate) fn clamp_merge() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_CLAMP_MERGE", |v, first| {
+        let on = v.is_some_and(|v| v.trim() == "1");
+        if first {
+            tracing::info!(
+                on,
+                "hoisted clamps merged per list across kinds/strides/interleaving (VICTORY_CLAMP_MERGE)"
+            );
+        }
+        u64::from(on)
+    }) == 1
+}
+
+/// Inserts a clamp job into `pending` under `merge` (list-wide grouping) or
+/// legacy consecutive grouping, returning any batch that must be flushed now.
+fn push_batch_job(
+    pending: &mut Vec<Batch>,
+    base: (u64, u64, u64),
+    count_gpu: u64,
+    ks: (u32, u32),
+    job: [u32; 8],
+    records: u32,
+    merge: bool,
+) -> Vec<Batch> {
+    let mut to_flush = Vec::new();
+    if merge {
+        if let Some(pos) = pending.iter().position(|b| {
+            b.base == base
+                && b.jobs.len() < BATCH_MOST
+                && (b.count_gpu == 0 || count_gpu == 0 || b.count_gpu == count_gpu)
+        }) {
+            let b = &mut pending[pos];
+            if b.count_gpu == 0 && count_gpu != 0 {
+                b.count_gpu = count_gpu;
+            }
+            b.jobs.push(job);
+            b.most = b.most.max(records);
+            if b.jobs.len() >= BATCH_MOST {
+                to_flush.push(pending.swap_remove(pos));
+            }
+        } else {
+            pending.push(Batch {
+                base,
+                count_gpu,
+                legacy_ks: None,
+                jobs: vec![job],
+                most: records,
+            });
+        }
+    } else {
+        let same = pending.last().is_some_and(|b| {
+            b.base == base
+                && b.count_gpu == count_gpu
+                && b.legacy_ks == Some(ks)
+                && b.jobs.len() < BATCH_MOST
+        });
+        if !same && !pending.is_empty() {
+            to_flush.append(pending);
+        }
+        if let Some(b) = pending.last_mut() {
+            b.jobs.push(job);
+            b.most = b.most.max(records);
+        } else {
+            pending.push(Batch {
+                base,
+                count_gpu,
+                legacy_ks: Some(ks),
+                jobs: vec![job],
+                most: records,
+            });
+        }
+    }
+    to_flush
 }
 
 fn batch_pipeline() -> Option<&'static Clamp> {
@@ -390,49 +481,62 @@ fn batch_pipeline() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// Records `batch`, if any, in `clamps` as one dispatch.
-fn flush(clamps: &HostList, c: &Clamp, batch: Option<Batch>) {
-    let Some(b) = batch else {
+/// Records `batches`, if any, in `clamps`, binding the batch pipeline once
+/// and sharing a single scratch allocation for all job tables.
+fn flush_batches(clamps: &HostList, c: &Clamp, batches: Vec<Batch>) {
+    if batches.is_empty() {
+        return;
+    }
+    let total_jobs: usize = batches.iter().map(|b| b.jobs.len()).sum();
+    if total_jobs == 0 {
+        return;
+    }
+    let total_bytes = total_jobs * 32;
+    let Some((jobs_gpu, data)) = clamps.scratch(total_bytes as u64) else {
+        tracing::warn!(jobs = total_jobs, "no room for a batch of clamps: their draws run nothing");
         return;
     };
-    let bytes = b.jobs.len() * 32;
-    let Some((jobs_gpu, data)) = clamps.scratch(bytes as u64) else {
-        tracing::warn!(jobs = b.jobs.len(), "no room for a batch of clamps: their draws run nothing");
-        return;
-    };
-    // SAFETY: `bytes` of the list's mapped upload memory, ours until it runs.
-    unsafe { std::ptr::copy_nonoverlapping(b.jobs.as_ptr().cast::<u8>(), data, bytes) };
-    let (src, count, kind, stride, dst, ledger) = b.key;
-    let constants = [kind, stride];
     let l = &clamps.list;
     // Another pipeline: the next clamp binds its own again.
     clamps.clamp_rebind();
     // SAFETY: an open list; our root signature and pipeline; the source,
     // count, destination and ledger buffers the clamps named (live while
-    // the list is), and the jobs just written.
+    // the list is), and the jobs written into the list's mapped upload memory.
     unsafe {
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-        l.SetComputeRootShaderResourceView(1, src);
-        l.SetComputeRootShaderResourceView(2, if count == 0 { src } else { count });
-        l.SetComputeRootShaderResourceView(3, jobs_gpu);
-        l.SetComputeRootUnorderedAccessView(4, dst);
-        l.SetComputeRootUnorderedAccessView(5, ledger);
-        l.Dispatch(b.most.div_ceil(64), b.jobs.len() as u32, 1);
-    }
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        tracing::info!(jobs = b.jobs.len(), most = b.most, "hoisted clamps batched into one dispatch");
+        let mut offset = 0usize;
+        for b in &batches {
+            if b.jobs.is_empty() {
+                continue;
+            }
+            let bytes = b.jobs.len() * 32;
+            std::ptr::copy_nonoverlapping(b.jobs.as_ptr().cast::<u8>(), data.add(offset), bytes);
+            let (src, dst, ledger) = b.base;
+            let count = b.count_gpu;
+            l.SetComputeRootShaderResourceView(0, src);
+            l.SetComputeRootShaderResourceView(1, if count == 0 { src } else { count });
+            l.SetComputeRootShaderResourceView(2, jobs_gpu + offset as u64);
+            l.SetComputeRootUnorderedAccessView(3, dst);
+            l.SetComputeRootUnorderedAccessView(4, ledger);
+            l.Dispatch(b.most.div_ceil(64), b.jobs.len() as u32, 1);
+            offset += bytes;
+            CLAMP_MERGE_STATS[0].fetch_add(b.jobs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            CLAMP_MERGE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                tracing::info!(jobs = b.jobs.len(), most = b.most, "hoisted clamps batched into one dispatch");
+            }
+        }
     }
 }
 
 /// Records the clamps still batched in `clamps` (before the list's clamps
 /// end).
 pub(crate) fn flush_batch(clamps: &HostList) {
-    let pending = clamps.clamp_batch().take();
+    let pending = std::mem::take(&mut *clamps.clamp_batch());
     if let Some(c) = batch_pipeline() {
-        flush(clamps, c, pending);
+        flush_batches(clamps, c, pending);
     }
 }
 
@@ -1025,34 +1129,37 @@ pub(crate) fn bound_before(
         Some((dst, head)) => (dst.clone(), *head),
         None => clamps.clamp_room(bytes)?,
     };
-    // Mode 9: batched with the clamps before it, when the offsets fit.
+    // Mode 9: batched with the clamps before it, when the offsets fit
+    // (or across the whole list with `VICTORY_CLAMP_MERGE=1`).
+    let merge = clamp_merge();
     if hoist_mode() == 9
         && let Some((ledger, i)) = &entry
-        && src_gpu == src_base
-        && (has_count == 0 || count_gpu == count_base.unwrap_or(0))
+        && (merge || (src_gpu == src_base && (has_count == 0 || count_gpu == count_base.unwrap_or(0))))
         && let Some(pso) = batch_pipeline()
     {
         // SAFETY: live buffers.
         let (dst_base, ledger_base) = unsafe { (dst.GetGPUVirtualAddress(), ledger.GetGPUVirtualAddress()) };
-        let key = (src_gpu, if has_count == 0 { 0 } else { count_gpu }, kind, stride, dst_base, ledger_base);
+        let base = (src_gpu, dst_base, ledger_base);
+        let job_count_gpu = if has_count == 0 { 0 } else { count_gpu };
         // Charged to the ledger entry, its active records noted there.
-        let job = [args_offset, records, has_count | LEDGER_BIT, count_offset, at as u32, i * 16, 0, 0];
-        let mut pending = clamps.clamp_batch();
-        if pending.as_ref().is_some_and(|b| b.key != key || b.jobs.len() >= BATCH_MOST) {
-            flush(clamps, pso, pending.take());
+        let job = [args_offset, records, has_count | LEDGER_BIT, count_offset, at as u32, i * 16, kind, stride];
+        let to_flush = {
+            let mut pending = clamps.clamp_batch();
+            push_batch_job(&mut pending, base, job_count_gpu, (kind, stride), job, records, merge)
+        };
+        if !to_flush.is_empty() {
+            flush_batches(clamps, pso, to_flush);
         }
-        let b = pending.get_or_insert_with(|| Batch { key, jobs: Vec::new(), most: 0 });
-        b.jobs.push(job);
-        b.most = b.most.max(records);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
         return Some((dst.clone(), at, Some((ledger.clone(), u64::from(*i) * 16 + 8))));
     }
     // Anything batched goes first: the clamps charge in order.
     if let Some(pso) = batch_pipeline() {
-        let pending = clamps.clamp_batch().take();
-        flush(clamps, pso, pending);
+        let pending = std::mem::take(&mut *clamps.clamp_batch());
+        flush_batches(clamps, pso, pending);
     }
+    CLAMP_MERGE_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: live buffers.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let (budget, has_count, ran) = match &entry {
@@ -2095,5 +2202,30 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn clamp_merge_groups_interleaved_kinds_strides_and_counts() {
+        let mut pending = Vec::new();
+        // Interleaved src A (kind 0, stride 16, no count), src B (kind 1, stride 20, count C2),
+        // then src A again (kind 1, stride 20, count C1), then src A (kind 3, stride 12, no count).
+        let f1 = push_batch_job(&mut pending, (0x1000, 0xD000, 0xE000), 0, (0, 16), [0, 1, 16, 0, 0, 0, 0, 16], 1, true);
+        let f2 = push_batch_job(&mut pending, (0x2000, 0xD000, 0xE000), 0xC2, (1, 20), [0, 4, 17, 0, 16, 16, 1, 20], 4, true);
+        let f3 = push_batch_job(&mut pending, (0x1000, 0xD000, 0xE000), 0xC1, (1, 20), [32, 2, 17, 4, 96, 32, 1, 20], 2, true);
+        let f4 = push_batch_job(&mut pending, (0x1000, 0xD000, 0xE000), 0, (3, 12), [64, 8, 16, 0, 144, 48, 3, 12], 8, true);
+        assert!(f1.is_empty() && f2.is_empty() && f3.is_empty() && f4.is_empty());
+        assert_eq!(pending.len(), 2, "all 3 src A clamps (different kinds/strides/counts) merge into 1 batch");
+        assert_eq!(pending[0].jobs.len(), 3);
+        assert_eq!(pending[0].count_gpu, 0xC1, "count_gpu=0 upgraded to 0xC1");
+        assert_eq!(pending[0].most, 8);
+        assert_eq!(pending[1].jobs.len(), 1);
+        assert_eq!(pending[1].count_gpu, 0xC2);
+
+        // Legacy mode (merge=false) flushes on every alternation.
+        let mut legacy = Vec::new();
+        assert!(push_batch_job(&mut legacy, (0x1000, 0xD000, 0xE000), 0, (0, 16), [0; 8], 1, false).is_empty());
+        let flushed = push_batch_job(&mut legacy, (0x1000, 0xD000, 0xE000), 0, (1, 20), [0; 8], 2, false);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(legacy.len(), 1);
     }
 }

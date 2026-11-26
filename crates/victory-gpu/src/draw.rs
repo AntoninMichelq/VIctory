@@ -1162,6 +1162,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let _aliases = crate::texture::HoldAliases::new(list);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1972,6 +1973,7 @@ impl State {
         // The barriers leaving uploaded textures readable: together at the
         // end (`VICTORY_UPLOAD_BARRIERS`).
         let _held = crate::list::HoldReads::new(list);
+        let _aliases = crate::texture::HoldAliases::new(list);
         // Host copies are made small only where the loop says so, and
         // never past it (`resource::shrinking`).
         struct Unshrink;
@@ -3631,12 +3633,23 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
             if drawn {
                 crate::resource::note_drawn(*resource as This);
             }
+            // The depth target the draw only tests is read in both ways at
+            // once: both read states, which its preparation asks for too.
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == *resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
+            let alias = crate::resource::alias_of(*resource as This)
+                .map_or(crate::texture::Alias::None, |source| {
+                    crate::texture::alias(list, *resource as This, source, state)
+                });
+            if matches!(alias, crate::texture::Alias::None)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
@@ -3647,16 +3660,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
             if drawn {
                 crate::quality::texture_read(*resource as This);
             }
-            // The depth target the draw only tests is read in both ways at
-            // once: both read states, which its preparation asks for too.
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
-            crate::list::ensure_state(list, *resource as This, state);
+            if !matches!(alias, crate::texture::Alias::Deferred) {
+                crate::texture::flush_aliases_if(list, *resource as This);
+                crate::list::ensure_state(list, *resource as This, state);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -3674,6 +3681,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
+            crate::texture::flush_aliases_if(list, *resource as This);
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
