@@ -135,6 +135,13 @@ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 unsafe impl Send for Retired {}
 
 /// Milliseconds since the first call.
+/// The milliseconds since the start with their fraction, for the timeline
+/// (`crate::timeline`).
+pub(crate) fn now_ms_f64() -> f64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
@@ -2877,7 +2884,11 @@ fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+///
+/// If so, the submission after whose landing the stale ranges are no
+/// flight's to write any more ([`settle_partial`]): `u64::MAX` when that
+/// cannot be told (every flight must land).
+fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -2900,9 +2911,66 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        if !settle_partial() {
+            return spans
+                .iter()
+                .any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left))
+                .then_some(u64::MAX);
+        }
+        // Every span is looked at (and merged where it can be), and the
+        // newest flight writing one that could not be is what to wait for.
+        let mut until = None;
+        for (shadow, from, to) in &spans {
+            if shadow.merge_under_writes(*from, *to - *from, &mut runs_left) {
+                let after = shadow.landed_free_after(*from, *to - *from);
+                until = Some(until.unwrap_or(0).max(after));
+            }
+        }
+        return until;
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from)).then_some(u64::MAX)
+}
+
+/// `VICTORY_SETTLE_PARTIAL=1` (off by default; with `VICTORY_RELAY` and
+/// `VICTORY_LATE_WAIT=2` or more): when the title wrote memory that flights'
+/// shaders are writing and a submission refreshes it, the submission waits
+/// only for the flights that write that memory to land, not for every
+/// flight in the air: the newest of them lands, and those before it (the
+/// relay lands in order). Every such wait was a drain of the whole line,
+/// the card's work and every copy-back with it: 58-79 ms a frame waiting
+/// in run cumul4 ("title memory changed under shader writes"), so that
+/// preparing and copying back ran one after the other on every frame.
+fn settle_partial() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_SETTLE_PARTIAL").is_some_and(|v| v == "1"))
+}
+
+/// Before a submission, with [`settle_partial`]: waits until the flights up
+/// to submission `until` have landed (all of them if `u64::MAX`), and only
+/// for that, unless the copies the flights alias were written (`aliased`,
+/// then all of them as before).
+fn settle_stale(host: &Host, submitted: &mut u64, until: u64, aliased: bool) {
+    if aliased || until == u64::MAX {
+        host.settle(submitted, WHY_STALE);
+        return;
+    }
+    crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
+    crate::timeline::mark("partial-until", until);
+    relay_wait(WHY_STALE, |_| FINISHED.load(Ordering::Acquire) >= until);
+}
+
+/// Counts which of the two checks before a submission settles flights
+/// (`VICTORY_COPY_STATS`): title memory stale under their shader writes,
+/// or written by an earlier list of copies the flights alias. Returns
+/// whether either did.
+fn settle_cause(stale: bool, aliased: bool) -> bool {
+    if stale {
+        crate::copytop::settle_cause(crate::copytop::S_STALE);
+    }
+    if aliased {
+        crate::copytop::settle_cause(crate::copytop::S_ALIASED);
+    }
+    stale | aliased
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -3153,10 +3221,25 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    const NAMES: [&str; 11] = [
+        "settle",
+        "settle",
+        "settle:sync",
+        "settle:card-done",
+        "settle:value",
+        "settle:stale",
+        "settle:read",
+        "settle:run",
+        "settle:most",
+        "settle:writes",
+        "settle:fence",
+    ];
+    crate::timeline::mark(NAMES.get(why).copied().unwrap_or("settle"), 0);
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
+    crate::timeline::mark("settled", why as u64);
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
@@ -4496,6 +4579,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        crate::timeline::mark("land", 0);
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -4570,6 +4654,7 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
+        crate::timeline::mark("landed", last);
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
@@ -5157,6 +5242,7 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        crate::timeline::mark("prep", this_submission);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -5191,17 +5277,25 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
+            let (until, aliased) = if behind {
+                (stale_under_flights_until(runs), aliased_under_flights(runs, behind))
+            } else {
+                (None, false)
+            };
+            if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             } else if !behind {
                 aliased_under_flights(runs, false);
             }
-        } else if behind && (stale_under_flights(runs) | aliased_under_flights(runs, behind)) {
+        } else if let Some((until, aliased)) =
+            behind.then(|| (stale_under_flights_until(runs), aliased_under_flights(runs, behind)))
+            && settle_cause(until.is_some(), aliased)
+        {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
             settled += settling.elapsed();
         } else if !behind {
             aliased_under_flights(runs, false);
@@ -5452,6 +5546,9 @@ impl Host {
                 }
                 *submitted
             };
+            // (`card_sent` and the signal's check are in the queue's branch
+            // above: async compute.)
+            crate::timeline::mark("sent", this_submission);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -6917,6 +7014,13 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        let all = crate::copytop::start();
+        self.run_deferred_steps(batch);
+        crate::copytop::time(crate::copytop::T_ALL, all);
+    }
+
+    /// [`HostList::run_deferred`]'s steps.
+    fn run_deferred_steps(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -6930,7 +7034,9 @@ impl HostList {
                     }
                     batch.title_written();
                     let timed = crate::cpuframe::start();
+                    let copying = crate::copytop::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::copytop::time(crate::copytop::T_TITLE, copying);
                     crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -6943,7 +7049,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     let timed = crate::cpuframe::start();
+                    let filling = crate::copytop::start();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::copytop::time(crate::copytop::T_FILL, filling);
                     crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
                     len
                 }
@@ -6960,7 +7068,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let running = crate::copytop::start();
                     work();
+                    crate::copytop::time(crate::copytop::T_RUN, running);
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -6982,7 +7092,9 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    let snapping = crate::copytop::start();
                     shadow.writing(*address, *len);
+                    crate::copytop::time(crate::copytop::T_SNAP, snapping);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -6995,7 +7107,9 @@ impl HostList {
                         if wide_textures() {
                             batch.due_textures.push(staging.clone());
                         } else {
+                            let refreshing = crate::copytop::start();
                             staging.refresh();
+                            crate::copytop::time(crate::copytop::T_TEXTURE, refreshing);
                         }
                     }
                     continue;
@@ -7148,6 +7262,13 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let flushing = crate::copytop::start();
+        self.flush_now();
+        crate::copytop::time(crate::copytop::T_FLUSH, flushing);
+    }
+
+    /// [`Batch::flush`], untimed.
+    fn flush_now(&mut self) {
         // The textures, several at a time ([`wide_textures`]): a refresh
         // reads the texture's title memory and writes its own staging
         // buffer, under its own lock. The time counted is the time it took,
@@ -7179,6 +7300,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             crate::cpuframe::done(crate::cpuframe::Work::AskAhead, crate::cpuframe::stats().then_some(started), 0);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::copytop::time(crate::copytop::T_AHEAD, crate::copytop::on().then_some(started));
         }
         let split = crate::cpuframe::refresh_split();
         if let Some(n) = split.filter(|_| wide_refresh()) {

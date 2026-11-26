@@ -99,6 +99,73 @@ pub(crate) fn merged(started: Option<std::time::Instant>) {
     }
 }
 
+/// Where the submitting thread's preparing goes, each counted alone (not
+/// inside another), microseconds since the last table: see [`TIMES`].
+static TIME_US: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Names of [`TIME_US`]'s counts, for the line.
+const TIMES: [&str; 10] = [
+    "all deferred steps (wall)",
+    "flushes of refreshes (wall)",
+    "write-watch asking ahead",
+    "refreshes, write-watch asking (summed over threads)",
+    "refreshes, copying stale pages (summed over threads)",
+    "title-to-title copies",
+    "fills of upload memory",
+    "snapshots of shader-written ranges",
+    "texture refreshes on the submitting thread",
+    "deferred runs of ours",
+];
+pub(crate) const T_ALL: usize = 0;
+pub(crate) const T_FLUSH: usize = 1;
+pub(crate) const T_AHEAD: usize = 2;
+pub(crate) const T_ASK: usize = 3;
+pub(crate) const T_COPY: usize = 4;
+pub(crate) const T_TITLE: usize = 5;
+pub(crate) const T_FILL: usize = 6;
+pub(crate) const T_SNAP: usize = 7;
+pub(crate) const T_TEXTURE: usize = 8;
+pub(crate) const T_RUN: usize = 9;
+
+/// A start for [`time`], if the counts are on.
+pub(crate) fn start() -> Option<std::time::Instant> {
+    on().then(std::time::Instant::now)
+}
+
+/// Counts the time since `started` (from [`start`]) as `kind`.
+pub(crate) fn time(kind: usize, started: Option<std::time::Instant>) {
+    if let (Some(t), Some(c)) = (started, TIME_US.get(kind)) {
+        c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Why flights were settled before a submission (title memory stale under
+/// their shader writes: `stale_under_flights`, `merge_under_writes`):
+/// counts since the last table, by [`SETTLE_NAMES`].
+static SETTLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const SETTLE_NAMES: [&str; 7] = [
+    "title memory stale under shader writes",
+    "written by an earlier list of copies the flights alias",
+    "of the first: a copy of guarded (not write-watched) memory",
+    "the write watch gave no answer",
+    "more than 512 changed runs for the card",
+    "no snapshot to merge into",
+    "waits for some flights only (VICTORY_SETTLE_PARTIAL=1)",
+];
+pub(crate) const S_STALE: usize = 0;
+pub(crate) const S_ALIASED: usize = 1;
+pub(crate) const S_UNWATCHED: usize = 2;
+pub(crate) const S_NO_ANSWER: usize = 3;
+pub(crate) const S_RUNS: usize = 4;
+pub(crate) const S_NO_SNAPSHOT: usize = 5;
+pub(crate) const S_PARTIAL: usize = 6;
+
+/// A settle before a submission had cause `cause` ([`SETTLE_NAMES`]).
+pub(crate) fn settle_cause(cause: usize) {
+    if let Some(c) = SETTLES.get(cause) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Frames since the last table.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -156,6 +223,18 @@ pub(crate) fn line() {
         host.1,
         all.len().min(20)
     );
+    let times: Vec<String> = TIMES
+        .iter()
+        .zip(&TIME_US)
+        .map(|(name, us)| format!("{name} {:.1} ms", us.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames))
+        .collect();
+    tracing::info!("copy stats, preparing per frame (VICTORY_COPY_STATS=1): {}", times.join(", "));
+    let settles: Vec<String> = SETTLE_NAMES
+        .iter()
+        .zip(&SETTLES)
+        .map(|(name, n)| format!("{name} {:.1}", n.swap(0, Ordering::Relaxed) as f64 / frames))
+        .collect();
+    tracing::info!("copy stats, settles before a submission per frame, by cause: {}", settles.join(", "));
     for (rank, (id, r)) in all.iter().take(20).enumerate() {
         let per = |k: usize| r.times[k] as f64 / frames;
         tracing::info!(

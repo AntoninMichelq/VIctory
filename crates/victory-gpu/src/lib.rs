@@ -65,6 +65,8 @@ mod copytop;
 #[cfg(windows)]
 mod cpuframe;
 #[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
