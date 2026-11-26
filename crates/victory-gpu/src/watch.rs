@@ -728,23 +728,81 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
+/// `VICTORY_COALESCE_UNGUARD=1` (off by default): coalesces contiguous 64 KiB
+/// blocks in [`open`] into single `VirtualProtect` calls to reduce TLB shootdowns.
+fn coalesce_unguard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COALESCE_UNGUARD").is_some_and(|v| v == "1"))
+}
+
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let unguard_one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    };
+    if !coalesce_unguard() || blocks.len() == 1 {
+        for &block in &blocks {
+            unguard_one(block);
+        }
+        return true;
     }
-    !blocks.is_empty()
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut end_block = from + 1;
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == end_block {
+            end_block += 1;
+            j += 1;
+        }
+        if end_block - from == 1 {
+            unguard_one(from);
+        } else {
+            let mut old = 0;
+            // SAFETY: contiguous blocks we made read-only.
+            let ok = unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (end_block - from) * BLOCK,
+                    PAGE_READWRITE,
+                    &mut old,
+                ) != 0
+            };
+            if !(ok && matches!(old, PAGE_READONLY | PAGE_READWRITE)) {
+                if ok {
+                    unsafe {
+                        VirtualProtect(
+                            (from * BLOCK) as *const _,
+                            (end_block - from) * BLOCK,
+                            old,
+                            &mut old,
+                        );
+                    }
+                }
+                for block in from..end_block {
+                    unguard_one(block);
+                }
+            }
+        }
+        i = j;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

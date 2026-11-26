@@ -324,6 +324,119 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// What a compute pipeline does only for post-geometry ray-tracing passes
+/// ([`for_rays`]). Skinning passes (`CSComputeSkinning*`, `CSGenerateHairVB`,
+/// `CS_PedStandardSkinning*`, etc.) are NEVER matched here.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RayOnly {
+    No,
+    Resolve,
+    Activate,
+    Trace,
+}
+
+/// Identifies post-geometry compute passes that only serve BVH ray-tracing:
+/// - `CS_RaytracingResolve*`: shades ray hits (~1,000 programs).
+/// - `CS_ScreenProbes_ActivateRays*`: activates screen-probe rays.
+/// - `CS_ScreenProbes_TraceRays*_BVH*` and `CS_RaytraceVBuffer*` (excluding
+///   `Voxels` and `Fallback`): trace against BVH structures.
+///
+/// Skinning passes (`CSComputeSkinning*`, `CSGenerateHairVB`, etc.) are
+/// intentionally NEVER skipped.
+#[cfg(windows)]
+fn for_rays(bytes: &[u8]) -> RayOnly {
+    let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    if has(b"CS_RaytracingResolve") {
+        RayOnly::Resolve
+    } else if has(b"CS_ScreenProbes_ActivateRays") {
+        RayOnly::Activate
+    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH"))
+        || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels"))
+    {
+        RayOnly::Trace
+    } else {
+        RayOnly::No
+    }
+}
+
+/// `VICTORY_RT_SKIP=1` (off by default): skips post-geometry RT compute
+/// dispatches (never skinning!) while `VICTORY_BVH_BUILDER` is off.
+/// Per-kind opt-outs: `VICTORY_RT_RESOLVE=1`, `VICTORY_ACTIVATE_RAYS=1`,
+/// `VICTORY_RT_TRACE=1`.
+#[cfg(windows)]
+pub(crate) fn skips_rt_only(this: This) -> bool {
+    fn skips(keep_switch: &str) -> bool {
+        std::env::var_os("VICTORY_RT_SKIP").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os(keep_switch).is_none_or(|v| v != "1")
+    }
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    match pipeline(this).rt_only {
+        RayOnly::No => false,
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| skips("VICTORY_RT_RESOLVE")),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| skips("VICTORY_ACTIVATE_RAYS")),
+        RayOnly::Trace => *TRACE.get_or_init(|| skips("VICTORY_RT_TRACE")),
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn ray_programs_are_known_by_name() {
+    // Skinning passes must NEVER be skipped.
+    assert_eq!(
+        for_rays(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."),
+        RayOnly::No
+    );
+    assert_eq!(
+        for_rays(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."),
+        RayOnly::No
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."),
+        RayOnly::No
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_PosOnlyLodSkinning_0_12345678_Wrapped\0.."),
+        RayOnly::No
+    );
+    assert_eq!(for_rays(b"computeclothSkinning"), RayOnly::No);
+    // Post-geometry BVH ray-tracing passes are matched; Voxels/Fallback stay on.
+    assert_eq!(
+        for_rays(b"..\0CS_RaytracingResolve_Opaque_12345678_Wrapped\0.."),
+        RayOnly::Resolve
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."),
+        RayOnly::Activate
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."),
+        RayOnly::Trace
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."),
+        RayOnly::No
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."),
+        RayOnly::No
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."),
+        RayOnly::Trace
+    );
+    assert_eq!(
+        for_rays(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."),
+        RayOnly::No
+    );
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
 /// check for a first run of the whole builder: a stage that stores where
@@ -431,6 +544,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Post-geometry BVH ray-tracing pass ([`for_rays`], never skinning).
+    #[cfg(windows)]
+    rt_only: RayOnly,
     /// A graphics pipeline of method 0x1c8 ([`create_from_words`]): its
     /// host pipelines are made per set of targets drawn into, not `host`.
     #[cfg(windows)]
@@ -818,6 +934,13 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        rt_only: shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .map(|s| for_rays(&s.container))
+            .find(|k| *k != RayOnly::No)
+            .unwrap_or(RayOnly::No),
         #[cfg(windows)]
         precompiled,
         shaders,

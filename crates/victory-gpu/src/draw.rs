@@ -2393,6 +2393,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        if crate::pipeline::skips_rt_only(self.pipeline as This) {
+            once!(
+                "post-geometry ray-tracing passes are left out (VICTORY_RT_SKIP=1, no skinning skipped; VICTORY_RT_RESOLVE/TRACE/ACTIVATE_RAYS=1 override)"
+            );
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3428,7 +3434,9 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::skips_rt_only(self.pipeline as This)
+            || crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs()
+        {
             return false;
         }
         const DRAW: u32 = 0;

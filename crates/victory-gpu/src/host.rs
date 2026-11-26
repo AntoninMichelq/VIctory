@@ -8835,16 +8835,22 @@ fn copy_recovery() {
 /// [`read`] into memory of ours (`dst` is never title memory): with
 /// [`fast_title_copy`], without the kernel when the ranges do not overlap.
 fn read_ours(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if len > 0 && fast_title_copy() {
+    if len > 0 {
         let (s, d) = (src as usize, dst as usize);
         let apart = s.checked_add(len).is_some_and(|e| e <= d) || d.checked_add(len).is_some_and(|e| e <= s);
         if apart {
-            // SAFETY: `dst` is `len` bytes of our writable memory (the
-            // callers' contract); a fault reading `src` is taken by
-            // `install_copy_recovery`'s handler, which makes the copy
-            // return 0.
-            return unsafe { fast_copy(dst, src, len) } != 0;
+            // SAFETY: `dst` is `len` bytes of our writable memory, disjoint from `src`.
+            if unsafe { crate::plaincopy::copy(src, dst, len) } {
+                return true;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if fast_title_copy() {
+                // SAFETY: `dst` is `len` bytes of our writable memory (the
+                // callers' contract); a fault reading `src` is taken by
+                // `install_copy_recovery`'s handler, which makes the copy
+                // return 0.
+                return unsafe { fast_copy(dst, src, len) } != 0;
+            }
         }
     }
     read(src, dst, len)

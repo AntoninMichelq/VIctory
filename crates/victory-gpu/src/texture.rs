@@ -247,11 +247,38 @@ fn maker() {
     }
 }
 
+/// `VICTORY_TEX_XXH3=1` (off by default): uses xxh3-128 instead of blake3 for
+/// in-memory texture change detection (never persisted across runs).
+fn tex_xxh3() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEX_XXH3").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("texture change hashing uses xxh3-128 (VICTORY_TEX_XXH3=1)");
+        }
+        on
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TexHash {
+    Blake3(blake3::Hash),
+    Xxh3(u128),
+}
+
+fn hash_texture_bytes(bytes: &[u8]) -> TexHash {
+    if tex_xxh3() {
+        TexHash::Xxh3(xxhash_rust::xxh3::xxh3_128(bytes))
+    } else {
+        TexHash::Blake3(blake3::hash(bytes))
+    }
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<TexHash>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -266,7 +293,7 @@ struct Last {
 impl Last {
     /// Takes `hash` as the hash of the texture's memory; true when it
     /// differs from the last one, and then the frame is noted.
-    fn rehash(&mut self, hash: blake3::Hash) -> bool {
+    fn rehash(&mut self, hash: TexHash) -> bool {
         if self.hash == Some(hash) {
             return false;
         }
@@ -1401,7 +1428,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = hash_texture_bytes(read);
                 if !last.rehash(hash) {
                     return false;
                 }
@@ -1420,7 +1447,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = hash_texture_bytes(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if !last.rehash(hash) {
@@ -1435,7 +1462,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = hash_texture_bytes(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if !last.rehash(hash) {
@@ -1461,7 +1488,7 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            if last.rehash(blake3::hash(read)) {
+            if last.rehash(hash_texture_bytes(read)) {
                 self.detile(read);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
