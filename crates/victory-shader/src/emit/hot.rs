@@ -31,6 +31,12 @@
 //!   for 16 dwords, not 16. Each read was a vector load the next one
 //!   waited for (`s_waitcnt vmcnt(0)`); the console makes one scalar load.
 //!   The same dwords, whatever the offset's alignment; any program.
+//! - 8: compute and mesh programs get every clean-up pass of
+//!   `bitcode::opt` (dead code, constants, one instruction per value,
+//!   branch facts, loads) whatever `VICTORY_SHADER_OPT` says (the Jouer
+//!   line runs with it at 0). The passes are exact. ScreenProbes
+//!   (`39f0e9ae`, RGA gfx1102): scratch per lane 5,376 -> 3,584 bytes,
+//!   scratch reads 12,430 -> 6,977, instructions 81k -> 72k.
 //!
 //! Part of the translation: the shader cache keys on it (`victory-gpu`'s
 //! does).
@@ -46,8 +52,16 @@ pub const UNIFORM_LOADS: u32 = 1;
 pub const UNIFORM_BRANCHES: u32 = 2;
 /// Constant-buffer dwords at a computed offset read by rows.
 pub const GROUPED_ROWS: u32 = 4;
+/// Every clean-up pass for compute and mesh programs.
+pub const CLEAN_COMPUTE: u32 = 8;
 /// Every bit.
-pub const ALL: u32 = UNIFORM_LOADS | UNIFORM_BRANCHES | GROUPED_ROWS;
+pub const ALL: u32 = UNIFORM_LOADS | UNIFORM_BRANCHES | GROUPED_ROWS | CLEAN_COMPUTE;
+
+/// The clean-up passes bit [`CLEAN_COMPUTE`] adds for a program with
+/// thread groups (`compute`: compute or mesh): every module pass, or none.
+pub(crate) fn module_passes(compute: bool) -> u32 {
+    if compute && hot_shaders() & CLEAN_COMPUTE != 0 { super::super::bitcode::opt::MODULE } else { 0 }
+}
 
 /// `VICTORY_HOT_SHADERS`'s bits (see the module).
 pub fn hot_shaders() -> u32 {
