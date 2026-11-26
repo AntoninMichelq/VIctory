@@ -3253,8 +3253,9 @@ fn alias_on_card() -> bool {
 /// writer's bytes are title memory's.
 fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCopy>>> {
     use std::sync::Arc;
+    use crate::copytop::refused;
     if host.compute_queue.is_some() && runs.iter().any(|l| l.is_compute()) {
-        return None;
+        return refused(0);
     }
     // Copies this submission's own shaders write: their snapshots are taken
     // on the CPU before the prelude's copy would run (review 6, 2.4).
@@ -3272,7 +3273,7 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
         // their bytes are in title memory: they would be missed (review 6,
         // 2.1).
         if line.settling {
-            return None;
+            return refused(1);
         }
         let flights: Vec<(bool, Vec<Declared>)> = line
             .line
@@ -3299,8 +3300,11 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
             if parts.is_empty() {
                 continue;
             }
-            if !reader.plain() || own.contains(&(Arc::as_ptr(reader) as usize)) {
-                return None;
+            if !reader.plain() {
+                return refused(2);
+            }
+            if own.contains(&(Arc::as_ptr(reader) as usize)) {
+                return refused(3);
             }
             let planned_from = copies.len();
             for (on_compute, back) in &flights {
@@ -3316,11 +3320,13 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
                                 continue;
                             }
                             if *on_compute {
-                                return None;
+                                return refused(0);
                             }
                             // Every page of the writer's copy there current.
-                            if writer.current_parts(lo, hi)? != [(lo, hi)] {
-                                return None;
+                            match writer.current_parts(lo, hi) {
+                                None => return refused(4),
+                                Some(parts) if parts != [(lo, hi)] => return refused(5),
+                                Some(_) => {}
                             }
                             copies.push((reader.clone(), writer.clone(), lo, hi));
                         }
@@ -3342,7 +3348,7 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
                 for &(wa, wb) in &written {
                     let (lo, hi) = (wa.max(pf), wb.min(pt));
                     if lo < hi && !joined.iter().any(|&(a, b)| a <= lo && hi <= b) {
-                        return None;
+                        return refused(6);
                     }
                 }
             }
