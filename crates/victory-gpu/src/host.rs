@@ -3412,6 +3412,20 @@ fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCop
         }
         out.push(copies);
     }
+    // All of the plan's copies go to the first list's prelude, with no
+    // barrier between them, and `back_to_common` puts back to COMMON only a
+    // buffer that is a reader alone or a writer alone (review 9, 2): a
+    // buffer both read and written there (COPY_DEST then COPY_SOURCE, or
+    // the other way) would need a transition between the two copies. Rare
+    // (two flights writing A and B, the submission refreshing each from the
+    // other): the plan is refused and the refreshes wait, as without it.
+    {
+        use windows::core::Interface;
+        let all = || out.iter().flatten();
+        if all().any(|(r, ..)| all().any(|(_, w, ..)| w.buffer.as_raw() == r.buffer.as_raw())) {
+            return refused(7);
+        }
+    }
     Some(out)
 }
 

@@ -185,8 +185,8 @@ pub(crate) fn in_air(n: u64, frames: u64) {
 
 /// Why [`crate::host`]'s plan of alias copies on the card was refused,
 /// since the last table, by [`REFUSED_NAMES`].
-static REFUSED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-const REFUSED_NAMES: [&str; 7] = [
+static REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const REFUSED_NAMES: [&str; 8] = [
     "the compute queue",
     "a landing under way",
     "the reader not a plain copy",
@@ -194,6 +194,7 @@ const REFUSED_NAMES: [&str; 7] = [
     "no write-watch asking covers the writer's pages",
     "a writer's page not current",
     "a part written by no flight the line lists",
+    "a buffer both read and written by the plan's copies",
 ];
 
 /// Counts a refusal for reason `why` ([`REFUSED_NAMES`]); `None` to return.
