@@ -3042,14 +3042,58 @@ pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
 /// to submission `until` have landed (all of them if `u64::MAX`), and only
 /// for that, unless the copies the flights alias were written (`aliased`,
 /// then all of them as before).
-fn settle_stale(host: &Host, submitted: &mut u64, until: u64, aliased: bool) {
-    if aliased || until == u64::MAX {
+fn settle_stale(host: &Host, submitted: &mut u64, runs: &[&HostList], until: Option<u64>, aliased: bool) {
+    let alias_partial = aliased && alias_partial();
+    if (aliased && !alias_partial) || until == Some(u64::MAX) {
         host.settle(submitted, WHY_STALE);
         return;
     }
-    crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
-    crate::timeline::mark("partial-until", until);
-    relay_wait(WHY_STALE, |_| FINISHED.load(Ordering::Acquire) >= until);
+    if let Some(until) = until {
+        crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
+        crate::timeline::mark("partial-until", until);
+        relay_wait(WHY_STALE, |_| FINISHED.load(Ordering::Acquire) >= until);
+    }
+    if alias_partial {
+        // Until no flight in the air writes what the refreshes of other
+        // copies of the same title memory read ([`aliased_under_flights`]).
+        let ranges = alias_ranges(runs);
+        crate::copytop::settle_cause(crate::copytop::S_ALIAS_PARTIAL);
+        crate::timeline::mark("alias-partial", ranges.len() as u64);
+        relay_wait(WHY_STALE, |line| ranges.iter().all(|&(from, to)| !touches(&line.written, from, to)));
+    }
+}
+
+/// `VICTORY_ALIAS_PARTIAL=1` (off by default; with the relay; read live):
+/// when a submission refreshes a host copy from title memory that flights'
+/// shaders write through another copy of it ([`aliased_under_flights`]), it
+/// waits until no flight in the air writes those ranges (the flights land
+/// in order, and what is still in the air is known after each landing), not
+/// until every flight has landed. The timeline of run cumul6 (2026-11-26
+/// 03:16): every stale settle was this case, two a frame, ~40 ms each at
+/// the start of a frame, waiting for the whole previous frame and its
+/// copy-back while the card had nothing new; `VICTORY_SETTLE_PARTIAL` never
+/// applied to it.
+fn alias_partial() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_ALIAS_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// The ranges [`aliased_under_flights`] settles for: refreshes of copies no
+/// flight writes, of title memory a flight writes through another copy.
+fn alias_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let flights = line().written.clone();
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step {
+                let (from, to) = (*address, *address + *len);
+                if !shadow.writes_pending() && touches(&flights, from, to) {
+                    out.push((from, to));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Counts which of the two checks before a submission settles flights
@@ -5400,7 +5444,7 @@ impl Host {
             crate::copytop::time(crate::copytop::T_CHECKS, checking);
             if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
-                settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
+                settle_stale(self, &mut submitted, runs, until, aliased);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             } else if !behind {
@@ -5411,7 +5455,7 @@ impl Host {
             && settle_cause(until.is_some(), aliased)
         {
             let settling = std::time::Instant::now();
-            settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
+            settle_stale(self, &mut submitted, runs, until, aliased);
             settled += settling.elapsed();
         } else if !behind {
             aliased_under_flights(runs, false);
