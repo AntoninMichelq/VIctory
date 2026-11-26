@@ -41,30 +41,35 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
 
-/// The floor; `None` if off.
+/// The floor; `None` if off. Live (`crate::live`): tunable at runtime via
+/// `VICTORY_LIVE` (`VICTORY_AMBIENT=off|0|0.2|0.6|...`).
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
-        if set.trim() == "off" {
-            return -1.0;
-        }
-        match set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0) {
-            Some(level) => level,
-            // Not set: only while no rays can run.
+    static LEVEL: crate::live::Switch = crate::live::Switch::new();
+    let bits = LEVEL.get("VICTORY_AMBIENT", |v, _| {
+        let level = match v.map(str::trim) {
+            Some("off") => -1.0f32,
+            Some(s) => match s.parse::<f32>().ok().filter(|l| l.is_finite() && *l >= 0.0) {
+                Some(l) => l,
+                None if crate::pipeline::builder_runs() => -1.0,
+                None => DEFAULT,
+            },
             None if crate::pipeline::builder_runs() => -1.0,
             None => DEFAULT,
-        }
+        };
+        u64::from(level.to_bits())
     });
+    let level = f32::from_bits(bits as u32);
     (level >= 0.0).then_some(level)
 }
 
 /// `VICTORY_AMBIENT_MODE=floor`: what the resolve wrote is raised to the
 /// constant where it is darker, not replaced (Belobug's first form,
-/// 0603123). Default: replaced.
+/// 0603123). Default: replaced. Live (`crate::live`).
 fn floor_only() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_MODE").is_ok_and(|v| v.trim() == "floor"))
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_AMBIENT_MODE", |v, _| {
+        u64::from(v.is_some_and(|v| v.trim() == "floor"))
+    }) == 1
 }
 
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`

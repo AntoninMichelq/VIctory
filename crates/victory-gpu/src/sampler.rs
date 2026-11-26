@@ -52,14 +52,42 @@ pub(crate) fn mip_bias_delta() -> Option<f32> {
     })
 }
 
+/// `VICTORY_MIP_BIAS_SCOPE=aniso`: restricts `VICTORY_MIP_BIAS` to anisotropic
+/// samplers (`D3D12_FILTER_ANISOTROPIC`, `0x55`) so bilinear/trilinear samplers
+/// used by bloom, lens flare, auto-exposure pyramids and reflection cubemaps
+/// keep their original `MipLODBias`. Default (`all`): all mipmapped linear and
+/// anisotropic samplers, as before.
+fn mip_bias_aniso_only() -> bool {
+    static ANISO: OnceLock<bool> = OnceLock::new();
+    *ANISO.get_or_init(|| {
+        let on = std::env::var("VICTORY_MIP_BIAS_SCOPE")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("aniso"));
+        if on {
+            tracing::info!("VICTORY_MIP_BIAS restricted to anisotropic samplers only (VICTORY_MIP_BIAS_SCOPE=aniso)");
+        }
+        on
+    })
+}
+
 /// Pure helper: applies `delta` to `orig_bias` only on standard mipmapped
 /// linear/anisotropic samplers (never comparison/shadow, min/max Hi-Z,
 /// point-only, or single-mip samplers), clamped to D3D12's `[-16.0, 15.99]`.
-fn biased_lod(filter: D3D12_FILTER, min_lod: f32, max_lod: f32, orig_bias: f32, delta: f32) -> f32 {
+/// When `aniso_only` is true, only `D3D12_FILTER_ANISOTROPIC` (`0x55`) is biased.
+fn biased_lod_scoped(
+    filter: D3D12_FILTER,
+    min_lod: f32,
+    max_lod: f32,
+    orig_bias: f32,
+    delta: f32,
+    aniso_only: bool,
+) -> f32 {
     let raw = filter.0 as u32;
     let reduction = raw >> 7;
     let filter_bits = raw & 0x7F;
     if reduction != 0 || filter_bits == 0 || max_lod <= min_lod {
+        return orig_bias;
+    }
+    if aniso_only && filter_bits != 0x55 {
         return orig_bias;
     }
     (orig_bias + delta).clamp(-16.0, 15.99)
@@ -75,7 +103,7 @@ pub(crate) fn apply_mip_bias(
     let Some(delta) = mip_bias_delta() else {
         return orig_bias;
     };
-    let next = biased_lod(filter, min_lod, max_lod, orig_bias, delta);
+    let next = biased_lod_scoped(filter, min_lod, max_lod, orig_bias, delta, mip_bias_aniso_only());
     if next != orig_bias {
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| {
@@ -205,18 +233,20 @@ mod tests {
 
     #[test]
     fn mip_bias_only_affects_standard_mipmapped_linear_samplers() {
-        // Anisotropic mipmapped sampler: gets biased.
-        assert!((biased_lod(D3D12_FILTER(0x55), 0.0, 1000.0, 0.0, -2.25) - -2.25).abs() < 1e-5);
-        // Trilinear mipmapped sampler with existing bias: adds delta, clamps to -16.
-        assert!((biased_lod(D3D12_FILTER(0x15), 0.0, 12.0, -1.0, -2.0) - -3.0).abs() < 1e-5);
-        assert_eq!(biased_lod(D3D12_FILTER(0x15), 0.0, 12.0, -15.0, -3.0), -16.0);
+        // Anisotropic mipmapped sampler: gets biased in both modes.
+        assert!((biased_lod_scoped(D3D12_FILTER(0x55), 0.0, 1000.0, 0.0, -2.25, false) - -2.25).abs() < 1e-5);
+        assert!((biased_lod_scoped(D3D12_FILTER(0x55), 0.0, 1000.0, 0.0, -2.25, true) - -2.25).abs() < 1e-5);
+        // Trilinear mipmapped sampler: biased in `all`, untouched in `aniso` (bloom/exposure/cubemaps).
+        assert!((biased_lod_scoped(D3D12_FILTER(0x15), 0.0, 12.0, -1.0, -2.0, false) - -3.0).abs() < 1e-5);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x15), 0.0, 12.0, -1.0, -2.0, true), -1.0);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x15), 0.0, 12.0, -15.0, -3.0, false), -16.0);
         // Comparison (shadow) sampler: untouched.
-        assert_eq!(biased_lod(D3D12_FILTER(0x85), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x85), 0.0, 1000.0, 0.0, -2.25, false), 0.0);
         // Min/Max reduction (Hi-Z) sampler: untouched.
-        assert_eq!(biased_lod(D3D12_FILTER(0x115), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x115), 0.0, 1000.0, 0.0, -2.25, false), 0.0);
         // Point-only sampler: untouched.
-        assert_eq!(biased_lod(D3D12_FILTER(0x0), 0.0, 1000.0, 0.0, -2.25), 0.0);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x0), 0.0, 1000.0, 0.0, -2.25, false), 0.0);
         // Single-mip sampler (MaxLOD <= MinLOD): untouched.
-        assert_eq!(biased_lod(D3D12_FILTER(0x55), 0.0, 0.0, 0.0, -2.25), 0.0);
+        assert_eq!(biased_lod_scoped(D3D12_FILTER(0x55), 0.0, 0.0, 0.0, -2.25, false), 0.0);
     }
 }
