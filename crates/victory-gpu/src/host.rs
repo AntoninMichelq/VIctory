@@ -1787,10 +1787,39 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+/// Whether scratch chunks returned by a list wait in [`retire`] before going
+/// back to [`SPARE`] or being freed (`VICTORY_SCRATCH_RETIRE`; on by default,
+/// `0` reverts to immediate return/drop). Fixes DRED page fault inside freed
+/// `"list scratch"` (`run-20261126-174255-essai-c2diag.log`).
+fn scratch_retire() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_RETIRE").is_none_or(|v| v != "0"))
+}
+
+struct DeferredChunks(Vec<(Chunk, u64)>);
+
+impl Drop for DeferredChunks {
+    fn drop(&mut self) {
+        give_chunks_now(std::mem::take(&mut self.0));
+    }
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
-/// without the pool.
+/// or dropped): deferred through [`retire`] when [`scratch_retire`] is on, so
+/// neither [`SPARE`] reuse nor buffer drop happens while in-flight submissions
+/// (direct or compute) may still read them.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
+    if chunks.is_empty() {
+        return;
+    }
+    if scratch_retire() {
+        retire(DeferredChunks(chunks));
+    } else {
+        give_chunks_now(chunks);
+    }
+}
+
+fn give_chunks_now(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
