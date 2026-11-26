@@ -4400,11 +4400,34 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
+/// `VICTORY_RDNA_CPU=1` (off by default): enables the RDNA3 CPU optimization
+/// batch (256 KiB `WIDE_JOB` fan-out, `ask_once_active` short-circuit,
+/// coalesced `VirtualProtect` in `watch::open`, and parallel deduplicated
+/// `texback::land_many` without COM drops on the relay thread).
+pub(crate) fn rdna_cpu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RDNA_CPU").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "RDNA3 CPU batch enabled (256 KiB wide fan-out, ask_ahead short-circuit, VirtualProtect coalescing, parallel texback; VICTORY_RDNA_CPU=1)"
+            );
+        }
+        on
+    })
+}
+
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
+    {
+        let deferred = list.deferred();
+        let texture_backs: Vec<&crate::texback::Back> = deferred.texture_backs.iter().collect();
+        crate::texback::land_many(&texture_backs);
     }
+    read_backs_buffers(list);
+}
+
+fn read_backs_buffers(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5474,8 +5497,17 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    {
+                        let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+                        let texture_backs: Vec<&crate::texback::Back> = flight
+                            .order
+                            .iter()
+                            .flat_map(|&i| guards[i].texture_backs.iter())
+                            .collect();
+                        crate::texback::land_many(&texture_backs);
+                    }
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        read_backs_buffers(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -6020,8 +6052,17 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
+                        {
+                            let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+                            let texture_backs: Vec<&crate::texback::Back> = flight
+                                .order
+                                .iter()
+                                .flat_map(|&i| guards[i].texture_backs.iter())
+                                .collect();
+                            crate::texback::land_many(&texture_backs);
+                        }
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            read_backs_buffers(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -8497,7 +8538,7 @@ impl Batch {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !(rdna_cpu() && crate::watch::ask_once_active());
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self

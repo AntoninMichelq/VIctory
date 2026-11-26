@@ -125,7 +125,10 @@ fn rt_miss() -> bool {
     *ON.get_or_init(|| {
         rt_miss_from(
             std::env::var("VICTORY_BVH_BUILDER").ok().as_deref(),
-            std::env::var("VICTORY_RT_MISS").ok().as_deref(),
+            std::env::var("VICTORY_RT_MISS")
+                .or_else(|_| std::env::var("VICTORY_BVH_MISS"))
+                .ok()
+                .as_deref(),
         )
     })
 }

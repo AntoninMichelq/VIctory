@@ -40,6 +40,8 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!pending.is_empty()` (updated under `pending`).
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1205,6 +1207,17 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
+/// Smaller fan-out piece size under `VICTORY_RDNA_CPU=1` (256 KiB so typical
+/// 1.5-2 MiB per-submission snapshots and card-send batches spread across workers).
+const WIDE_JOB_RDNA: usize = 256 << 10;
+
+fn wide_job_bytes() -> usize {
+    if crate::host::rdna_cpu() {
+        WIDE_JOB_RDNA
+    } else {
+        WIDE_JOB
+    }
+}
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
@@ -1241,14 +1254,15 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
             }));
         }
     };
+    let job_bytes = wide_job_bytes();
     for (src, dst, len) in copies {
         let mut at = 0;
         while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
+            let n = (job_bytes - bytes).min(len - at);
             group.push((src + at, dst + at, n));
             at += n;
             bytes += n;
-            if bytes >= WIDE_JOB {
+            if bytes >= job_bytes {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
@@ -1898,6 +1912,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -1980,6 +1995,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -2004,6 +2020,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         self.top(crate::copytop::SNAP, taken as u64);
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
@@ -2355,6 +2372,9 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        if pending.is_empty() {
+            self.has_pending.store(false, Ordering::Release);
+        }
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -2412,7 +2432,7 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// The ranges shaders write that are not copied back yet (title
@@ -2467,6 +2487,9 @@ impl Shadow {
         if from >= to {
             return false;
         }
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -2511,6 +2534,9 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            return false;
+        }
+        if !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -2660,30 +2686,32 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
+        if self.has_pending.load(Ordering::Acquire) {
+            let mut busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            if !busy.is_empty() {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame).
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    if a > at {
+                        bytes += self.update_free(at, a);
+                    }
+                    at = at.max(e);
                 }
-                at = at.max(e);
+                if at < to {
+                    bytes += self.update_free(at, to);
+                }
+                return bytes;
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
         }
         self.update_free(from, to)
     }

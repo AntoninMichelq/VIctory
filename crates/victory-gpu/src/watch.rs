@@ -152,10 +152,18 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
+/// Whether a submission-wide `ask_once` journal is active (so `ask_ahead` is a no-op).
+pub(crate) fn ask_once_active() -> bool {
+    JOURNAL.read().unwrap_or_else(|e| e.into_inner()).kept
+}
+
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if crate::host::rdna_cpu() && ask_once_active() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -731,20 +739,74 @@ fn uncommitted_end(block: usize) -> usize {
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let unguard_one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    };
+    if !crate::host::rdna_cpu() || blocks.len() == 1 {
+        for &block in &blocks {
+            unguard_one(block);
+        }
+        return true;
     }
-    !blocks.is_empty()
+    // `blocks` comes from a BTreeSet range, so it is already sorted and unique.
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut end_block = from + 1;
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == end_block {
+            end_block += 1;
+            j += 1;
+        }
+        if end_block - from == 1 {
+            unguard_one(from);
+        } else {
+            let mut old = 0;
+            // SAFETY: contiguous blocks we made read-only.
+            let ok = unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (end_block - from) * BLOCK,
+                    PAGE_READWRITE,
+                    &mut old,
+                ) != 0
+            };
+            if !(ok && matches!(old, PAGE_READONLY | PAGE_READWRITE)) {
+                if ok {
+                    // Restore and handle block by block so non-guarded memory
+                    // keeps its original protection.
+                    unsafe {
+                        VirtualProtect(
+                            (from * BLOCK) as *const _,
+                            (end_block - from) * BLOCK,
+                            old,
+                            &mut old,
+                        );
+                    }
+                }
+                for block in from..end_block {
+                    unguard_one(block);
+                }
+            }
+        }
+        i = j;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
