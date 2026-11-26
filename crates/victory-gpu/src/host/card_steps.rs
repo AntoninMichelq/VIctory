@@ -1046,6 +1046,21 @@ mod tests {
 
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
+    /// Renderer port RT is the order's switch too: with it a fill ahead of
+    /// a copy at its place is let through, one behind it still refused.
+    #[test]
+    fn the_port_takes_the_order() {
+        crate::port_rt::PORT_RT_IN_TEST.set(true);
+        assert!(placed_order());
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let by_order = placed_order();
+        assert!(plan(&[fill(2032, 64, true), placed], 2, by_order, &mut None).is_ok());
+        assert_eq!(plan(&[placed, fill(2032, 64, true)], 2, by_order, &mut None), Err(BEHIND_PLACED));
+        crate::port_rt::PORT_RT_IN_TEST.set(false);
+        // Without it (and without VICTORY_PLACED_ORDER) both were refused.
+        assert_eq!(plan(&[fill(2032, 64, true), placed], 2, false, &mut None), Err(BEHIND_PLACED));
+    }
+
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
         let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };

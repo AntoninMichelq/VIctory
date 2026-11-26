@@ -67,9 +67,9 @@ void main(uint id : SV_DispatchThreadID) {
     uint acc = 0;
     for (uint i = 0; i < steps; i++) {
         // The directory: the copy and the byte offset of the node's page.
-        uint2 e = dir.Load2((p >> 10) * 8);
+        uint2 e = spread == 99 ? uint2(0, (p >> 10) * 1024 * 64) : dir.Load2((p >> 10) * 8);
         uint copy = (e.x + ((id >> spread) & 7)) & 7;
-        if (spread == 0) { copy = e.x; }
+        if (spread == 0 || spread == 99) { copy = e.x; }
         uint at = e.y + (p & 1023) * 64;
         uint4 b, c, d;
         uint4 a = node(copy, at, b, c, d);
@@ -234,8 +234,9 @@ fn bench_title_memory_reads() {
             back.Unmap(0, None);
             ms
         };
-        let cases: [(&str, u32, u32); 7] = [
+        let cases: [(&str, u32, u32); 8] = [
             ("one view (uniform)", 0, 0),
+            ("one view, no directory", 0, 99),
             ("view per lane, all lanes one copy", 1, 0),
             ("one loop per node, all lanes one copy", 2, 0),
             ("the wave's view if shared, all lanes one copy", 3, 0),
