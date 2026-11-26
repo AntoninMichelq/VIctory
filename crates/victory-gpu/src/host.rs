@@ -3042,11 +3042,33 @@ pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
 /// to submission `until` have landed (all of them if `u64::MAX`), and only
 /// for that, unless the copies the flights alias were written (`aliased`,
 /// then all of them as before).
-fn settle_stale(host: &Host, submitted: &mut u64, runs: &[&HostList], until: Option<u64>, aliased: bool) {
+fn settle_stale(
+    host: &Host,
+    submitted: &mut u64,
+    runs: &[&HostList],
+    until: Option<u64>,
+    aliased: bool,
+) -> Vec<Vec<CrossCopy>> {
+    // Aliased refreshes taken from the flights' writer copies on the card,
+    // behind them on the queue, instead of a wait.
+    let mut aliased = aliased;
+    let mut copies = Vec::new();
+    if aliased
+        && alias_on_card()
+        && let Some(planned) = plan_alias_copies(host, runs)
+    {
+        crate::copytop::settle_cause(crate::copytop::S_ALIAS_CARD);
+        crate::timeline::mark("alias-on-card", planned.iter().map(|c| c.len() as u64).sum());
+        copies = planned;
+        aliased = false;
+        if until.is_none() {
+            return copies;
+        }
+    }
     let alias_partial = aliased && alias_partial();
     if (aliased && !alias_partial) || until == Some(u64::MAX) {
         host.settle(submitted, WHY_STALE);
-        return;
+        return copies;
     }
     if let Some(until) = until {
         crate::copytop::settle_cause(crate::copytop::S_PARTIAL);
@@ -3061,6 +3083,94 @@ fn settle_stale(host: &Host, submitted: &mut u64, runs: &[&HostList], until: Opt
         crate::timeline::mark("alias-partial", ranges.len() as u64);
         relay_wait(WHY_STALE, |line| ranges.iter().all(|&(from, to)| !touches(&line.written, from, to)));
     }
+    copies
+}
+
+/// `VICTORY_ALIAS_ON_CARD=1` (off by default; with the relay; read live):
+/// a submission that refreshes a host copy from title memory that flights
+/// in the air write through another copy ([`aliased_under_flights`]) does
+/// not wait for them: its lists' preludes copy those ranges from the
+/// writers' copies to the reader's on the card ([`plan_alias_copies`]),
+/// behind the flights on the same queue, so the reader gets the flights'
+/// bytes before its shaders read it, as it would have from title memory
+/// after their copy-back. Where that cannot be shown to hold, it waits as
+/// before.
+fn alias_on_card() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_ALIAS_ON_CARD", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// For [`alias_on_card`]: per list of `runs`, the copies (reader, writer,
+/// from, to) that give the reader's aliased refreshes the bytes flights in
+/// the air write there, newest flight last; `None` (wait as before) unless
+/// every one can be: the reader is a plain copy (PC memory, not placed);
+/// neither the submission nor the writing flights use the compute queue
+/// (the copy must be behind them on one queue); and every page of the
+/// writer's copy in the range is current with title memory (as the
+/// submission's write-watch asking says; the title's later bytes there were
+/// put in beside the writes, `merge_under_writes`, and go to a card side
+/// before these lists), so outside what the flights' shaders write the
+/// writer's bytes are title memory's.
+fn plan_alias_copies(host: &Host, runs: &[&HostList]) -> Option<Vec<Vec<CrossCopy>>> {
+    use std::sync::Arc;
+    if host.compute_queue.is_some() && runs.iter().any(|l| l.is_compute()) {
+        return None;
+    }
+    let (written, flights) = {
+        let line = line();
+        let flights: Vec<(bool, Vec<Declared>)> = line
+            .line
+            .iter()
+            .filter_map(|item| match item {
+                Late::Run(f) => Some((f.on_compute, f.back.clone())),
+                _ => None,
+            })
+            .collect();
+        (line.written.clone(), flights)
+    };
+    let mut out: Vec<Vec<CrossCopy>> = Vec::with_capacity(runs.len());
+    for list in runs {
+        let mut copies: Vec<CrossCopy> = Vec::new();
+        for step in &list.deferred().copies {
+            let Step::Refresh(reader, address, len) = step else {
+                continue;
+            };
+            let (rs, rl) = reader.span();
+            let (from, to) = ((*address).max(rs as usize), (*address + *len).min((rs + rl) as usize));
+            // As `aliased_under_flights` picks them.
+            if from >= to || reader.writes_pending() || !touches(&written, from, to) {
+                continue;
+            }
+            if !reader.plain() {
+                return None;
+            }
+            for (on_compute, back) in &flights {
+                for (writer, ranges) in back {
+                    if Arc::ptr_eq(writer, reader) {
+                        return None;
+                    }
+                    let (ws, wl) = writer.span();
+                    for &(a, b) in ranges {
+                        let (lo, hi) = (a.max(from).max(ws as usize), b.min(to).min((ws + wl) as usize));
+                        if lo >= hi {
+                            continue;
+                        }
+                        if *on_compute {
+                            return None;
+                        }
+                        // Every page of the writer's copy there current.
+                        let parts = writer.current_parts(lo, hi)?;
+                        if parts != [(lo, hi)] {
+                            return None;
+                        }
+                        copies.push((reader.clone(), writer.clone(), lo, hi));
+                    }
+                }
+            }
+        }
+        out.push(copies);
+    }
+    Some(out)
 }
 
 /// `VICTORY_ALIAS_PARTIAL=1` (off by default; with the relay; read live):
@@ -5392,6 +5502,9 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         let asking = crate::prepstats::start();
+        // With `VICTORY_ALIAS_ON_CARD`: copies on the card standing for a
+        // wait for flights ([`plan_alias_copies`]).
+        let mut alias_extra: Vec<Vec<CrossCopy>> = Vec::new();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -5444,7 +5557,7 @@ impl Host {
             crate::copytop::time(crate::copytop::T_CHECKS, checking);
             if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
-                settle_stale(self, &mut submitted, runs, until, aliased);
+                alias_extra = settle_stale(self, &mut submitted, runs, until, aliased);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             } else if !behind {
@@ -5455,7 +5568,7 @@ impl Host {
             && settle_cause(until.is_some(), aliased)
         {
             let settling = std::time::Instant::now();
-            settle_stale(self, &mut submitted, runs, until, aliased);
+            alias_extra = settle_stale(self, &mut submitted, runs, until, aliased);
             settled += settling.elapsed();
         } else if !behind {
             aliased_under_flights(runs, false);
@@ -5547,6 +5660,14 @@ impl Host {
         let crossing = crate::prepstats::start();
         let mut crossed = if alias_copies() { cross_list_copies(runs) } else { Vec::new() };
         crate::prepstats::done(crate::prepstats::P::CrossCopies, crossing);
+        // Copies from flights' writer copies on the card instead of a wait
+        // (`VICTORY_ALIAS_ON_CARD`): after the lists' own cross copies.
+        if alias_extra.iter().any(|c| !c.is_empty()) {
+            crossed.resize_with(runs.len(), Vec::new);
+            for (mine, extra) in crossed.iter_mut().zip(alias_extra) {
+                mine.extend(extra);
+            }
+        }
         for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
