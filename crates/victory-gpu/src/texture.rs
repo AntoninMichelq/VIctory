@@ -1026,6 +1026,9 @@ pub(crate) fn let_go_idle() {
         {
             dropped += 1;
             dropped_bytes += gone.bytes;
+            // Freed once the lists that may name it are through
+            // (`crate::host::retire`), not here.
+            crate::host::retire(gone);
         }
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
@@ -1034,6 +1037,8 @@ pub(crate) fn let_go_idle() {
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            // As above: the table's handle goes, the staging later.
+            crate::host::retire(s.clone());
         }
         keep
     });

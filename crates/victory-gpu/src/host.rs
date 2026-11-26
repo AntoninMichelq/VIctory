@@ -400,11 +400,21 @@ fn memory_line(card: Option<[u64; 4]>) {
 /// How often the PC became short of memory ([`memory_short`]).
 pub(crate) static SHORT_TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Drops `object` once every submission running now has finished, and
+/// [`retire_ahead`] submissions more: lists recorded but not yet submitted
+/// (the submission being prepared, those the relay sends ahead, the title's
+/// lists recorded early) can name a host copy without holding it
+/// (`resource::host_resource` hands textures out unheld), and the sweeps
+/// that let copies go run before a submission starts. With
+/// `VICTORY_RETIRE_AHEAD=0`, as before: at once if no submission is running.
+/// The device removals of cumul11b, walls11 and walls13y (2026-11-26): a page
+/// fault at an address in the range of our host copies but in none of them,
+/// the first unfinished command a prelude; gone with `VICTORY_SWEEP=0` or
+/// `VICTORY_TEXTURE_SWEEP=0`.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    let ahead = retire_ahead();
+    if ahead == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -413,7 +423,19 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push((started + ahead, Retired(Box::new(object))));
+}
+
+/// Submissions [`retire`] waits for beyond those running:
+/// `VICTORY_RETIRE_AHEAD` (16, about four frames; 0: none, as before).
+fn retire_ahead() -> u64 {
+    static AHEAD: OnceLock<u64> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RETIRE_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+    })
 }
 
 /// Drops what waited for submissions up to `finished`.
