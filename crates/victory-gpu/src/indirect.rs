@@ -105,6 +105,12 @@ RWByteAddressBuffer budget : register(u1);
 #ifndef BUDGET_LOG2
 #define BUDGET_LOG2 27
 #endif
+#ifndef WIDEST
+#define WIDEST 65535u
+#endif
+#ifndef REST
+#define REST 1
+#endif
 static const uint BUDGET = 1u << BUDGET_LOG2;
 // Where a ledger entry's cost stops (two of them still fit 32 bits).
 static const uint LEDGER_CAP = 1u << 30;
@@ -170,9 +176,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             cost = draw_counts.x;
         }
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = src_args.Load3(src_at);
+        // Up to WIDEST groups in x run as asked (`widest`).
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -204,7 +212,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(entry, 0, before);
         [allow_uav_condition]
         while (before < cap) {
-            uint next = (cap - before <= cost) ? cap : (before + cost);
+            uint next = (cap - before < cost) ? (REST ? cap : before) : (before + cost);
+            if (next == before) break;
             uint prev;
             budget.InterlockedCompareExchange(entry, before, next, prev);
             if (prev == before) break;
@@ -255,6 +264,12 @@ RWByteAddressBuffer ledger : register(u0);
 RWByteAddressBuffer budget : register(u1);
 #ifndef BUDGET_LOG2
 #define BUDGET_LOG2 27
+#endif
+#ifndef WIDEST
+#define WIDEST 65535u
+#endif
+#ifndef REST
+#define REST 1
 #endif
 static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint CAP = 1u << 30;
@@ -320,6 +335,12 @@ RWByteAddressBuffer budget : register(u1);
 #ifndef BUDGET_LOG2
 #define BUDGET_LOG2 27
 #endif
+#ifndef WIDEST
+#define WIDEST 65535u
+#endif
+#ifndef REST
+#define REST 1
+#endif
 static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint WIDE = 1024;
 groupshared uint scan[WIDE];
@@ -375,7 +396,7 @@ void main(uint tid : SV_GroupIndex) {
                 uint c = cost_at(at, kind);
                 if (c == 0) continue;
                 if (run >= BUDGET || BUDGET - run < c) {
-                    run = BUDGET;
+                    if (REST) run = BUDGET;
                     budget.InterlockedAdd(12, 1);
                     if (kind <= 1) {
                         chunk.Store2(at, uint2(0, 0));
@@ -694,14 +715,76 @@ fn budget_log2() -> &'static std::ffi::CStr {
     })
 }
 
+/// The most groups in x that an indirect compute dispatch runs as the title
+/// asks: 65,535 is D3D12's portable limit, 2^20 (`GROUPS`) runs whole on AMD
+/// cards (`VICTORY_INDIRECT_WIDE=0`: force 65,535).
+fn widest_for(is_amd: bool, wide_on: bool) -> u32 {
+    if is_amd && wide_on { 1 << 20 } else { 65_535 }
+}
+
+fn widest(is_amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    widest_for(is_amd, on)
+}
+
+/// Whether `device` is an AMD adapter (`VendorId == 0x1002`).
+fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
+    }
+}
+
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest (`VICTORY_INDIRECT_REST=0`: takes nothing, so later records
+/// that fit still run, avoiding outdoor flickering when one large/garbage
+/// record hits the budget). Default: `1` (previous behavior).
+fn rest_flag() -> &'static std::ffi::CStr {
+    static REST: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    REST.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_REST").is_none_or(|v| v != "0");
+        tracing::info!(
+            on,
+            "indirect record over budget consumes rest of list budget (VICTORY_INDIRECT_REST)"
+        );
+        std::ffi::CString::new(if on { "1" } else { "0" }).unwrap_or_default()
+    })
+}
+
 fn compile_with(device: &ID3D12Device, source: &str, batch: bool) -> windows::core::Result<Clamp> {
+    compile_with_macros(device, source, batch, widest(amd(device)), rest_flag())
+}
+
+fn compile_with_macros(
+    device: &ID3D12Device,
+    source: &str,
+    batch: bool,
+    wide: u32,
+    rest: &std::ffi::CStr,
+) -> windows::core::Result<Clamp> {
     let log2 = windows::core::PCSTR(budget_log2().as_ptr().cast());
+    let wide_c = std::ffi::CString::new(format!("{wide}u")).unwrap_or_default();
+    let wide_p = windows::core::PCSTR(wide_c.as_ptr().cast());
+    let rest_p = windows::core::PCSTR(rest.as_ptr().cast());
     let defines = [
         D3D_SHADER_MACRO { Name: s!("BUDGET_LOG2"), Definition: log2 },
+        D3D_SHADER_MACRO { Name: s!("WIDEST"), Definition: wide_p },
+        D3D_SHADER_MACRO { Name: s!("REST"), Definition: rest_p },
         D3D_SHADER_MACRO { Name: s!("BATCH"), Definition: s!("1") },
         D3D_SHADER_MACRO::default(),
     ];
-    let plain = [D3D_SHADER_MACRO { Name: s!("BUDGET_LOG2"), Definition: log2 }, D3D_SHADER_MACRO::default()];
+    let plain = [
+        D3D_SHADER_MACRO { Name: s!("BUDGET_LOG2"), Definition: log2 },
+        D3D_SHADER_MACRO { Name: s!("WIDEST"), Definition: wide_p },
+        D3D_SHADER_MACRO { Name: s!("REST"), Definition: rest_p },
+        D3D_SHADER_MACRO::default(),
+    ];
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -803,6 +886,12 @@ RWByteAddressBuffer budget : register(u1);
 #ifndef BUDGET_LOG2
 #define BUDGET_LOG2 27
 #endif
+#ifndef WIDEST
+#define WIDEST 65535u
+#endif
+#ifndef REST
+#define REST 1
+#endif
 static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint GROUPS = 1u << 20;
 static const uint PAST = 0xffffffffu;
@@ -831,8 +920,9 @@ void main(uint lane : SV_GroupIndex) {
                 cost = count * instances;
                 draw_counts = uint2(count, instances);
             } else if (kind == 2) {
-                uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                uint3 g = src_args.Load3(src_at);
+                g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+                if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                     g = uint3(0, 0, 0);
                 }
                 cost = g.x * g.y * g.z * 64u;
@@ -854,7 +944,7 @@ void main(uint lane : SV_GroupIndex) {
                 uint c = costs[i];
                 if (c > left) {
                     costs[i] = PAST;
-                    left = 0;
+                    if (REST) left = 0;
                     budget.InterlockedAdd(12, 1);
                 } else {
                     left -= c;
@@ -2593,5 +2683,25 @@ void main() {
         let flushed = push_batch_job(&mut legacy, (0x1000, 0xD000, 0xE000), 0, (1, 20), [0; 8], 2, false);
         assert_eq!(flushed.len(), 1);
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn widest_caps_non_amd_and_allows_amd_when_enabled() {
+        assert_eq!(widest_for(false, true), 65_535);
+        assert_eq!(widest_for(false, false), 65_535);
+        assert_eq!(widest_for(true, false), 65_535);
+        assert_eq!(widest_for(true, true), 1 << 20);
+    }
+
+    #[test]
+    fn indirect_rest_zero_compiles_for_all_clamp_shaders() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        let rest0 = c"0";
+        assert!(compile_with_macros(&warp.device, SOURCE, false, 65_535, rest0).is_ok());
+        assert!(compile_with_macros(&warp.device, SOURCE, true, 1 << 20, rest0).is_ok());
+        assert!(compile_with_macros(&warp.device, SETTLE_LATER, false, 65_535, rest0).is_ok());
+        assert!(compile_with_macros(&warp.device, COMPACT_SOURCE, false, 1 << 20, rest0).is_ok());
     }
 }
