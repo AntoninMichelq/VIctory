@@ -617,6 +617,24 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// `VICTORY_MERGE_MORE=<MB>` (0, off, by default; read live): the title's
+/// bytes are put in beside flights' shader writes in more cases, so that a
+/// submission waits for flights less often (`merge_under_writes`): where
+/// nothing tells which pages the title wrote (memory not write-watched,
+/// or the write watch gave no answer) every page of the busy ranges is
+/// compared, up to that many MB; and up to 4,096 runs a submission instead
+/// of 512 ([`merge_runs`]). (Runs are never joined: see the merge.)
+pub(crate) fn merge_more() -> u64 {
+    static MB: crate::live::Switch = crate::live::Switch::new();
+    MB.get("VICTORY_MERGE_MORE", |v, _| v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(1024))
+}
+
+/// The most changed runs of the title's bytes a submission sends to copies
+/// in the card's memory beside flights' writes ([`merge_more`]).
+pub(crate) fn merge_runs() -> usize {
+    if merge_more() > 0 { 4096 } else { 512 }
+}
+
 /// `VICTORY_BACK_BLOCKS=1` (off by default): bytes shaders wrote go back
 /// into title memory by 1 KiB block, only the blocks the merge changed
 /// ([`put_back`]), not the whole span from the first changed byte to the
@@ -2454,20 +2472,33 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        // With `VICTORY_MERGE_MORE=<MB>`: where nothing says which pages the
+        // title wrote (memory not write-watched, or no answer), every page
+        // of the busy ranges is looked at, up to that many MB of them.
+        let more = merge_more();
+        let busy_bytes: usize = busy.iter().map(|&(a, e)| e - a).sum();
+        let look_all = more > 0 && busy_bytes as u64 <= more << 20;
+        let unwatched = self.watched.load(Ordering::Relaxed) == NOT_WATCHED;
+        if unwatched && !look_all {
             crate::copytop::settle_cause(crate::copytop::S_UNWATCHED);
             return true;
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
+            let all_pages = || (a / PAGE..e.div_ceil(PAGE)).map(|p| (p, u64::MAX)).collect::<Vec<(usize, u64)>>();
+            let asked = if unwatched { Some((0, all_pages())) } else { crate::watch::writes(a, e, true) };
+            let asked = match asked {
+                None if look_all => Some((0, all_pages())),
+                other => other,
+            };
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = asked else {
                 crate::copytop::settle_cause(crate::copytop::S_NO_ANSWER);
                 return true;
             };
@@ -2506,6 +2537,11 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // Never joined across bytes that did not change: equal
+                    // on the CPU's side, they may not be on the card's,
+                    // where shaders of a flight are writing this range (a
+                    // join sent the older bytes over the card's newer ones:
+                    // the device was removed a minute into run copies6).
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
                         crate::copytop::settle_cause(crate::copytop::S_RUNS);

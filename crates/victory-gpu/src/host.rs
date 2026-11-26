@@ -128,6 +128,23 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The frame each of the last 1,024 submissions was prepared in, by its
+/// number modulo 1,024 ([`in_air`]).
+static SUBMISSION_FRAME: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+/// Submissions prepared and not yet landed (copied back), and how many
+/// frames back the oldest of them was prepared: how far ahead of the card
+/// and the copy-back the title is now.
+pub(crate) fn in_air() -> (u64, u64) {
+    let (started, finished) = (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire));
+    let n = started.saturating_sub(finished);
+    if n == 0 {
+        return (0, 0);
+    }
+    let oldest = SUBMISSION_FRAME[((finished + 1) % 1024) as usize].load(Ordering::Relaxed);
+    (n, crate::frame::current().saturating_sub(oldest))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -2664,13 +2681,16 @@ fn aliased_under_flights(runs: &[&HostList], behind: bool) -> bool {
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                Step::GpuWrite(shadow, address, len) => {
+                // (With the copies made on the card, this submission's own
+                // writes are not looked for: a walk of all of them per
+                // refresh, for nothing.)
+                Step::GpuWrite(shadow, address, len) if !copied => {
                     own.push((Arc::as_ptr(shadow) as usize, *address, *address + *len, shadow.span()));
                 }
                 Step::Refresh(shadow, address, len) => {
                     let (from, to) = (*address, *address + *len);
                     let me = Arc::as_ptr(shadow) as usize;
-                    if let Some(w) = own.iter().find(|w| !copied && w.0 != me && w.1 < to && w.2 > from) {
+                    if !copied && let Some(w) = own.iter().find(|w| w.0 != me && w.1 < to && w.2 > from) {
                         alias_note(false, shadow.span(), (from, to), Some(w.3));
                     }
                     if !shadow.writes_pending() && touches(&flights, from, to) {
@@ -2894,16 +2914,34 @@ fn record_cross_copies(list: &ID3D12GraphicsCommandList, copies: &[CrossCopy]) {
 fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
+    // up to date at most). By copy in a map, whether shaders write it asked
+    // once per copy (`VICTORY_FLIGHT_CHECKS_MAP=1`): a lock and a search of
+    // the copies so far for each of a submission's ~500 refresh steps.
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+    if flight_checks_map() {
+        let mut by_copy: std::collections::HashMap<usize, (Arc<crate::shadow::Shadow>, usize, usize)> =
+            std::collections::HashMap::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    by_copy
+                        .entry(Arc::as_ptr(shadow) as usize)
+                        .and_modify(|s| (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)))
+                        .or_insert_with(|| (shadow.clone(), *address, *address + *len));
+                }
+            }
+        }
+        spans.extend(by_copy.into_values().filter(|s| s.0.writes_pending()));
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && shadow.writes_pending()
+                {
+                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                    }
                 }
             }
         }
@@ -2913,7 +2951,7 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = crate::shadow::merge_runs();
         if !settle_partial() {
             return spans
                 .iter()
@@ -2934,6 +2972,31 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from)).then_some(u64::MAX)
 }
 
+/// `VICTORY_FLUSH_PART=1` (off by default; read live): before a dispatch's
+/// declared write range of a copy, only the part of the copy's pending
+/// refresh inside that range is done ([`Batch::flush_part`]), not all of
+/// it. Every one of a frame's ~6,900 write steps refreshed its copy's whole
+/// pending range (the title's 174 MB heap: its envelope), and refresh steps
+/// in between made it pending again: run prep (2026-11-26 02:36), "batch
+/// flush (refreshes, textures)" 34 ms a frame.
+fn flush_part() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FLUSH_PART", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// `VICTORY_FLIGHT_CHECKS_MAP=1` (off by default; read live): the check of
+/// a submission's refreshes against flights' writes takes each copy once
+/// ([`stale_under_flights_until`]), and the submission's one write-watch
+/// asking (`crate::watch::ask_once`) asks, per copy, the ranges refreshed
+/// (joined where within 64 KiB, as [`refresh_ranges`]) instead of their
+/// envelope, when [`refresh_ranges`] is on. Run prep (2026-11-26 02:36):
+/// "write-watch asking + flight checks" 11.6 ms a frame, 42 submissions
+/// of ~520 refresh steps each.
+fn flight_checks_map() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    ON.get("VICTORY_FLIGHT_CHECKS_MAP", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
 /// `VICTORY_SETTLE_PARTIAL=1` (off by default; with `VICTORY_RELAY` and
 /// `VICTORY_LATE_WAIT=2` or more): when the title wrote memory that flights'
 /// shaders are writing and a submission refreshes it, the submission waits
@@ -2948,6 +3011,28 @@ fn stale_under_flights_until(runs: &[&HostList]) -> Option<u64> {
 fn settle_partial() -> bool {
     static ON: crate::live::Switch = crate::live::Switch::new();
     relay() && ON.get("VICTORY_SETTLE_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// `VICTORY_FENCE_PARTIAL=1` (off by default; with the relay; read live):
+/// a title thread that blocks on a fence value behind flights waits until
+/// that value is set (the flight before its signal has landed), not until
+/// every flight in the air has landed.
+pub(crate) fn fence_partial() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new();
+    relay() && ON.get("VICTORY_FENCE_PARTIAL", |v, _| u64::from(v.is_some_and(|v| v.trim() == "1"))) == 1
+}
+
+/// [`settle_for_fence`] with [`fence_partial`]: until `reached` says the
+/// value is set, or nothing is in the air.
+pub(crate) fn settle_for_fence_until(reached: impl Fn() -> bool) {
+    if !late() {
+        return;
+    }
+    if !fence_partial() {
+        settle_now(WHY_FENCE);
+        return;
+    }
+    relay_wait(WHY_FENCE, |line| reached() || (line.line.is_empty() && !line.settling));
 }
 
 /// Before a submission, with [`settle_partial`]: waits until the flights up
@@ -3108,9 +3193,6 @@ pub(crate) fn settle_now(why: usize) {
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
-}
-pub(crate) fn settle_for_fence() {
-    settle_now(WHY_FENCE);
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -5249,6 +5331,7 @@ impl Host {
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
         crate::timeline::mark("prep", this_submission);
+        SUBMISSION_FRAME[(this_submission % 1024) as usize].store(crate::frame::current(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -5264,30 +5347,53 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            let asking = crate::copytop::start();
+            let ranges: Vec<(usize, usize)> = if refresh_ranges() && flight_checks_map() {
+                // The ranges asked for, per copy, not their envelope.
+                let mut parts: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && !shadow.unwatched()
+                        {
+                            add_range(
+                                parts.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default(),
+                                *address,
+                                *address + *len,
+                            );
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                parts.into_values().flatten().collect()
+            } else {
+                let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && !shadow.unwatched()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                    }
+                }
+                spans.into_values().collect()
+            };
             crate::watch::ask_once(&ranges);
+            crate::copytop::time(crate::copytop::T_ONCE, asking);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
+            let checking = crate::copytop::start();
             let (until, aliased) = if behind {
                 (stale_under_flights_until(runs), aliased_under_flights(runs, behind))
             } else {
                 (None, false)
             };
+            crate::copytop::time(crate::copytop::T_CHECKS, checking);
             if behind && settle_cause(until.is_some(), aliased) {
                 let settling = std::time::Instant::now();
                 settle_stale(self, &mut submitted, until.unwrap_or(u64::MAX), aliased);
@@ -7044,6 +7150,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     crate::copytop::time(crate::copytop::T_TITLE, copying);
                     crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
+                    crate::copytop::time(crate::copytop::T_TITLE, copying);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -7059,6 +7166,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     crate::copytop::time(crate::copytop::T_FILL, filling);
                     crate::cpuframe::done(crate::cpuframe::Work::TitleCopies, timed, len);
+                    crate::copytop::time(crate::copytop::T_FILL, filling);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -7095,7 +7203,13 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
-                    batch.flush_one(shadow);
+                    if flush_part() {
+                        let parting = crate::copytop::start();
+                        batch.flush_part(shadow, *address, *address + *len);
+                        crate::copytop::time(crate::copytop::T_PART, parting);
+                    } else {
+                        batch.flush_one(shadow);
+                    }
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     let snapping = crate::copytop::start();
@@ -7205,6 +7319,48 @@ impl Batch {
         for &(from, to) in ranges {
             Self::update(shadow, from, to);
         }
+    }
+
+    /// With [`flush_part`], before shaders are given `[from, to)` of
+    /// `shadow`'s copy: of its pending refresh, the part inside that range
+    /// is done now (the snapshot of the range, or its being left alone by
+    /// refreshes while shaders write it, needs the title's bytes there
+    /// first); the rest stays pending for the next flush.
+    fn flush_part(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(&at) = self.index.get(&key) else {
+            return;
+        };
+        let ranges = &mut self.refreshes[at].1;
+        let mut now: Vec<(usize, usize)> = Vec::new();
+        let mut rest: Vec<(usize, usize)> = Vec::with_capacity(ranges.len() + 1);
+        for &(a, b) in ranges.iter() {
+            if b <= from || a >= to {
+                rest.push((a, b));
+                continue;
+            }
+            now.push((a.max(from), b.min(to)));
+            if a < from {
+                rest.push((a, from));
+            }
+            if b > to {
+                rest.push((to, b));
+            }
+        }
+        if now.is_empty() {
+            return;
+        }
+        if rest.is_empty() {
+            self.index.remove(&key);
+            self.refreshes.swap_remove(at);
+            // The last entry took its place.
+            if let Some(moved) = self.refreshes.get(at) {
+                self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            }
+        } else {
+            *ranges = rest;
+        }
+        Self::update_all(shadow, &now);
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending

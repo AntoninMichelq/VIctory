@@ -101,9 +101,9 @@ pub(crate) fn merged(started: Option<std::time::Instant>) {
 
 /// Where the submitting thread's preparing goes, each counted alone (not
 /// inside another), microseconds since the last table: see [`TIMES`].
-static TIME_US: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static TIME_US: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Names of [`TIME_US`]'s counts, for the line.
-const TIMES: [&str; 10] = [
+const TIMES: [&str; 13] = [
     "all deferred steps (wall)",
     "flushes of refreshes (wall)",
     "write-watch asking ahead",
@@ -114,6 +114,9 @@ const TIMES: [&str; 10] = [
     "snapshots of shader-written ranges",
     "texture refreshes on the submitting thread",
     "deferred runs of ours",
+    "the submission's one write-watch asking",
+    "checks against flights (stale, aliased; merges under writes included)",
+    "refreshes before write steps, their part only (VICTORY_FLUSH_PART)",
 ];
 pub(crate) const T_ALL: usize = 0;
 pub(crate) const T_FLUSH: usize = 1;
@@ -125,6 +128,9 @@ pub(crate) const T_FILL: usize = 6;
 pub(crate) const T_SNAP: usize = 7;
 pub(crate) const T_TEXTURE: usize = 8;
 pub(crate) const T_RUN: usize = 9;
+pub(crate) const T_ONCE: usize = 10;
+pub(crate) const T_CHECKS: usize = 11;
+pub(crate) const T_PART: usize = 12;
 
 /// A start for [`time`], if the counts are on.
 pub(crate) fn start() -> Option<std::time::Instant> {
@@ -158,6 +164,20 @@ pub(crate) const S_NO_ANSWER: usize = 3;
 pub(crate) const S_RUNS: usize = 4;
 pub(crate) const S_NO_SNAPSHOT: usize = 5;
 pub(crate) const S_PARTIAL: usize = 6;
+
+/// At presents since the last table: their count, the submissions in the
+/// air summed and at most, the frames ahead summed and at most
+/// (`crate::host::in_air`).
+static AIR: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// A present found `n` submissions in the air, the oldest `frames` frames back.
+pub(crate) fn in_air(n: u64, frames: u64) {
+    AIR[0].fetch_add(1, Ordering::Relaxed);
+    AIR[1].fetch_add(n, Ordering::Relaxed);
+    AIR[2].fetch_max(n, Ordering::Relaxed);
+    AIR[3].fetch_add(frames, Ordering::Relaxed);
+    AIR[4].fetch_max(frames, Ordering::Relaxed);
+}
 
 /// A settle before a submission had cause `cause` ([`SETTLE_NAMES`]).
 pub(crate) fn settle_cause(cause: usize) {
@@ -235,6 +255,15 @@ pub(crate) fn line() {
         .map(|(name, n)| format!("{name} {:.1}", n.swap(0, Ordering::Relaxed) as f64 / frames))
         .collect();
     tracing::info!("copy stats, settles before a submission per frame, by cause: {}", settles.join(", "));
+    let air = AIR.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    let presents = air[0].max(1) as f64;
+    tracing::info!(
+        "copy stats, at a present: {:.1} submissions in the air (at most {}), the oldest {:.1} frames back (at most {}): how far the title runs ahead of the card and the copy-back",
+        air[1] as f64 / presents,
+        air[2],
+        air[3] as f64 / presents,
+        air[4]
+    );
     for (rank, (id, r)) in all.iter().take(20).enumerate() {
         let per = |k: usize| r.times[k] as f64 / frames;
         tracing::info!(
