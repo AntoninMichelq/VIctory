@@ -760,6 +760,14 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Variable Rate Shading tier reported by the host adapter (`0` = unsupported,
+/// `1` = per-draw `RSSetShadingRate`, `2` = per-draw + per-primitive/image).
+static VRS_TIER: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn vrs_tier() -> u32 {
+    VRS_TIER.load(Ordering::Relaxed)
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -846,6 +854,26 @@ fn create() -> windows::core::Result<Host> {
         // the CPU through a resizable BAR): what host copies there would
         // need (upstream PRs #2120/#2130, fxceless VICTORY_WINDOW_UPLOAD).
         tracing::info!(supported = gpu_upload_heaps(&device), "GPU upload heaps (resizable BAR)");
+        let mut o6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+        let vrs_tier = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS6,
+                (&raw mut o6).cast(),
+                size_of_val(&o6) as u32,
+            )
+            .is_ok()
+        {
+            o6.VariableShadingRateTier.0 as u32
+        } else {
+            0
+        };
+        VRS_TIER.store(vrs_tier, Ordering::Relaxed);
+        tracing::info!(
+            tier = vrs_tier,
+            additional_rates = o6.AdditionalShadingRatesSupported.as_bool(),
+            tile_size = o6.ShadingRateImageTileSize,
+            "host variable rate shading (VRS) support"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -8241,6 +8269,15 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; indirect records emptied by the budget (VICTORY_CLAMP_BUDGET): {emptied:.1} per frame"
         );
+        if let Some(mode) = crate::draw::vrs_mode_label() {
+            let [draws, switches] = crate::draw::take_vrs_stats();
+            tracing::info!(
+                "VRS (VICTORY_VRS={mode}, tier {}): {:.1} draws/frame at coarse rate, {:.1} RSSetShadingRate calls/frame",
+                vrs_tier(),
+                draws as f64 / frames,
+                switches as f64 / frames,
+            );
+        }
         late_line(frames);
         if async_compute() {
             let secs = elapsed.as_secs_f64().max(1e-6);
