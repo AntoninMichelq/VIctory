@@ -7297,12 +7297,6 @@ impl HostList {
         Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        self.budget_resource().map(|(_, gpu)| gpu)
-    }
-
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
@@ -7512,8 +7506,10 @@ impl HostList {
         let used = chunks.used;
         let entries = std::mem::take(&mut chunks.entries);
         let settled = match &chunks.ledger {
-            Some((ledger, _)) if entries > 0 => match self.budget() {
-                Some(budget) => crate::indirect::settle(&self.list, ledger, entries, budget),
+            Some((ledger, _)) if entries > 0 => match self.budget_resource() {
+                Some((budget_res, budget)) => {
+                    crate::indirect::settle(&self.list, ledger, entries, Some(budget_res), budget)
+                }
                 None => false,
             },
             _ => false,
