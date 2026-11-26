@@ -3710,12 +3710,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, drawn: bool) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, words), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            } else if crate::descriptor::host::uav_writes_depth_plane(words.as_ref()) {
+                list.twin_plane_written(*resource as This);
             }
         }
         _ => {}

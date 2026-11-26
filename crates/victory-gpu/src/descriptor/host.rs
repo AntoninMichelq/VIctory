@@ -1973,6 +1973,24 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// Whether an unordered view of a depth-stencil texture (its title
+/// description, `None` for the whole resource) writes its depth plane, not
+/// the stencil plane alone: as `twin_uav` tells them apart.
+pub(crate) fn uav_writes_depth_plane(words: Option<&[u32; 10]>) -> bool {
+    let Some(words) = words else {
+        return true;
+    };
+    let desc = uav_desc(words);
+    let plane = match desc.ViewDimension {
+        // SAFETY: the member the dimension names.
+        D3D12_UAV_DIMENSION_TEXTURE2D => unsafe { desc.Anonymous.Texture2D.PlaneSlice },
+        // SAFETY: as above.
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => unsafe { desc.Anonymous.Texture2DArray.PlaneSlice },
+        _ => 0,
+    };
+    plane != 1 && !matches!(desc.Format.0, 22 | 47)
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
