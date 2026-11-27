@@ -22,6 +22,9 @@ use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
 mod keymap;
+mod tabs;
+
+pub use tabs::apply_graphics;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
