@@ -106,16 +106,22 @@ fn run(to: &str) {
         // address, size, binds; the most bound first.
         let mut seen: Vec<(u64, u32, u32)> = by_address.into_iter().map(|(a, (s, b))| (a, s, b)).collect();
         seen.sort_by_key(|e| std::cmp::Reverse(e.2));
+        // The view's buffer holds a perspective projection (shadow views are
+        // orthographic; a cube face's is square: kept, but after the others).
         let mut found = None;
-        for &(address, size, binds) in seen.iter().take(64) {
+        let mut views: Vec<(u32, usize, bool)> = Vec::new(); // binds, projection at, square
+        let mut dump: Option<(u64, u32, Vec<f32>)> = None;
+        for &(address, size, binds) in seen.iter().take(96) {
             let len = if size == 0 { 1024 } else { (size as usize).clamp(64, 4096) } & !15;
             if !read(address, &mut bytes[..len]) {
                 continue;
             }
             let floats: Vec<f32> = bytes[..len].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            if let Some(m) = find_rigid(&floats) {
-                found = Some((m, binds));
-                break;
+            let Some((at, square)) = find_projection(&floats) else { continue };
+            views.push((binds, at, square));
+            if found.is_none() && !square {
+                found = find_rigid(&floats).map(|m| (m, binds));
+                dump = Some((address, binds, floats));
             }
         }
         if let Some((m, _)) = found
@@ -130,13 +136,19 @@ fn run(to: &str) {
         }
         if last_log.elapsed() > Duration::from_secs(5) {
             last_log = Instant::now();
+            let views_text: Vec<String> = views.iter().take(8).map(|(b, at, sq)| format!("{b}x@+{}{}", at * 4, if *sq { "sq" } else { "" })).collect();
             match found {
                 Some((m, binds)) => tracing::info!(
                     target: "multi",
-                    "multiplayer camera: buffers {}, best bound {binds}x, matrix at +{} ({:?}), as camera {:?}, as view {:?}, votes {:?}, sending {}",
-                    seen.len(), m.offset * 4, m.layout, m.position(false), m.position(true), finder.votes(&m), finder.decided(&m).is_some()
+                    "multiplayer camera: buffers {}, views [{}], view bound {binds}x, matrix at +{} ({:?}), as camera {:?}, as view {:?}, votes {:?}, sending {}",
+                    seen.len(), views_text.join(" "), m.offset * 4, m.layout, m.position(false), m.position(true), finder.votes(&m), finder.decided(&m).is_some()
                 ),
-                None => tracing::info!(target: "multi", "multiplayer camera: buffers {}, no camera matrix found", seen.len()),
+                None => tracing::info!(target: "multi", "multiplayer camera: buffers {}, views [{}], no camera matrix found", seen.len(), views_text.join(" ")),
+            }
+            // What the view's buffer holds, to learn its layout from a run.
+            if let Some((address, binds, floats)) = &dump {
+                let text: Vec<String> = floats.iter().take(160).map(|x| format!("{x:.3}")).collect();
+                tracing::info!(target: "multi", "multiplayer view buffer {address:#x} bound {binds}x, {} floats: {}", floats.len(), text.join(" "));
             }
         }
         std::thread::sleep(Duration::from_millis(84));
@@ -232,6 +244,36 @@ pub(crate) fn find_rigid(f: &[f32]) -> Option<Rigid> {
                 && dot(t, t) > 1e-4
             {
                 return Some(Rigid { r, t, offset: k, layout });
+            }
+        }
+        k += 4;
+    }
+    None
+}
+
+/// The first perspective projection in a buffer's floats (row or column
+/// vectors, any depth convention, a small jitter allowed), and whether it is
+/// square (a cube face's).
+pub(crate) fn find_projection(f: &[f32]) -> Option<(usize, bool)> {
+    let zero = |x: f32| x.abs() < 1e-6;
+    let scale = |x: f32| x > 0.1 && x < 20.0;
+    let mut k = 0;
+    while k + 16 <= f.len() {
+        let m = |r: usize, c: usize| f[k + r * 4 + c];
+        let common = scale(m(0, 0)) && scale(m(1, 1)) && zero(m(0, 1)) && zero(m(1, 0)) && zero(m(3, 3));
+        if common {
+            // Row vectors: w in (2, 3), depth bias in (3, 2).
+            let row = zero(m(0, 2)) && zero(m(0, 3)) && zero(m(1, 2)) && zero(m(1, 3))
+                && m(2, 0).abs() < 0.1 && m(2, 1).abs() < 0.1
+                && (m(2, 3).abs() - 1.0).abs() < 1e-3
+                && zero(m(3, 0)) && zero(m(3, 1)) && !zero(m(3, 2));
+            // Column vectors: the transpose.
+            let column = zero(m(2, 0)) && zero(m(3, 0)) && zero(m(2, 1)) && zero(m(3, 1))
+                && m(0, 2).abs() < 0.1 && m(1, 2).abs() < 0.1
+                && (m(3, 2).abs() - 1.0).abs() < 1e-3
+                && zero(m(0, 3)) && zero(m(1, 3)) && !zero(m(2, 3));
+            if row || column {
+                return Some((k, (m(0, 0) - m(1, 1)).abs() < 1e-3));
             }
         }
         k += 4;
@@ -354,6 +396,22 @@ mod tests {
             assert!((axes[0][0] - 0.7f32.cos()).abs() < 1e-4, "layout {i}: right {:?}", axes[0]);
         }
         assert!(find_rigid(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, 5.0, 5.0, 1.0]).is_none());
+    }
+
+    #[test]
+    fn projections_are_found() {
+        // 16:9, 60 degrees, reverse depth, row vectors, with jitter.
+        let (sy, sx) = (1.732, 1.732 / 1.777);
+        let row = [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0003, -0.0002, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0];
+        let mut buffer = vec![0.5; 8];
+        buffer.extend(row);
+        assert_eq!(find_projection(&buffer), Some((8, false)));
+        let column: Vec<f32> = (0..16).map(|i| row[(i % 4) * 4 + i / 4]).collect();
+        assert_eq!(find_projection(&column), Some((0, false)));
+        let cube = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, -0.1, 0.0];
+        assert_eq!(find_projection(&cube), Some((0, true)));
+        let ortho = [0.01, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.5, 1.0];
+        assert_eq!(find_projection(&ortho), None);
     }
 
     #[test]
