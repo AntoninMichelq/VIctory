@@ -94,6 +94,8 @@ fn yes_no(b: bool) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Graphics {
+    /// A preset picked with Left/Right, applied only on Enter.
+    preview: Preview,
     /// `lodScale`: how far details are kept.
     distance: f32,
     /// `grassLod`.
@@ -114,11 +116,23 @@ pub(super) struct Graphics {
     sharpen: bool,
 }
 
+/// A preset being looked at; not part of what the settings are (two
+/// settings with different previews are the same).
+#[derive(Clone, Copy, Debug, Default)]
+struct Preview(Option<usize>);
+
+impl PartialEq for Preview {
+    fn eq(&self, _: &Preview) -> bool {
+        true
+    }
+}
+
 /// The title's own settings (as a Series S writes them), then the lighter ones.
 const PRESETS: [(&str, Graphics); 3] = [
     (
         "NORMALE",
         Graphics {
+            preview: Preview(None),
             distance: 1.0,
             grass: 0.8,
             small: 1.0,
@@ -133,6 +147,7 @@ const PRESETS: [(&str, Graphics); 3] = [
     (
         "LEGERE",
         Graphics {
+            preview: Preview(None),
             distance: 0.6,
             grass: 0.3,
             small: 2.0,
@@ -147,6 +162,7 @@ const PRESETS: [(&str, Graphics); 3] = [
     (
         "TRES LEGERE",
         Graphics {
+            preview: Preview(None),
             distance: 0.4,
             grass: 0.0,
             small: 3.0,
@@ -241,6 +257,10 @@ impl Graphics {
     /// Writes `path` (none: nowhere); a note if that failed.
     pub(super) fn save_to(&self, path: Option<&Path>) -> Option<String> {
         let path = path?;
+        // The settings before, one step back (reglages.ini.avant).
+        if path.exists() {
+            let _ = std::fs::copy(path, path.with_extension("ini.avant"));
+        }
         match std::fs::write(path, self.text()) {
             Ok(()) => None,
             Err(e) => {
@@ -263,7 +283,13 @@ impl Graphics {
         vec![
             (Item::header("QUALITÉ"), None),
             (
-                Item::setting("Préréglage", pretty(self.preset())),
+                Item::setting(
+                    "Préréglage",
+                    match self.preview.0 {
+                        Some(i) => format!("{}  ·  Entrée pour appliquer", pretty(PRESETS[i].0)),
+                        None => pretty(self.preset()).to_owned(),
+                    },
+                ),
                 Some(Preset),
             ),
             (Item::header("DISTANCE ET DÉTAILS"), None),
@@ -323,17 +349,34 @@ impl Graphics {
 
     pub(super) fn key(&mut self, row: GraphicsRow, key: u8) -> Reply {
         use GraphicsRow::*;
+        if row != GraphicsRow::Preset {
+            self.preview = Preview(None);
+        }
         let before = *self;
         let toggle = matches!(key, ENTER | KEY_LEFT | KEY_RIGHT);
         let step = matches!(key, KEY_LEFT | KEY_RIGHT);
         match row {
-            Preset if toggle => {
-                let now = PRESETS.iter().position(|(_, p)| p == self);
+            // Looking through the presets changes nothing; Enter applies the one shown.
+            Preset if step => {
                 let n = PRESETS.len();
-                let i = match (now, key) {
+                let from = self
+                    .preview
+                    .0
+                    .or_else(|| PRESETS.iter().position(|(_, p)| p == self));
+                let i = match (from, key) {
                     (Some(i), KEY_LEFT) => (i + n - 1) % n,
                     (Some(i), _) => (i + 1) % n,
                     (None, _) => 0,
+                };
+                self.preview = Preview(Some(i));
+                return Reply::note(format!(
+                    "Entrée pour appliquer le préréglage {}",
+                    pretty(PRESETS[i].0)
+                ));
+            }
+            Preset if key == ENTER => {
+                let Some(i) = self.preview.0 else {
+                    return Reply::note("Choisis un préréglage avec ← →, puis Entrée");
                 };
                 *self = PRESETS[i].1;
             }
@@ -968,6 +1011,28 @@ mod tests {
         };
         assert_eq!(Graphics::parse(&g.text()), g);
         assert_eq!(g.preset(), "PERSO");
+    }
+
+    #[test]
+    fn a_preset_is_only_applied_on_enter() {
+        let mut g = Graphics {
+            grass: 0.5,
+            ..Graphics::default()
+        };
+        let mine = g;
+        for _ in 0..5 {
+            assert!(!g.key(GraphicsRow::Preset, KEY_RIGHT).changed);
+        }
+        assert_eq!(g, mine);
+        let mut g = mine;
+        assert!(
+            !g.key(GraphicsRow::Preset, ENTER).changed,
+            "Enter alone applies nothing"
+        );
+        assert_eq!(g, mine);
+        g.key(GraphicsRow::Preset, KEY_RIGHT);
+        assert!(g.key(GraphicsRow::Preset, ENTER).changed);
+        assert_eq!(g, PRESETS[0].1);
     }
 
     #[test]
