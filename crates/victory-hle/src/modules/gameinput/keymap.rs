@@ -80,61 +80,61 @@ const fn stick(right: bool, y: bool, sign: f32) -> Target {
 const ACTIONS: [Action; 24] = [
     Action {
         id: "AVANCER",
-        label: "AVANCER",
+        label: "Avancer",
         target: stick(false, true, 1.0),
         default: &[At(b'W')],
     },
     Action {
         id: "RECULER",
-        label: "RECULER",
+        label: "Reculer",
         target: stick(false, true, -1.0),
         default: &[At(b'S')],
     },
     Action {
         id: "GAUCHE",
-        label: "ALLER A GAUCHE",
+        label: "Aller à gauche",
         target: stick(false, false, -1.0),
         default: &[At(b'A')],
     },
     Action {
         id: "DROITE",
-        label: "ALLER A DROITE",
+        label: "Aller à droite",
         target: stick(false, false, 1.0),
         default: &[At(b'D')],
     },
     Action {
         id: "A",
-        label: "BOUTON A",
+        label: "Bouton A",
         target: Target::Button(A),
         default: &[Vk(0x0D), Vk(0xA0)],
     },
     Action {
         id: "B",
-        label: "BOUTON B",
+        label: "Bouton B",
         target: Target::Button(B),
         default: &[Vk(0x08), At(b'R')],
     },
     Action {
         id: "X",
-        label: "BOUTON X",
+        label: "Bouton X",
         target: Target::Button(X),
         default: &[At(b'X'), Vk(0x20)],
     },
     Action {
         id: "Y",
-        label: "BOUTON Y",
+        label: "Bouton Y",
         target: Target::Button(Y),
         default: &[At(b'Y')],
     },
     Action {
         id: "RT",
-        label: "RT (GACHETTE D)",
+        label: "RT (gâchette droite)",
         target: Target::RightTrigger,
         default: &[Vk(0x01), At(b'C')],
     },
     Action {
         id: "LT",
-        label: "LT (GACHETTE G)",
+        label: "LT (gâchette gauche)",
         target: Target::LeftTrigger,
         default: &[Vk(0x02), At(b'Z')],
     },
@@ -152,73 +152,73 @@ const ACTIONS: [Action; 24] = [
     },
     Action {
         id: "L3",
-        label: "CLIC STICK G (L3)",
+        label: "Clic stick gauche (L3)",
         target: Target::Button(LEFT_STICK),
         default: &[At(b'F'), Vk(0xA2)],
     },
     Action {
         id: "R3",
-        label: "CLIC STICK D (R3)",
+        label: "Clic stick droit (R3)",
         target: Target::Button(RIGHT_STICK),
         default: &[At(b'H'), Vk(0x04)],
     },
     Action {
         id: "MENU",
-        label: "MENU (START)",
+        label: "Menu (Start)",
         target: Target::Button(MENU),
         default: &[Vk(0x1B)],
     },
     Action {
         id: "VUE",
-        label: "VUE (SELECT)",
+        label: "Vue (Select)",
         target: Target::Button(VIEW),
         default: &[Vk(0x09)],
     },
     Action {
         id: "CROIX_HAUT",
-        label: "CROIX HAUT",
+        label: "Croix haut",
         target: Target::Button(UP),
         default: &[Vk(0x26)],
     },
     Action {
         id: "CROIX_BAS",
-        label: "CROIX BAS",
+        label: "Croix bas",
         target: Target::Button(DOWN),
         default: &[Vk(0x28)],
     },
     Action {
         id: "CROIX_GAUCHE",
-        label: "CROIX GAUCHE",
+        label: "Croix gauche",
         target: Target::Button(LEFT),
         default: &[Vk(0x25)],
     },
     Action {
         id: "CROIX_DROITE",
-        label: "CROIX DROITE",
+        label: "Croix droite",
         target: Target::Button(RIGHT),
         default: &[Vk(0x27)],
     },
     Action {
         id: "CAMERA_HAUT",
-        label: "CAMERA HAUT",
+        label: "Caméra haut",
         target: stick(true, true, 1.0),
         default: &[At(b'I')],
     },
     Action {
         id: "CAMERA_BAS",
-        label: "CAMERA BAS",
+        label: "Caméra bas",
         target: stick(true, true, -1.0),
         default: &[At(b'K')],
     },
     Action {
         id: "CAMERA_GAUCHE",
-        label: "CAMERA GAUCHE",
+        label: "Caméra gauche",
         target: stick(true, false, -1.0),
         default: &[At(b'J')],
     },
     Action {
         id: "CAMERA_DROITE",
-        label: "CAMERA DROITE",
+        label: "Caméra droite",
         target: stick(true, false, 1.0),
         default: &[At(b'L')],
     },
@@ -247,10 +247,10 @@ const ESCAPE: u8 = 0x1B;
 
 /// The menu's tabs.
 const TABS: [&str; 4] = [
-    "GRAPHISMES",
-    "CLAVIER / SOURIS",
-    "MULTIJOUEUR",
-    "DEVELOPPEUR",
+    "Graphismes",
+    "Clavier / souris",
+    "Multijoueur",
+    "Développeur",
 ];
 const GRAPHICS_TAB: usize = 0;
 const KEYS_TAB: usize = 1;
@@ -765,14 +765,14 @@ impl Keymap {
     /// The CLAVIER / SOURIS tab's rows.
     fn keys_entries(&self, m: &Menu) -> Vec<(Item, Option<Sel>)> {
         let s = &self.settings;
-        let yes = |b: bool| if b { "OUI" } else { "NON" };
+        let yes = |b: bool| if b { "Oui" } else { "Non" };
         let mut out = vec![(Item::header("ACTIONS"), None)];
         let at = m.cursor[KEYS_TAB];
         for r in rows() {
             let i = out.len();
             let item = match r {
                 Row::Action(a) => {
-                    let names: Vec<String> = s.keys[a].iter().map(|&k| key_name(k)).collect();
+                    let names: Vec<String> = s.keys[a].iter().map(|&k| key_shown(k)).collect();
                     let names = if at == i && m.wait.is_some() {
                         "...".to_owned()
                     } else if names.is_empty() {
@@ -784,16 +784,16 @@ impl Keymap {
                 }
                 Row::Camera => {
                     out.push((Item::header("SOURIS"), None));
-                    Item::setting("SOURIS = CAMERA", yes(s.camera))
+                    Item::setting("La souris tourne la caméra", yes(s.camera))
                 }
-                Row::Sensitivity => Item::setting("SENSIBILITE", format!("{:.1}", s.sensitivity)),
-                Row::Invert => Item::setting("INVERSER HAUT/BAS", yes(s.invert)),
-                Row::DeadZone => Item::setting("ZONE MORTE", format!("{:.2}", s.dead_zone)),
+                Row::Sensitivity => Item::setting("Sensibilité", format!("{:.1}", s.sensitivity)),
+                Row::Invert => Item::setting("Inverser haut / bas", yes(s.invert)),
+                Row::DeadZone => Item::setting("Zone morte", format!("{:.2}", s.dead_zone)),
                 Row::Defaults => {
                     out.push((Item::header("AUTRES"), None));
-                    Item::button("REMETTRE LES TOUCHES PAR DEFAUT")
+                    Item::button("Remettre les touches par défaut")
                 }
-                Row::Close => Item::button("FERMER LE MENU"),
+                Row::Close => Item::button("Fermer le menu"),
             };
             out.push((item, Some(Sel::Keys(r))));
         }
@@ -814,7 +814,7 @@ impl Keymap {
                 return;
             };
             if key == F1 || key == ESCAPE {
-                menu.note = "ANNULE".into();
+                menu.note = "Annulé".into();
                 return;
             }
             match wait {
@@ -835,11 +835,11 @@ impl Keymap {
                 .map(|(_, (a, _))| a.label)
                 .collect();
             menu.note = if others.is_empty() {
-                format!("{} = {}", ACTIONS[i].label, key_name(key))
+                format!("{} = {}", ACTIONS[i].label, key_shown(key))
             } else {
                 format!(
-                    "ATTENTION: {} SERT AUSSI A {}",
-                    key_name(key),
+                    "Attention : {} sert aussi à {}",
+                    key_shown(key),
                     others.join(", ")
                 )
             };
@@ -850,15 +850,15 @@ impl Keymap {
             match (key, here) {
                 (ENTER, Row::Action(_)) => {
                     menu.wait = Some(Wait::Replace);
-                    menu.note = "APPUIE SUR LA NOUVELLE TOUCHE (ECHAP ANNULE)".into();
+                    menu.note = "Appuie sur la nouvelle touche (Échap annule)".into();
                 }
                 (KEY_RIGHT, Row::Action(_)) => {
                     menu.wait = Some(Wait::Add);
-                    menu.note = "APPUIE SUR LA TOUCHE A AJOUTER (ECHAP ANNULE)".into();
+                    menu.note = "Appuie sur la touche à ajouter (Échap annule)".into();
                 }
                 (DELETE | BACK, Row::Action(i)) => {
                     s.keys[i].clear();
-                    menu.note = format!("{} : PLUS AUCUNE TOUCHE", ACTIONS[i].label);
+                    menu.note = format!("{} : plus aucune touche", ACTIONS[i].label);
                     changed = true;
                 }
                 (ENTER | KEY_LEFT | KEY_RIGHT, Row::Camera) => {
@@ -882,7 +882,7 @@ impl Keymap {
                 }
                 (ENTER, Row::Defaults) => {
                     *s = Settings::defaults_for(self.layout);
-                    menu.note = "TOUCHES PAR DEFAUT REMISES".into();
+                    menu.note = "Touches par défaut remises".into();
                     changed = true;
                 }
                 (ENTER, Row::Close) => {
@@ -908,11 +908,11 @@ impl Keymap {
         };
         let entries = self.entries(m);
         let help = match m.tab {
-            KEYS_TAB => "ENTREE CHANGER  DROITE AJOUTER  SUPPR EFFACER  TAB ONGLET",
+            KEYS_TAB => "Entrée changer   → ajouter   Suppr effacer   Tab onglet   Échap fermer",
             GRAPHICS_TAB | MULTI_TAB => {
-                "HAUT/BAS CHOISIR  GAUCHE/DROITE OU ENTREE CHANGER  TAB ONGLET"
+                "↑↓ choisir   ←→ ou Entrée changer   Tab onglet   Échap fermer"
             }
-            _ => "TAB ONGLET SUIVANT  ECHAP FERMER",
+            _ => "Tab onglet suivant   Échap fermer",
         };
         menu::show(Some(Page {
             tabs: TABS.iter().map(|t| (*t).to_owned()).collect(),
@@ -992,6 +992,29 @@ const NAMES: [(u8, &str); 35] = [
     (0x5B, "WIN_G"),
     (0x5D, "MENU_CONTEXTE"),
 ];
+
+/// A key's name on screen: `Flèche haut`, `Clic gauche`, `W`, `F5`.
+pub(super) fn key_shown(vk: u8) -> String {
+    let name = key_name(vk);
+    if name.len() <= 3 {
+        return name;
+    }
+    let mut out = name.replace('_', " ").to_lowercase();
+    for (plain, accented) in [
+        ("fleche", "flèche"),
+        ("entree", "entrée"),
+        ("echap", "échap"),
+        ("pave", "pavé"),
+        ("debut", "début"),
+        ("divise", "divisé"),
+    ] {
+        out = out.replace(plain, accented);
+    }
+    let mut chars = out.chars();
+    chars
+        .next()
+        .map_or(out.clone(), |c| c.to_uppercase().chain(chars).collect())
+}
 
 pub(super) fn key_name(vk: u8) -> String {
     if let Some((_, name)) = NAMES.iter().find(|(k, _)| *k == vk) {

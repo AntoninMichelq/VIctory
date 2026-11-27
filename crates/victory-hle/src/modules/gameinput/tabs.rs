@@ -71,6 +71,21 @@ fn number(value: &str) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
+/// Yes or no, on screen.
+fn shown(b: bool) -> &'static str {
+    if b { "Oui" } else { "Non" }
+}
+
+/// A preset's name, on screen.
+fn pretty(name: &str) -> &'static str {
+    match name {
+        "NORMALE" => "Normale",
+        "LEGERE" => "Légère",
+        "TRES LEGERE" => "Très légère",
+        _ => "Perso",
+    }
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b { "OUI" } else { "NON" }
 }
@@ -246,61 +261,61 @@ impl Graphics {
         use GraphicsRow::*;
         let level = |v: f32| format!("{:.0} %", v * 100.0);
         vec![
-            (Item::header("QUALITE"), None),
-            (Item::setting("PRESET", self.preset()), Some(Preset)),
-            (Item::header("DISTANCE ET DETAILS"), None),
+            (Item::header("QUALITÉ"), None),
             (
-                Item::setting("DISTANCE DES DETAILS", level(self.distance)),
+                Item::setting("Préréglage", pretty(self.preset())),
+                Some(Preset),
+            ),
+            (Item::header("DISTANCE ET DÉTAILS"), None),
+            (
+                Item::setting("Distance des détails", level(self.distance)),
                 Some(Distance),
             ),
-            (Item::setting("HERBE", level(self.grass)), Some(Grass)),
+            (Item::setting("Herbe", level(self.grass)), Some(Grass)),
             (
-                Item::setting("CACHER LES PETITS OBJETS", format!("X {:.1}", self.small)),
+                Item::setting("Cacher les petits objets", format!("X {:.1}", self.small)),
                 Some(Small),
             ),
             (Item::header("OMBRES ET EFFETS"), None),
             (
-                Item::setting("OMBRES DYNAMIQUES (RT)", yes_no(self.rt_shadows)),
+                Item::setting("Ombres dynamiques (RT)", shown(self.rt_shadows)),
                 Some(RtShadows),
             ),
             (
-                Item::setting("OMBRES DES PARTICULES", yes_no(self.particle_shadows)),
+                Item::setting("Ombres des particules", shown(self.particle_shadows)),
                 Some(ParticleShadows),
             ),
             (
-                Item::setting("FLOU DE MOUVEMENT", yes_no(self.blur)),
+                Item::setting("Flou de mouvement", shown(self.blur)),
                 Some(Blur),
             ),
             (
-                Item::setting("REFLETS DE L'EAU", if self.water { "HAUTS" } else { "BAS" }),
+                Item::setting("Reflets de l'eau", if self.water { "Hauts" } else { "Bas" }),
                 Some(Water),
             ),
             (
                 Item::setting(
-                    "OCCLUSION AMBIANTE",
+                    "Occlusion ambiante",
                     if self.occlusion >= 2 {
-                        "HAUTE"
+                        "Haute"
                     } else {
-                        "BASSE"
+                        "Basse"
                     },
                 ),
                 Some(Occlusion),
             ),
-            (
-                Item::setting("NETTETE", yes_no(self.sharpen)),
-                Some(Sharpen),
-            ),
+            (Item::setting("Netteté", shown(self.sharpen)), Some(Sharpen)),
             (Item::header("AFFICHAGE"), None),
             (
                 Item::setting(
-                    "AFFICHER LES FPS (F3)",
-                    yes_no(victory_gpu::menu::stats_shown()),
+                    "Afficher les FPS (F3)",
+                    shown(victory_gpu::menu::stats_shown()),
                 ),
                 Some(Stats),
             ),
-            (Item::button("REMETTRE LES REGLAGES DU JEU"), Some(Defaults)),
+            (Item::button("Remettre les réglages du jeu"), Some(Defaults)),
             (
-                Item::text("CHANGEMENTS APPLIQUES AU PROCHAIN LANCEMENT", ""),
+                Item::text("Changements appliqués au prochain lancement", ""),
                 None,
             ),
         ]
@@ -336,7 +351,7 @@ impl Graphics {
                 victory_gpu::menu::ask_stats(on);
                 // The panel takes it at the next picture; show it at once.
                 victory_gpu::menu::set_stats_shown(on);
-                return Reply::note(if on { "FPS AFFICHES" } else { "FPS CACHES" });
+                return Reply::note(if on { "FPS affichés" } else { "FPS cachés" });
             }
             Defaults if key == ENTER => *self = Graphics::default(),
             _ => return Reply::default(),
@@ -345,7 +360,7 @@ impl Graphics {
             return Reply::default();
         }
         Reply {
-            note: Some("ENREGISTRE : RELANCE LE JEU POUR L'APPLIQUER".into()),
+            note: Some("Enregistré : relance le jeu pour l'appliquer".into()),
             changed: true,
         }
     }
@@ -631,7 +646,7 @@ impl Multi {
         let path = self.path.as_ref()?;
         std::fs::write(path, self.voice.text()).err().map(|e| {
             tracing::warn!(?path, %e, "multijoueur.ini not written");
-            "REGLAGES NON ENREGISTRES".to_owned()
+            "Réglages non enregistrés".to_owned()
         })
     }
 
@@ -653,7 +668,7 @@ impl Multi {
                 let mut s = VoiceState::default();
                 for (k, v) in lines(&t) {
                     match k.as_str() {
-                        "ETAT" => s.state = v,
+                        "ÉTAT" => s.state = v,
                         "ERREUR" => s.error = v,
                         "AMIS" => s.friends = v,
                         "NIVEAU_MICRO" => s.mic_level = v.parse().unwrap_or(0),
@@ -681,17 +696,17 @@ impl Multi {
             _ if value.is_empty() => "-".to_owned(),
             _ => value.to_owned(),
         };
-        let mut out = vec![(Item::header("ETAT"), None)];
+        let mut out = vec![(Item::header("ÉTAT"), None)];
         match &self.state {
-            None => out.push((Item::text("VOCAL", "NON LANCE (VICTORY-VOIX)"), None)),
+            None => out.push((Item::text("Vocal", "Pas lancé"), None)),
             Some(s) => {
                 let state = match s.state.as_str() {
-                    "attente" => "EN ATTENTE D'UN AMI".to_owned(),
-                    "connecte" => "CONNECTE".to_owned(),
-                    "erreur" => format!("ERREUR : {}", s.error),
+                    "attente" => "En attente d'un ami".to_owned(),
+                    "connecte" => "Connecté".to_owned(),
+                    "erreur" => format!("Erreur : {}", s.error),
                     other => other.to_uppercase(),
                 };
-                out.push((Item::text("VOCAL", state), None));
+                out.push((Item::text("Vocal", state), None));
                 for friend in s.friends.split(';').filter(|f| !f.is_empty()) {
                     let mut parts = friend.split(':');
                     let who = parts.next().unwrap_or_default().to_uppercase();
@@ -700,16 +715,16 @@ impl Multi {
                 }
                 let bar = "*".repeat((s.mic_level.min(100) / 10) as usize);
                 out.push((
-                    Item::text("NIVEAU DU MICRO", format!("{bar:<10} {:>3} %", s.mic_level)),
+                    Item::text("Niveau du micro", format!("{bar:<10} {:>3} %", s.mic_level)),
                     None,
                 ));
                 out.push((
                     Item::text(
-                        "POSITION DANS LE JEU",
+                        "Position dans le jeu",
                         if s.game_position {
-                            "RECUE"
+                            "Reçue"
                         } else {
-                            "PAS ENCORE"
+                            "Pas encore"
                         },
                     ),
                     None,
@@ -718,76 +733,73 @@ impl Multi {
         }
         out.extend([
             (Item::header("CONNEXION"), None),
-            (Item::setting("PSEUDO", typed(Name, &v.name)), Some(Name)),
+            (Item::setting("Pseudo", typed(Name, &v.name)), Some(Name)),
             (
-                Item::setting("ADRESSE DE L'AMI (IP)", typed(Friend, &v.friend)),
+                Item::setting("Adresse de l'ami (IP)", typed(Friend, &v.friend)),
                 Some(Friend),
             ),
             (
-                Item::setting("CODE DE LA PARTIE", typed(Code, &v.code)),
+                Item::setting("Code de la partie", typed(Code, &v.code)),
                 Some(Code),
             ),
             (
-                Item::setting("PORT (AU DEMARRAGE)", typed(Port, &v.port.to_string())),
+                Item::setting("Port (au démarrage)", typed(Port, &v.port.to_string())),
                 Some(Port),
             ),
-            (Item::header("VOCAL"), None),
+            (Item::header("Vocal"), None),
             (
                 Item::setting(
-                    "MICRO",
+                    "Micro",
                     if v.push_to_talk {
-                        "APPUYER POUR PARLER"
+                        "Appuyer pour parler"
                     } else {
-                        "TOUJOURS OUVERT"
+                        "Toujours ouvert"
                     },
                 ),
                 Some(Mic),
             ),
             (
                 Item::setting(
-                    "TOUCHE POUR PARLER",
+                    "Touche pour parler",
                     if self.waiting_key {
                         "...".to_owned()
                     } else {
-                        super::keymap::key_name(v.talk_key)
+                        super::keymap::key_shown(v.talk_key)
                     },
                 ),
                 Some(TalkKey),
             ),
+            (Item::setting("Couper mon micro", shown(v.mute)), Some(Mute)),
             (
-                Item::setting("COUPER MON MICRO", yes_no(v.mute)),
-                Some(Mute),
-            ),
-            (
-                Item::setting("VOLUME DU MICRO", format!("{} %", v.mic_volume)),
+                Item::setting("Volume du micro", format!("{} %", v.mic_volume)),
                 Some(MicVolume),
             ),
             (
-                Item::setting("VOLUME DES AMIS", format!("{} %", v.friends_volume)),
+                Item::setting("Volume des amis", format!("{} %", v.friends_volume)),
                 Some(FriendsVolume),
             ),
             (
-                Item::setting("SENSIBILITE DU MICRO", format!("{:.3}", v.threshold)),
+                Item::setting("Sensibilité du micro", format!("{:.3}", v.threshold)),
                 Some(Threshold),
             ),
             (Item::header("SON EN 3D"), None),
             (
-                Item::setting("VOLUME PLEIN JUSQU'A", format!("{} M", v.near)),
+                Item::setting("Volume plein jusqu'à", format!("{} m", v.near)),
                 Some(Near),
             ),
             (
-                Item::setting("PLUS RIEN AU-DELA DE", format!("{} M", v.far)),
+                Item::setting("Plus rien au-delà de", format!("{} m", v.far)),
                 Some(Far),
             ),
             (
-                Item::setting("INVERSER GAUCHE / DROITE", yes_no(v.swap)),
+                Item::setting("Inverser gauche / droite", shown(v.swap)),
                 Some(Swap),
             ),
             (
                 Item::button(if v.test {
-                    "ARRETER LE TEST DU MICRO"
+                    "Arrêter le test du micro"
                 } else {
-                    "TESTER LE MICRO (ON S'ENTEND)"
+                    "Tester le micro (on s'entend)"
                 }),
                 Some(TestMic),
             ),
@@ -800,18 +812,18 @@ impl Multi {
         if self.waiting_key {
             self.waiting_key = false;
             if key == ESCAPE || key == 0x70 {
-                return Reply::note("ANNULE");
+                return Reply::note("Annulé");
             }
             if talk_name(key).is_none() {
                 return Reply::note(format!(
-                    "{} : TOUCHE NON PRISE PAR LE VOCAL (LETTRE, CHIFFRE, F1-F12, ESPACE, MAJ, CTRL, ALT)",
-                    super::keymap::key_name(key)
+                    "{} : touche non prise par le vocal (lettre, chiffre, F1-F12, Espace, Maj, Ctrl, Alt)",
+                    super::keymap::key_shown(key)
                 ));
             }
             self.voice.talk_key = key;
             return self.saved(format!(
-                "TOUCHE POUR PARLER : {}",
-                super::keymap::key_name(key)
+                "Touche pour parler : {}",
+                super::keymap::key_shown(key)
             ));
         }
         if let Some(t) = &mut self.typing {
@@ -827,15 +839,15 @@ impl Multi {
                         Code => v.code = t.text,
                         Port => match t.text.parse::<u32>() {
                             Ok(p @ 1..=65535) => v.port = p,
-                            _ => return Reply::note("PORT : UN NOMBRE DE 1 A 65535"),
+                            _ => return Reply::note("Port : un nombre de 1 à 65535"),
                         },
                         _ => {}
                     }
-                    return self.saved("ENREGISTRE".into());
+                    return self.saved("Enregistré".into());
                 }
                 ESCAPE => {
                     self.typing = None;
-                    return Reply::note("ANNULE");
+                    return Reply::note("Annulé");
                 }
                 BACK => {
                     t.text.pop();
@@ -866,7 +878,7 @@ impl Multi {
                     _ => v.port.to_string(),
                 };
                 self.typing = Some(Typing { row, text });
-                return Reply::note("TAPE PUIS ENTREE (ECHAP ANNULE, RETOUR EFFACE)");
+                return Reply::note("Tape puis Entrée (Échap annule, Retour efface)");
             }
             Friend | Code if matches!(key, DELETE | BACK) => {
                 if row == Friend {
@@ -878,7 +890,7 @@ impl Multi {
             Mic if toggle => v.push_to_talk = !v.push_to_talk,
             TalkKey if key == ENTER => {
                 self.waiting_key = true;
-                return Reply::note("APPUIE SUR LA TOUCHE POUR PARLER (ECHAP ANNULE)");
+                return Reply::note("Appuie sur la touche pour parler (Échap annule)");
             }
             Mute if toggle => v.mute = !v.mute,
             MicVolume if step => v.mic_volume = add(v.mic_volume, 10, 0, 200),
@@ -895,15 +907,15 @@ impl Multi {
             TestMic if key == ENTER => {
                 v.test = !v.test;
                 let note = if v.test {
-                    "TEST DU MICRO : PARLE, TU DOIS T'ENTENDRE"
+                    "Test du micro : parle, tu dois t'entendre"
                 } else {
-                    "TEST DU MICRO ARRETE"
+                    "Test du micro arrêté"
                 };
                 return self.saved(note.into());
             }
             _ => return Reply::default(),
         }
-        self.saved("ENREGISTRE (S'APPLIQUE TOUT DE SUITE)".into())
+        self.saved("Enregistré (s'applique tout de suite)".into())
     }
 
     fn saved(&self, note: String) -> Reply {
@@ -931,12 +943,12 @@ fn typed_char(key: u8, row: MultiRow) -> Option<char> {
 
 pub(super) fn dev_entries() -> Vec<(Item, Option<()>)> {
     vec![
-        (Item::header("MODE DEVELOPPEUR"), None),
-        (Item::text("BIENTOT ICI :", ""), None),
-        (Item::text("  INVINCIBLE", "A VENIR"), None),
-        (Item::text("  ALLER PLUS VITE", "A VENIR"), None),
-        (Item::text("  SE TELEPORTER", "A VENIR"), None),
-        (Item::text("  CHANGER L'HEURE ET LA METEO", "A VENIR"), None),
+        (Item::header("MODE DÉVELOPPEUR"), None),
+        (Item::text("Bientôt ici :", ""), None),
+        (Item::text("  Invincible", "À venir"), None),
+        (Item::text("  Aller plus vite", "À venir"), None),
+        (Item::text("  Se téléporter", "À venir"), None),
+        (Item::text("  Changer l'heure et la météo", "À venir"), None),
     ]
 }
 

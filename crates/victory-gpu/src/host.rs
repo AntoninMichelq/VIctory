@@ -3883,6 +3883,8 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
+mod menu_gdi;
+mod menu_paint;
 mod panel;
 mod place;
 pub(crate) mod rec;
