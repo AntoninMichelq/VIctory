@@ -137,8 +137,27 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'?' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
         b'[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
         b']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+        b'\'' => [0b00100, 0b00100, 0b01000, 0, 0, 0, 0],
+        b'*' => [0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
+}
+
+/// A character as one of the glyphs: upper case, accents dropped.
+fn fold(c: char) -> u8 {
+    let c = match c {
+        'à' | 'â' | 'ä' | 'À' | 'Â' | 'Ä' => 'A',
+        'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'E',
+        'î' | 'ï' | 'Î' | 'Ï' => 'I',
+        'ô' | 'ö' | 'Ô' | 'Ö' => 'O',
+        'ù' | 'û' | 'ü' | 'Ù' | 'Û' | 'Ü' => 'U',
+        'ç' | 'Ç' => 'C',
+        '’' => '\'',
+        '«' => '<',
+        '»' => '>',
+        c => c,
+    };
+    if c.is_ascii() { (c as u8).to_ascii_uppercase() } else { b'?' }
 }
 
 /// The box's size in pixels.
@@ -231,12 +250,36 @@ impl Canvas {
         self.rect(x + w - 1, y, 1, h, color);
     }
 
+    /// One pixel, if inside.
+    fn dot(&mut self, x: u32, y: u32, color: [u8; 3]) {
+        let (x, y) = (x as usize, y as usize);
+        if x < self.w && y < self.h {
+            self.rgb[y * self.w + x] = color;
+        }
+    }
+
+    /// A box shading from `left` to `right`.
+    fn hgradient(&mut self, x: u32, y: u32, w: u32, h: u32, left: [u8; 3], right: [u8; 3]) {
+        for i in 0..w {
+            let color = mix(left, right, i as f32 / w.max(2).saturating_sub(1) as f32);
+            self.rect(x + i, y, 1, h, color);
+        }
+    }
+
+    /// A box shading from `top` to `bottom`.
+    fn vgradient(&mut self, x: u32, y: u32, w: u32, h: u32, top: [u8; 3], bottom: [u8; 3]) {
+        for i in 0..h {
+            let color = mix(top, bottom, i as f32 / h.max(2).saturating_sub(1) as f32);
+            self.rect(x, y + i, w, 1, color);
+        }
+    }
+
     /// Draws `text` at `(x, y)` with integer glyph pixel size `px` (`2` => 10x14).
     /// Returns the ending `x` coordinate.
     fn text(&mut self, mut x: u32, y: u32, px: u32, color: [u8; 3], text: &str) -> u32 {
         let step = (GLYPH.0 + 1) * px;
-        for ch in text.bytes() {
-            let bits = glyph(ch.to_ascii_uppercase());
+        for ch in text.chars() {
+            let bits = glyph(fold(ch));
             for (row, &mask) in bits.iter().enumerate() {
                 if mask == 0 {
                     continue;
@@ -285,6 +328,12 @@ impl Canvas {
         }
         out
     }
+}
+
+/// `a` to `b` by `t` (0 to 1).
+fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|i| (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8)
 }
 
 /// Private committed bytes of the current process.
@@ -743,7 +792,7 @@ pub(super) struct Panel {
     failed: bool,
     /// The menu over the picture (`crate::menu`): the version painted last.
     menu_seen: u64,
-    menu_lines: Option<crate::menu::Lines>,
+    menu_page: Option<crate::menu::Page>,
     menu_changed: bool,
     menu_buffers: Option<Buffers>,
     menu_failed: bool,
@@ -767,7 +816,7 @@ impl Panel {
             buffers: None,
             failed: false,
             menu_seen: 0,
-            menu_lines: None,
+            menu_page: None,
             menu_changed: false,
             menu_buffers: None,
             menu_failed: false,
@@ -780,6 +829,10 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        if let Some(on) = crate::menu::take_stats_ask() {
+            shown().store(on, Ordering::Relaxed);
+        }
+        crate::menu::set_stats_shown(shown().load(Ordering::Relaxed));
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
             return;
@@ -891,11 +944,11 @@ impl Panel {
         let version = crate::menu::version();
         if version != self.menu_seen {
             self.menu_seen = version;
-            self.menu_lines = crate::menu::lines();
+            self.menu_page = crate::menu::page();
             self.menu_changed = true;
         }
         let hud = shown().load(Ordering::Relaxed) && !self.failed && self.snap.is_some();
-        let menu = self.menu_lines.is_some() && !self.menu_failed;
+        let menu = self.menu_page.is_some() && !self.menu_failed;
         if !hud && !menu {
             return;
         }
@@ -926,9 +979,9 @@ impl Panel {
                 self.menu_failed = self.menu_buffers.is_none();
                 self.menu_changed = true;
             }
-            if let (Some(buffers), Some(lines)) = (&mut self.menu_buffers, self.menu_lines.as_ref()) {
+            if let (Some(buffers), Some(page)) = (&mut self.menu_buffers, self.menu_page.as_ref()) {
                 if std::mem::take(&mut self.menu_changed) {
-                    buffers.write(&paint_menu(lines));
+                    buffers.write(&paint_menu(page));
                 }
                 let (w, h) = buffers.size;
                 let at = (width.saturating_sub(w) / 2, height.saturating_sub(h) / 2);
@@ -940,35 +993,158 @@ impl Panel {
 }
 
 /// The menu box, in logical pixels.
-const MENU_W: u32 = 620;
-const MENU_H: u32 = 660;
-const MENU_LINE: u32 = 18;
-/// Characters that fit on a line of the menu.
-const MENU_CHARS: usize = 49;
+const MENU_W: u32 = 900;
+const MENU_H: u32 = 640;
+/// Where the rows start and how tall each is.
+const ROWS_TOP: u32 = 158;
+const ROW_H: u32 = 26;
+/// Rows that fit between the tabs and the bottom lines.
+const ROWS_SEEN: usize = ((MENU_H - 76 - ROWS_TOP) / ROW_H) as usize;
+/// Pixels per character at glyph size 2.
+const CHAR_2: u32 = (GLYPH.0 + 1) * 2;
 
-fn paint_menu(lines: &crate::menu::Lines) -> Canvas {
-    use crate::menu::Tone;
-    let mut c = Canvas::new(MENU_W, MENU_H, BG);
-    c.border(0, 0, MENU_W, MENU_H, BORDER);
-    c.border(1, 1, MENU_W - 2, MENU_H - 2, BORDER);
-    let mut y = 14;
-    for (text, tone) in lines {
-        if y + MENU_LINE > MENU_H - 6 {
-            break;
-        }
-        let text = trunc(text, MENU_CHARS);
-        let color = match tone {
-            Tone::Title => LABEL,
-            Tone::Normal => WHITE,
-            Tone::Selected => {
-                c.rect(8, y - 3, MENU_W - 16, MENU_LINE, BAR_BG);
-                YELLOW
-            }
-            Tone::Note => MUTED,
-        };
-        c.text(14, y, 2, color, &text);
-        y += MENU_LINE;
+// The menu's colours: a neon night over the sea.
+const NIGHT_TOP: [u8; 3] = [34, 12, 58];
+const NIGHT_LOW: [u8; 3] = [7, 4, 18];
+const NEON_PINK: [u8; 3] = [255, 46, 150];
+const NEON_CYAN: [u8; 3] = [52, 226, 248];
+const SUN_TOP: [u8; 3] = [255, 222, 92];
+const SUN_LOW: [u8; 3] = [255, 64, 140];
+const LAVENDER: [u8; 3] = [196, 170, 228];
+const DUSK: [u8; 3] = [96, 58, 136];
+const SAND: [u8; 3] = [255, 170, 76];
+const PALE_PINK: [u8; 3] = [255, 196, 228];
+const GOLD: [u8; 3] = [255, 226, 96];
+const MOON: [u8; 3] = [255, 240, 250];
+
+/// At most `max` characters, the last one `…` as `.` when cut.
+fn fit(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
     }
+    let mut out: String = s.chars().take(max.saturating_sub(2)).collect();
+    out.push_str("..");
+    out
+}
+
+/// Width of `s` at glyph size `px`.
+fn width(s: &str, px: u32) -> u32 {
+    s.chars().count() as u32 * (GLYPH.0 + 1) * px
+}
+
+fn paint_menu(page: &crate::menu::Page) -> Canvas {
+    use crate::menu::Kind;
+    let (w, h) = (MENU_W, MENU_H);
+    let mut c = Canvas::new(w, h, NIGHT_LOW);
+    c.vgradient(0, 0, w, h, NIGHT_TOP, NIGHT_LOW);
+
+    // A sun going down behind the title, cut by the sea's lines.
+    let (sun_x, sun_y, r) = (w as i32 - 150, 104_i32, 64_i32);
+    for y in (sun_y - r).max(0)..sun_y.min(100) {
+        let dy = y - sun_y;
+        let below = y - (sun_y - 28);
+        if below > 0 && below % 10 < (below / 10 + 2).min(6) {
+            continue;
+        }
+        let half = f64::from(r * r - dy * dy).sqrt() as i32;
+        let color = mix(SUN_TOP, SUN_LOW, (y - (sun_y - r)) as f32 / r as f32);
+        for x in (sun_x - half).max(0)..(sun_x + half) {
+            c.dot(x as u32, y as u32, color);
+        }
+    }
+    // Stars.
+    for (x, y) in [(330, 22), (410, 58), (520, 16), (600, 44), (870, 20), (700, 12), (470, 34), (640, 70)] {
+        c.dot(x, y, MOON);
+    }
+
+    // The name, in neon with its glow.
+    c.text(31, 21, 6, [90, 14, 60], "VICTORY");
+    c.text(30, 19, 6, NEON_PINK, "VICTORY");
+    c.text(27, 16, 6, MOON, "VICTORY");
+    c.text(31, 70, 2, NEON_CYAN, "MENU DE L'EMULATEUR  -  F1 POUR FERMER");
+    c.hgradient(0, 98, w, 2, NEON_PINK, NEON_CYAN);
+    c.rect(0, 100, w, 1, [70, 20, 80]);
+
+    // Tabs.
+    let mut x = 20;
+    for (i, tab) in page.tabs.iter().enumerate() {
+        let tw = width(tab, 2) + 28;
+        if i == page.tab {
+            c.vgradient(x, 110, tw, 32, NEON_PINK, [170, 24, 110]);
+            c.rect(x, 140, tw, 2, NEON_CYAN);
+            c.text(x + 15, 120, 2, [60, 0, 40], tab);
+            c.text(x + 14, 119, 2, MOON, tab);
+        } else {
+            c.border(x, 110, tw, 32, DUSK);
+            c.text(x + 14, 119, 2, LAVENDER, tab);
+        }
+        x += tw + 10;
+    }
+    c.rect(20, 146, w - 40, 1, DUSK);
+
+    // Rows, scrolled to keep the cursor in sight.
+    let first = page.selected.saturating_sub(ROWS_SEEN - 2).min(page.items.len().saturating_sub(ROWS_SEEN));
+    let chars = ((w - 80) / CHAR_2) as usize;
+    for (n, item) in page.items.iter().enumerate().skip(first).take(ROWS_SEEN) {
+        let y = ROWS_TOP + (n - first) as u32 * ROW_H;
+        let selected = n == page.selected && item.kind != Kind::Header;
+        if selected {
+            c.hgradient(24, y - 5, w - 50, ROW_H - 2, [150, 26, 104], NIGHT_LOW);
+            c.rect(24, y - 5, 4, ROW_H - 2, NEON_CYAN);
+        }
+        let value = match (item.kind, selected) {
+            (Kind::Setting, true) if !item.value.is_empty() => format!("< {} >", item.value),
+            _ => item.value.clone(),
+        };
+        let value = fit(&value, chars / 2);
+        let label = fit(&item.label, chars.saturating_sub(value.chars().count() + 2));
+        match item.kind {
+            Kind::Header => {
+                c.text(40, y + 2, 2, SAND, &label);
+                let end = 40 + width(&label, 2) + 12;
+                if end < w - 40 {
+                    c.hgradient(end, y + 9, w - 40 - end, 1, SAND, NIGHT_LOW);
+                }
+            }
+            kind => {
+                let (lc, vc) = match (kind, selected) {
+                    (_, true) => (MOON, GOLD),
+                    (Kind::Button, false) => (PALE_PINK, NEON_CYAN),
+                    (Kind::Text, false) => (LAVENDER, MOON),
+                    _ => (MOON, NEON_CYAN),
+                };
+                let lx = if kind == Kind::Button { 60 } else { 40 };
+                if kind == Kind::Button {
+                    c.text(40, y, 2, if selected { GOLD } else { NEON_PINK }, ">");
+                }
+                c.text(lx, y, 2, lc, &label);
+                if !value.is_empty() {
+                    c.text(w - 44 - width(&value, 2), y, 2, vc, &value);
+                }
+            }
+        }
+    }
+    // Where the rows shown are in all of them.
+    if page.items.len() > ROWS_SEEN {
+        let track = ROWS_SEEN as u32 * ROW_H;
+        let bar = (track * ROWS_SEEN as u32 / page.items.len() as u32).max(12);
+        let top = ROWS_TOP - 5 + (track - bar) * first as u32 / (page.items.len() - ROWS_SEEN) as u32;
+        c.rect(w - 16, ROWS_TOP - 5, 3, track, [40, 24, 64]);
+        c.rect(w - 16, top, 3, bar, NEON_PINK);
+    }
+
+    // The last change and the keys.
+    c.hgradient(20, h - 66, w - 40, 1, DUSK, NEON_PINK);
+    let chars = ((w - 60) / CHAR_2) as usize;
+    if !page.note.is_empty() {
+        c.text(30, h - 54, 2, GOLD, &fit(&page.note, chars));
+    }
+    c.text(30, h - 28, 2, LAVENDER, &fit(&page.help, chars));
+
+    // A neon frame.
+    c.border(0, 0, w, h, NEON_PINK);
+    c.border(1, 1, w - 2, h - 2, [200, 30, 120]);
+    c.border(3, 3, w - 6, h - 6, [30, 110, 130]);
     c
 }
 
