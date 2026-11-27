@@ -98,11 +98,6 @@ pub fn run(
         }
         victory_loader::load(&prepared, &images)?
     };
-    // VICTORY_FFX_SCALE: the render scale of the title's FidelityFX path,
-    // before any title code runs (not with VICTORY_FSR_4K, which sets its own).
-    if fsr.is_none() {
-        crate::title_patch::apply(&image);
-    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
