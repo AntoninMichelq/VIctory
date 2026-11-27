@@ -84,8 +84,25 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // The Series S profile picks the title's FidelityFX path itself (at
+        // 2/3 of 1080p); with a PC upscaler folder named, the host's FSR
+        // serves it instead of the console one (whose fallback shaders leave
+        // dithered hair and edges unresolved). Before the import registry is
+        // first used.
+        if matches!(console, Console::SeriesS)
+            && let Some(dir) = cfg.fidelityfx_dir.as_deref()
+        {
+            victory_hle::modules::fidelityfx::use_host_dir(dir)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("loading the PC FSR from {}", dir.display()))?;
+        }
         victory_loader::load(&prepared, &images)?
     };
+    // VICTORY_FFX_SCALE: the render scale of the title's FidelityFX path,
+    // before any title code runs (not with VICTORY_FSR_4K, which sets its own).
+    if fsr.is_none() {
+        crate::title_patch::apply(&image);
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
