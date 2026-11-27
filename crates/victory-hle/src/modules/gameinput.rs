@@ -1116,7 +1116,7 @@ mod host {
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1258,7 +1258,11 @@ mod host {
                 // SAFETY: plain queries.
                 .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                 .collect();
-            let mut out = Mouse { buttons, ..Mouse::default() };
+            // SAFETY: plain queries.
+            let layout = unsafe {
+                GetKeyboardLayout(GetWindowThreadProcessId(window as HWND, std::ptr::null_mut()))
+            } as usize;
+            let mut out = Mouse { buttons, layout, ..Mouse::default() };
             if !hold {
                 self.let_go();
                 return out;
@@ -1622,7 +1626,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
         // W by its place (Z on an AZERTY keyboard): forward.
-        let keys = vec![key(keymap::at(b'W')), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(keymap::at(b'W', 0)), key(0x0D), key(b'L'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
