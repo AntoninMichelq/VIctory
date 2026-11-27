@@ -26,6 +26,15 @@ mod tabs;
 
 pub use tabs::apply_graphics;
 
+/// The cursor is held in the title's window for the mouse camera: our hook
+/// of its window procedure answers WM_SETCURSOR with no cursor.
+static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the cursor should not show over the title's window now.
+pub(crate) fn cursor_hidden() -> bool {
+    CURSOR_HIDDEN.load(Ordering::Relaxed)
+}
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -1185,6 +1194,7 @@ mod host {
         /// Lets the cursor go: free to leave, shown again.
         fn let_go(&mut self) {
             if let Some((window, cursor)) = self.held.take() {
+                CURSOR_HIDDEN.store(false, Ordering::Relaxed);
                 // SAFETY: plain calls; a window gone since just fails.
                 unsafe {
                     ClipCursor(std::ptr::null());
@@ -1295,6 +1305,7 @@ mod host {
                 // SAFETY: our own window.
                 let cursor = unsafe { SetClassLongPtrW(window as HWND, GCLP_HCURSOR, 0) };
                 self.held = Some((window, cursor));
+                CURSOR_HIDDEN.store(true, Ordering::Relaxed);
             }
             // SAFETY: plain calls (again each time: others may change the clip).
             unsafe {

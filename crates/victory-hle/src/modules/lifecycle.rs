@@ -261,6 +261,16 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // The mouse turns the camera (gameinput): no cursor over the picture.
+    // The title's procedure (or the default one) would show its own.
+    if message == wm::WM_SETCURSOR
+        && lparam & 0xFFFF == wm::HTCLIENT as isize
+        && super::gameinput::cursor_hidden()
+    {
+        // SAFETY: a plain call on the window's own thread.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
