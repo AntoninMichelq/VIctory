@@ -458,6 +458,32 @@ impl Keymap {
         }
     }
 
+    /// The player types on `layout` now (the title window's; it changes
+    /// with Alt+Shift): each action still on its default keys gets the
+    /// defaults placed for it, so letters stay where they are on the
+    /// keyboard (the poll thread's own layout may be another one). Keys the
+    /// player chose stay as chosen.
+    fn place(&mut self, layout: usize) {
+        if self.settings.layout == layout {
+            return;
+        }
+        let before = Settings::defaults_for(self.settings.layout);
+        let now = Settings::defaults_for(layout);
+        let first = self.settings.layout == 0;
+        for ((keys, old), new) in self.settings.keys.iter_mut().zip(before.keys).zip(now.keys) {
+            // A file without a layout (the first version's): all defaults again.
+            if first || *keys == old {
+                *keys = new;
+            }
+        }
+        self.settings.layout = layout;
+        tracing::info!(
+            layout = format_args!("{layout:X}"),
+            "default keys placed for the keyboard"
+        );
+        self.save();
+    }
+
     /// Whether the mouse should be held in the window now.
     pub(super) fn wants_mouse(&self) -> bool {
         self.settings.camera && !self.free && self.menu.is_none()
@@ -468,28 +494,7 @@ impl Keymap {
     pub(super) fn step(&mut self, keys: &[KeyState], mouse: &Mouse) -> (PadState, bool) {
         if mouse.layout != 0 && self.layout != mouse.layout {
             self.layout = mouse.layout;
-            if self.settings.layout == 0 {
-                // Letters placed for the keyboard the player types on (the
-                // title window's), not for this thread's.
-                let mut fresh = Settings::defaults_for(self.layout);
-                (
-                    fresh.camera,
-                    fresh.sensitivity,
-                    fresh.invert,
-                    fresh.dead_zone,
-                ) = (
-                    self.settings.camera,
-                    self.settings.sensitivity,
-                    self.settings.invert,
-                    self.settings.dead_zone,
-                );
-                self.settings = fresh;
-                tracing::info!(
-                    layout = format_args!("{:X}", self.layout),
-                    "default keys placed for the keyboard"
-                );
-                self.save();
-            }
+            self.place(mouse.layout);
         }
         let down: Vec<u8> = keys
             .iter()
@@ -894,7 +899,7 @@ mod tests {
             buttons: vec![0x01],
             ..Default::default()
         };
-        let (pad, seen) = map.step(&[key(b'W'), key(b'D')], &mouse);
+        let (pad, seen) = map.step(&[key(at(b'W', 0)), key(at(b'D', 0))], &mouse);
         assert!(seen);
         assert_eq!((pad.left_x, pad.left_y, pad.right_trigger), (1.0, 1.0, 1.0));
         // The mouse to the right: the camera turns right, past the dead zone.
@@ -905,6 +910,18 @@ mod tests {
         };
         let (pad, _) = map.step(&[], &mouse);
         assert!(pad.right_x > 0.2 && pad.right_y == 0.0, "{pad:?}");
+    }
+
+    #[test]
+    fn a_new_layout_moves_only_default_keys() {
+        let mut map = Keymap::default();
+        map.settings.layout = 1;
+        map.settings.keys[1] = vec![b'U'];
+        let defaults = Settings::defaults_for(2);
+        map.place(2);
+        assert_eq!(map.settings.layout, 2);
+        assert_eq!(map.settings.keys[0], defaults.keys[0]);
+        assert_eq!(map.settings.keys[1], vec![b'U']);
     }
 
     #[test]
