@@ -34,6 +34,8 @@ pub(super) struct Mouse {
     pub buttons: Vec<u8>,
     /// The cursor is held in the window (`dx`/`dy` mean something).
     pub held: bool,
+    /// Keyboard layout (HKL) of the title's window in front; 0: none.
+    pub layout: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,10 +285,18 @@ struct Settings {
     sensitivity: f32,
     invert: bool,
     dead_zone: f32,
+    /// The keyboard layout (HKL) the default letters were placed for; 0:
+    /// not known yet.
+    layout: usize,
 }
 
 impl Settings {
     fn defaults() -> Settings {
+        Settings::defaults_for(0)
+    }
+
+    /// Defaults with letters placed for that keyboard layout (0: ours).
+    fn defaults_for(layout: usize) -> Settings {
         Settings {
             keys: ACTIONS
                 .iter()
@@ -295,7 +305,7 @@ impl Settings {
                         .iter()
                         .map(|d| match *d {
                             Vk(vk) => vk,
-                            At(letter) => at(letter),
+                            At(letter) => at(letter, layout),
                         })
                         .collect()
                 })
@@ -304,9 +314,13 @@ impl Settings {
             sensitivity: 1.0,
             invert: false,
             dead_zone: 0.2,
+            layout,
         }
     }
 
+    /// The file's settings; `layout` stays 0 without a `CLAVIER` line
+    /// (files of the first version, whose letters may be placed for the
+    /// wrong keyboard).
     fn parse(text: &str) -> Settings {
         let mut s = Settings::defaults();
         for line in text.lines() {
@@ -333,6 +347,7 @@ impl Settings {
                     .filter(|v| v.is_finite())
             };
             match name.as_str() {
+                "CLAVIER" => s.layout = usize::from_str_radix(value, 16).unwrap_or(0),
                 "SOURIS_CAMERA" => s.camera = yes(),
                 "SOURIS_INVERSER" => s.invert = yes(),
                 "SOURIS_SENSIBILITE" => {
@@ -373,11 +388,13 @@ impl Settings {
             out += &format!("{} = {}\n", action.id, names.join(", "));
         }
         out += &format!(
-            "\nSOURIS_CAMERA = {}\nSOURIS_SENSIBILITE = {:.1}\nSOURIS_INVERSER = {}\nSOURIS_ZONE_MORTE = {:.2}\n",
+            "\nSOURIS_CAMERA = {}\nSOURIS_SENSIBILITE = {:.1}\nSOURIS_INVERSER = {}\nSOURIS_ZONE_MORTE = {:.2}\n\
+             \n# Clavier pour lequel les lettres par defaut ont ete placees (ne pas toucher).\nCLAVIER = {:X}\n",
             yes(self.camera),
             self.sensitivity,
             yes(self.invert),
-            self.dead_zone
+            self.dead_zone,
+            self.layout
         );
         out
     }
@@ -392,6 +409,8 @@ pub(super) struct Keymap {
     free: bool,
     before: Vec<u8>,
     moves: VecDeque<(i32, i32)>,
+    /// The keyboard layout seen last (0: none yet).
+    layout: usize,
 }
 
 impl Default for Keymap {
@@ -404,6 +423,7 @@ impl Default for Keymap {
             free: false,
             before: Vec::new(),
             moves: VecDeque::with_capacity(WINDOW),
+            layout: 0,
         }
     }
 }
@@ -446,6 +466,31 @@ impl Keymap {
     /// One poll: the stand-in pad, and whether the title may see the keys
     /// (not while the menu is open).
     pub(super) fn step(&mut self, keys: &[KeyState], mouse: &Mouse) -> (PadState, bool) {
+        if mouse.layout != 0 && self.layout != mouse.layout {
+            self.layout = mouse.layout;
+            if self.settings.layout == 0 {
+                // Letters placed for the keyboard the player types on (the
+                // title window's), not for this thread's.
+                let mut fresh = Settings::defaults_for(self.layout);
+                (
+                    fresh.camera,
+                    fresh.sensitivity,
+                    fresh.invert,
+                    fresh.dead_zone,
+                ) = (
+                    self.settings.camera,
+                    self.settings.sensitivity,
+                    self.settings.invert,
+                    self.settings.dead_zone,
+                );
+                self.settings = fresh;
+                tracing::info!(
+                    layout = format_args!("{:X}", self.layout),
+                    "default keys placed for the keyboard"
+                );
+                self.save();
+            }
+        }
         let down: Vec<u8> = keys
             .iter()
             .map(|k| k.virtual_key)
@@ -617,7 +662,7 @@ impl Keymap {
                     changed = true;
                 }
                 (ENTER, Row::Defaults) => {
-                    *s = Settings::defaults();
+                    *s = Settings::defaults_for(self.layout);
                     menu.note = "TOUCHES PAR DEFAUT REMISES".into();
                     changed = true;
                 }
@@ -692,10 +737,12 @@ impl Keymap {
 
 /// The virtual key of a letter's place on a QWERTY keyboard, in the host's
 /// layout (QWERTY's W is Z on AZERTY).
-pub(super) fn at(letter: u8) -> u8 {
+pub(super) fn at(letter: u8, layout: usize) -> u8 {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK, MapVirtualKeyW};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            HKL, MAPVK_VSC_TO_VK, MapVirtualKeyExW,
+        };
         const SCAN: [u8; 26] = [
             0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31,
             0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
@@ -703,13 +750,18 @@ pub(super) fn at(letter: u8) -> u8 {
         if letter.is_ascii_uppercase() {
             // SAFETY: a plain query.
             let vk = unsafe {
-                MapVirtualKeyW(u32::from(SCAN[usize::from(letter - b'A')]), MAPVK_VSC_TO_VK)
+                MapVirtualKeyExW(
+                    u32::from(SCAN[usize::from(letter - b'A')]),
+                    MAPVK_VSC_TO_VK,
+                    layout as HKL,
+                )
             };
             if let Ok(vk @ 1..=0xFE) = u8::try_from(vk) {
                 return vk;
             }
         }
     }
+    let _ = layout;
     letter
 }
 
