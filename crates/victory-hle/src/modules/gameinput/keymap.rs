@@ -5,9 +5,11 @@
 //! victory.exe, or the path in `VICTORY_TOUCHES`), written on first start and
 //! on every change, and a menu over the picture changes them:
 //!
-//! - F1 opens and closes the menu; arrows choose, Enter changes a binding
-//!   (then press the new key or mouse button), Right adds a second one,
-//!   Delete or Backspace clears it, Left/Right change numbers.
+//! - F1 opens and closes the menu (Escape closes it too); Tab and Page
+//!   Up/Down change tabs (GRAPHISMES, CLAVIER / SOURIS, MULTIJOUEUR,
+//!   DEVELOPPEUR: the other tabs are in `tabs`); arrows choose, Enter changes
+//!   a binding (then press the new key or mouse button), Right adds a second
+//!   one, Delete or Backspace clears it, Left/Right change numbers.
 //! - F2 lets go of the mouse (and takes it again).
 //!
 //! Letters of the default bindings are by position on the keyboard (W A S D
@@ -17,7 +19,9 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use victory_gpu::menu::{self, Tone};
+use victory_gpu::menu::{self, Item, Page};
+
+use super::tabs::{self, Graphics, GraphicsRow, Multi, MultiRow};
 
 use super::{
     A, B, DOWN, KeyState, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -236,6 +240,29 @@ const KEY_UP: u8 = 0x26;
 const KEY_DOWN: u8 = 0x28;
 const KEY_LEFT: u8 = 0x25;
 const KEY_RIGHT: u8 = 0x27;
+const TAB: u8 = 0x09;
+const PAGE_UP: u8 = 0x21;
+const PAGE_DOWN: u8 = 0x22;
+const ESCAPE: u8 = 0x1B;
+
+/// The menu's tabs.
+const TABS: [&str; 4] = [
+    "GRAPHISMES",
+    "CLAVIER / SOURIS",
+    "MULTIJOUEUR",
+    "DEVELOPPEUR",
+];
+const GRAPHICS_TAB: usize = 0;
+const KEYS_TAB: usize = 1;
+const MULTI_TAB: usize = 2;
+
+/// A row the cursor can be on, in any tab.
+#[derive(Clone, Copy, PartialEq)]
+enum Sel {
+    Keys(Row),
+    Graphics(GraphicsRow),
+    Multi(MultiRow),
+}
 
 /// Menu rows after the actions.
 #[derive(Clone, Copy, PartialEq)]
@@ -260,12 +287,6 @@ fn rows() -> impl Iterator<Item = Row> {
     ])
 }
 
-fn row(i: usize) -> Row {
-    rows().nth(i).unwrap_or(Row::Close)
-}
-
-const ROWS: usize = ACTIONS.len() + 6;
-
 #[derive(Clone, Copy, PartialEq)]
 enum Wait {
     Replace,
@@ -273,7 +294,9 @@ enum Wait {
 }
 
 struct Menu {
-    row: usize,
+    tab: usize,
+    /// The cursor of each tab: an index in its rows (headers included).
+    cursor: [usize; TABS.len()],
     wait: Option<Wait>,
     note: String,
 }
@@ -405,6 +428,11 @@ pub(super) struct Keymap {
     settings: Settings,
     path: Option<PathBuf>,
     menu: Option<Menu>,
+    /// The tab the menu opens on (the one shown last).
+    last_tab: usize,
+    graphics: Graphics,
+    graphics_path: Option<PathBuf>,
+    multi: Multi,
     /// F2: the mouse is let go.
     free: bool,
     before: Vec<u8>,
@@ -420,6 +448,10 @@ impl Default for Keymap {
             settings: Settings::defaults(),
             path: None,
             menu: None,
+            last_tab: GRAPHICS_TAB,
+            graphics: Graphics::default(),
+            graphics_path: None,
+            multi: Multi::detached(),
             free: false,
             before: Vec::new(),
             moves: VecDeque::with_capacity(WINDOW),
@@ -440,6 +472,9 @@ impl Keymap {
             });
         let mut map = Keymap {
             path,
+            graphics: Graphics::load().unwrap_or_default(),
+            graphics_path: Graphics::path(),
+            multi: Multi::load(),
             ..Keymap::default()
         };
         match map.path.as_ref().map(std::fs::read_to_string) {
@@ -516,20 +551,39 @@ impl Keymap {
             (0, 0)
         });
 
-        let waiting = self.menu.as_ref().is_some_and(|m| m.wait.is_some());
+        let waiting = self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.wait.is_some() || (m.tab == MULTI_TAB && self.multi.capturing()));
         if pressed.contains(&F1) && !waiting {
             self.menu = match self.menu {
                 Some(_) => None,
-                None => Some(Menu {
-                    row: 0,
-                    wait: None,
-                    note: String::new(),
-                }),
+                None => {
+                    let mut m = Menu {
+                        tab: self.last_tab,
+                        cursor: [0; TABS.len()],
+                        wait: None,
+                        note: String::new(),
+                    };
+                    for tab in 0..TABS.len() {
+                        m.tab = tab;
+                        m.cursor[tab] = self.selectable(&m, 0, 1);
+                    }
+                    m.tab = self.last_tab;
+                    Some(m)
+                }
             };
             self.show();
         } else if self.menu.is_some() {
-            if !pressed.is_empty() {
+            let mut again = !pressed.is_empty();
+            if again {
                 self.menu_keys(&pressed);
+            }
+            // victory-voix's state, each second while its tab is open.
+            if self.menu.as_ref().is_some_and(|m| m.tab == MULTI_TAB) && self.multi.tick() {
+                again = true;
+            }
+            if again {
                 self.show();
             }
         } else if pressed.contains(&F2) {
@@ -584,7 +638,170 @@ impl Keymap {
         p
     }
 
+    /// The rows of the menu's tab, each with what the cursor selects there
+    /// (`None`: a title or a line to read).
+    fn entries(&self, m: &Menu) -> Vec<(Item, Option<Sel>)> {
+        match m.tab {
+            GRAPHICS_TAB => self
+                .graphics
+                .entries()
+                .into_iter()
+                .map(|(i, r)| (i, r.map(Sel::Graphics)))
+                .collect(),
+            KEYS_TAB => self.keys_entries(m),
+            MULTI_TAB => self
+                .multi
+                .entries()
+                .into_iter()
+                .map(|(i, r)| (i, r.map(Sel::Multi)))
+                .collect(),
+            _ => tabs::dev_entries()
+                .into_iter()
+                .map(|(i, _)| (i, None))
+                .collect(),
+        }
+    }
+
+    /// The first row from `from` (going `by` rows, wrapping) the cursor can
+    /// be on; `from` if none.
+    fn selectable(&self, m: &Menu, from: usize, by: isize) -> usize {
+        let entries = self.entries(m);
+        let n = entries.len() as isize;
+        let mut i = from as isize;
+        for _ in 0..n {
+            if entries.get(i as usize).is_some_and(|(_, s)| s.is_some()) {
+                return i as usize;
+            }
+            i = (i + by).rem_euclid(n.max(1));
+        }
+        from
+    }
+
     fn menu_keys(&mut self, pressed: &[u8]) {
+        for &key in pressed {
+            let Some(m) = self.menu.as_ref() else { return };
+            let entries = self.entries(m);
+            let at = m.cursor[m.tab].min(entries.len().saturating_sub(1));
+            let here = entries.get(at).and_then(|(_, s)| *s);
+            let tab = m.tab;
+            if m.wait.is_some() {
+                if let Some(Sel::Keys(row)) = here {
+                    self.keys_tab_keys(row, &[key]);
+                }
+                continue;
+            }
+            if tab == MULTI_TAB && self.multi.capturing() {
+                if let Some(Sel::Multi(row)) = here {
+                    let reply = self.multi.key(row, key);
+                    self.take(reply);
+                }
+                continue;
+            }
+            let n = entries.len();
+            match key {
+                TAB | PAGE_DOWN | PAGE_UP => {
+                    let t = if key == PAGE_UP {
+                        (tab + TABS.len() - 1) % TABS.len()
+                    } else {
+                        (tab + 1) % TABS.len()
+                    };
+                    if let Some(m) = self.menu.as_mut() {
+                        m.tab = t;
+                        m.note.clear();
+                    }
+                    self.last_tab = t;
+                }
+                ESCAPE => {
+                    self.menu = None;
+                    return;
+                }
+                KEY_UP | KEY_DOWN => {
+                    let by = if key == KEY_UP { -1 } else { 1 };
+                    let next = (at as isize + by).rem_euclid(n.max(1) as isize) as usize;
+                    let Some(m) = self.menu.as_ref() else { return };
+                    let next = self.selectable(m, next, by);
+                    if let Some(m) = self.menu.as_mut() {
+                        m.cursor[tab] = next;
+                    }
+                }
+                _ => match here {
+                    Some(Sel::Keys(row)) => {
+                        self.keys_tab_keys(row, &[key]);
+                        if self.menu.is_none() {
+                            return;
+                        }
+                    }
+                    Some(Sel::Graphics(row)) => {
+                        let reply = self.graphics.key(row, key);
+                        if reply.changed
+                            && let Some(failed) =
+                                self.graphics.save_to(self.graphics_path.as_deref())
+                        {
+                            self.take(tabs::Reply {
+                                note: Some(failed),
+                                changed: false,
+                            });
+                        } else {
+                            self.take(reply);
+                        }
+                    }
+                    Some(Sel::Multi(row)) => {
+                        let reply = self.multi.key(row, key);
+                        self.take(reply);
+                    }
+                    None => {}
+                },
+            }
+        }
+    }
+
+    /// A tab's note shown.
+    fn take(&mut self, reply: tabs::Reply) {
+        if let (Some(m), Some(note)) = (self.menu.as_mut(), reply.note) {
+            m.note = note;
+        }
+    }
+
+    /// The CLAVIER / SOURIS tab's rows.
+    fn keys_entries(&self, m: &Menu) -> Vec<(Item, Option<Sel>)> {
+        let s = &self.settings;
+        let yes = |b: bool| if b { "OUI" } else { "NON" };
+        let mut out = vec![(Item::header("ACTIONS"), None)];
+        let at = m.cursor[KEYS_TAB];
+        for r in rows() {
+            let i = out.len();
+            let item = match r {
+                Row::Action(a) => {
+                    let names: Vec<String> = s.keys[a].iter().map(|&k| key_name(k)).collect();
+                    let names = if at == i && m.wait.is_some() {
+                        "...".to_owned()
+                    } else if names.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        names.join(", ")
+                    };
+                    Item::setting(ACTIONS[a].label, names)
+                }
+                Row::Camera => {
+                    out.push((Item::header("SOURIS"), None));
+                    Item::setting("SOURIS = CAMERA", yes(s.camera))
+                }
+                Row::Sensitivity => Item::setting("SENSIBILITE", format!("{:.1}", s.sensitivity)),
+                Row::Invert => Item::setting("INVERSER HAUT/BAS", yes(s.invert)),
+                Row::DeadZone => Item::setting("ZONE MORTE", format!("{:.2}", s.dead_zone)),
+                Row::Defaults => {
+                    out.push((Item::header("AUTRES"), None));
+                    Item::button("REMETTRE LES TOUCHES PAR DEFAUT")
+                }
+                Row::Close => Item::button("FERMER LE MENU"),
+            };
+            out.push((item, Some(Sel::Keys(r))));
+        }
+        out
+    }
+
+    /// Keys on the CLAVIER / SOURIS tab's row `here`.
+    fn keys_tab_keys(&mut self, here: Row, pressed: &[u8]) {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
@@ -593,10 +810,10 @@ impl Keymap {
         if let Some(wait) = menu.wait {
             let Some(&key) = pressed.first() else { return };
             menu.wait = None;
-            let Row::Action(i) = row(menu.row) else {
+            let Row::Action(i) = here else {
                 return;
             };
-            if key == F1 {
+            if key == F1 || key == ESCAPE {
                 menu.note = "ANNULE".into();
                 return;
             }
@@ -630,17 +847,14 @@ impl Keymap {
             return;
         }
         for &key in pressed {
-            let here = row(menu.row);
             match (key, here) {
-                (KEY_UP, _) => menu.row = (menu.row + ROWS - 1) % ROWS,
-                (KEY_DOWN, _) => menu.row = (menu.row + 1) % ROWS,
                 (ENTER, Row::Action(_)) => {
                     menu.wait = Some(Wait::Replace);
-                    menu.note = "APPUIE SUR LA NOUVELLE TOUCHE (F1 ANNULE)".into();
+                    menu.note = "APPUIE SUR LA NOUVELLE TOUCHE (ECHAP ANNULE)".into();
                 }
                 (KEY_RIGHT, Row::Action(_)) => {
                     menu.wait = Some(Wait::Add);
-                    menu.note = "APPUIE SUR LA TOUCHE A AJOUTER (F1 ANNULE)".into();
+                    menu.note = "APPUIE SUR LA TOUCHE A AJOUTER (ECHAP ANNULE)".into();
                 }
                 (DELETE | BACK, Row::Action(i)) => {
                     s.keys[i].clear();
@@ -686,57 +900,28 @@ impl Keymap {
         }
     }
 
-    /// Hands the menu's lines to the picture (or takes them away).
+    /// Hands the menu's page to the picture (or takes it away).
     fn show(&self) {
         let Some(m) = &self.menu else {
             menu::show(None);
             return;
         };
-        let s = &self.settings;
-        let yes = |b: bool| if b { "OUI" } else { "NON" };
-        let mut lines = vec![
-            ("TOUCHES  -  F1 POUR FERMER".to_owned(), Tone::Title),
-            (
-                "HAUT/BAS CHOISIR, ENTREE CHANGER, DROITE AJOUTER".to_owned(),
-                Tone::Note,
-            ),
-            (
-                "SUPPR EFFACER. F2 EN JEU: LACHER LA SOURIS".to_owned(),
-                Tone::Note,
-            ),
-        ];
-        for (i, r) in rows().enumerate() {
-            let text = match r {
-                Row::Action(a) => {
-                    let names: Vec<String> = s.keys[a].iter().map(|&k| key_name(k)).collect();
-                    let names = if names.is_empty() {
-                        "-".to_owned()
-                    } else {
-                        names.join(", ")
-                    };
-                    let names = if m.row == i && m.wait.is_some() {
-                        "...".to_owned()
-                    } else {
-                        names
-                    };
-                    format!("{:<18} {}", ACTIONS[a].label, names)
-                }
-                Row::Camera => format!("{:<18} {}", "SOURIS = CAMERA", yes(s.camera)),
-                Row::Sensitivity => format!("{:<18} < {:.1} >", "SENSIBILITE", s.sensitivity),
-                Row::Invert => format!("{:<18} {}", "INVERSER HAUT/BAS", yes(s.invert)),
-                Row::DeadZone => format!("{:<18} < {:.2} >", "ZONE MORTE", s.dead_zone),
-                Row::Defaults => "REMETTRE PAR DEFAUT".to_owned(),
-                Row::Close => "FERMER".to_owned(),
-            };
-            let (text, tone) = if m.row == i {
-                (format!("> {text}"), Tone::Selected)
-            } else {
-                (format!("  {text}"), Tone::Normal)
-            };
-            lines.push((text, tone));
-        }
-        lines.push((m.note.clone(), Tone::Note));
-        menu::show(Some(lines));
+        let entries = self.entries(m);
+        let help = match m.tab {
+            KEYS_TAB => "ENTREE CHANGER  DROITE AJOUTER  SUPPR EFFACER  TAB ONGLET",
+            GRAPHICS_TAB | MULTI_TAB => {
+                "HAUT/BAS CHOISIR  GAUCHE/DROITE OU ENTREE CHANGER  TAB ONGLET"
+            }
+            _ => "TAB ONGLET SUIVANT  ECHAP FERMER",
+        };
+        menu::show(Some(Page {
+            tabs: TABS.iter().map(|t| (*t).to_owned()).collect(),
+            tab: m.tab,
+            selected: m.cursor[m.tab],
+            items: entries.into_iter().map(|(i, _)| i).collect(),
+            help: help.into(),
+            note: m.note.clone(),
+        }));
     }
 }
 
@@ -808,7 +993,7 @@ const NAMES: [(u8, &str); 35] = [
     (0x5D, "MENU_CONTEXTE"),
 ];
 
-fn key_name(vk: u8) -> String {
+pub(super) fn key_name(vk: u8) -> String {
     if let Some((_, name)) = NAMES.iter().find(|(k, _)| *k == vk) {
         return (*name).to_owned();
     }
@@ -820,7 +1005,7 @@ fn key_name(vk: u8) -> String {
     }
 }
 
-fn parse_key(name: &str) -> Option<u8> {
+pub(super) fn parse_key(name: &str) -> Option<u8> {
     let name = name.trim().to_ascii_uppercase();
     if name.is_empty() {
         return None;
@@ -930,7 +1115,9 @@ mod tests {
         let none = Mouse::default();
         let (_, seen) = map.step(&[key(F1)], &none);
         assert!(!seen && map.menu.is_some());
-        // Row 0 (forward): Enter, then the new key.
+        // To the keys' tab; its first row (forward): Enter, then the new key.
+        map.step(&[], &none);
+        map.step(&[key(TAB)], &none);
         map.step(&[], &none);
         map.step(&[key(ENTER)], &none);
         map.step(&[], &none);
