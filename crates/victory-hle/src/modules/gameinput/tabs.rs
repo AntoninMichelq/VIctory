@@ -501,9 +501,7 @@ impl Voice {
                 "CODE" => v.code = value,
                 "PORT" => v.port = n().unwrap_or(v.port),
                 "MICRO" => v.push_to_talk = value.eq_ignore_ascii_case("appuyer"),
-                "TOUCHE_PARLER" => {
-                    v.talk_key = super::keymap::parse_key(&value).unwrap_or(v.talk_key)
-                }
+                "TOUCHE_PARLER" => v.talk_key = talk_key(&value).unwrap_or(v.talk_key),
                 "MUET" => v.mute = yes(&value),
                 "VOLUME_MICRO" => v.mic_volume = n().unwrap_or(v.mic_volume).min(200),
                 "VOLUME_AMIS" => v.friends_volume = n().unwrap_or(v.friends_volume).min(200),
@@ -533,7 +531,7 @@ impl Voice {
             } else {
                 "ouvert"
             },
-            super::keymap::key_name(self.talk_key),
+            talk_name(self.talk_key).unwrap_or("V".into()),
             b(self.mute),
             self.mic_volume,
             self.friends_volume,
@@ -544,6 +542,34 @@ impl Voice {
             b(self.test),
         )
     }
+}
+
+/// victory-voix's name of a push-to-talk key (its `config::touche`):
+/// letters, digits, F1-F24, ESPACE, TAB, MAJ, CTRL, ALT, VERRMAJ, SOURIS4,
+/// SOURIS5, SOURISMILIEU. `None`: a key it does not know.
+fn talk_name(vk: u8) -> Option<String> {
+    Some(match vk {
+        b'A'..=b'Z' | b'0'..=b'9' => (vk as char).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x20 => "ESPACE".into(),
+        0x09 => "TAB".into(),
+        0x10 | 0xA0 | 0xA1 => "MAJ".into(),
+        0x11 | 0xA2 | 0xA3 => "CTRL".into(),
+        0x12 | 0xA4 | 0xA5 => "ALT".into(),
+        0x14 => "VERRMAJ".into(),
+        0x05 => "SOURIS4".into(),
+        0x06 => "SOURIS5".into(),
+        0x04 => "SOURISMILIEU".into(),
+        _ => return None,
+    })
+}
+
+/// A push-to-talk key's name, victory-voix's or touches.ini's.
+fn talk_key(name: &str) -> Option<u8> {
+    let n = name.trim().to_ascii_uppercase();
+    (0..=0xFF_u8)
+        .find(|&vk| talk_name(vk).is_some_and(|t| t == n) && !matches!(vk, 0xA0..=0xA5))
+        .or_else(|| super::keymap::parse_key(&n))
 }
 
 /// What victory-voix says (`multijoueur-etat.ini`).
@@ -776,6 +802,12 @@ impl Multi {
             if key == ESCAPE || key == 0x70 {
                 return Reply::note("ANNULE");
             }
+            if talk_name(key).is_none() {
+                return Reply::note(format!(
+                    "{} : TOUCHE NON PRISE PAR LE VOCAL (LETTRE, CHIFFRE, F1-F12, ESPACE, MAJ, CTRL, ALT)",
+                    super::keymap::key_name(key)
+                ));
+            }
             self.voice.talk_key = key;
             return self.saved(format!(
                 "TOUCHE POUR PARLER : {}",
@@ -938,6 +970,15 @@ mod tests {
             xml,
             "<a>\r\n  <lodScale value=\"0.600000\" />\r\n  <motionBlur value=\"false\" />\r\n</a>"
         );
+    }
+
+    #[test]
+    fn talk_keys_use_victory_voix_names() {
+        assert_eq!(talk_name(0xA0).as_deref(), Some("MAJ"));
+        assert_eq!(talk_key("MAJ"), Some(0x10));
+        assert_eq!(talk_key("espace"), Some(0x20));
+        assert_eq!(talk_key("F5"), Some(0x74));
+        assert_eq!(talk_name(0x2E), None);
     }
 
     #[test]
