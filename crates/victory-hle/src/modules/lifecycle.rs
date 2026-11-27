@@ -263,10 +263,8 @@ extern "system" fn window_proc(
     }
     // The mouse turns the camera (gameinput): no cursor over the picture.
     // The title's procedure (or the default one) would show its own.
-    if message == wm::WM_SETCURSOR
-        && lparam & 0xFFFF == wm::HTCLIENT as isize
-        && super::gameinput::cursor_hidden()
-    {
+    let client_cursor = message == wm::WM_SETCURSOR && lparam & 0xFFFF == wm::HTCLIENT as isize;
+    if client_cursor && super::gameinput::cursor_hidden() {
         // SAFETY: a plain call on the window's own thread.
         unsafe { wm::SetCursor(std::ptr::null_mut()) };
         return 1;
@@ -278,7 +276,15 @@ extern "system" fn window_proc(
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        let result = wm::CallWindowProcW(title, hwnd, message, wparam, lparam);
+        // The mouse let go (F2, the key menu): the title's procedure may
+        // leave the cursor we hid hidden (a class without a cursor, or one
+        // set while it was held); the arrow comes back.
+        if client_cursor && wm::GetCursor().is_null() {
+            wm::SetCursor(wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW));
+            return 1;
+        }
+        result
     }
 }
 
