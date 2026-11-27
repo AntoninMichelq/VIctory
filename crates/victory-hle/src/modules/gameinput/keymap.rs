@@ -733,6 +733,9 @@ impl Keymap {
                     }
                     Some(Sel::Graphics(row)) => {
                         let reply = self.graphics.key(row, key);
+                        if reply.changed {
+                            tracing::info!(?row, key, path = ?self.graphics_path, "menu: graphics settings written");
+                        }
                         if reply.changed
                             && let Some(failed) =
                                 self.graphics.save_to(self.graphics_path.as_deref())
