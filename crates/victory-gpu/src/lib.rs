@@ -23,6 +23,8 @@ mod lightprobe;
 mod texlate;
 #[cfg(windows)]
 mod texstore;
+// Multiplayer: the camera's position for proximity voice (VICTORY_MULTI=1).
+mod camfind;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

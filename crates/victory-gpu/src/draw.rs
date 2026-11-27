@@ -1759,6 +1759,9 @@ impl State {
                         }
                         continue;
                     }
+                    if !srv {
+                        crate::camfind::note(address, 0);
+                    }
                     let Some(mut gpu) = root_view(list, address, srv) else {
                         continue;
                     };
@@ -3619,6 +3622,7 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        crate::camfind::note(address, size);
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
