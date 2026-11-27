@@ -1,0 +1,21 @@
+[package]
+name = "victory-voix"
+description = "Multijoueur léger : on se connecte à un ami et on se parle en vocal de proximité (position lue dans l'émulateur)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+opus-pure.workspace = true
+clap.workspace = true
+# Micro et haut-parleurs (WASAPI sous Windows), pur Rust.
+cpal = "0.16"
+
+[target.'cfg(windows)'.dependencies]
+# « Pousser pour parler » : l'état d'une touche.
+windows-sys = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
+[lints]
+workspace = true
