@@ -28,6 +28,7 @@ mod capture;
 #[cfg(windows)]
 mod compose;
 pub mod console;
+pub mod menu;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]

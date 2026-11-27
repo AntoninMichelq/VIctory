@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! (host slots 0-3); while none is connected, the keyboard and mouse drive
+//! one stand-in gamepad (`keymap`: bindings in `touches.ini`, F1 menu). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod keymap;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -61,8 +63,9 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// The stand-in gamepad's buttons by key before `keymap` (scripted keys of
+/// diagnostics builds still press a real pad's buttons by it).
+#[cfg_attr(not(all(windows, feature = "diagnostics")), allow(dead_code))]
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -113,27 +116,10 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
-}
-
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+    /// The mouse since the last call; `hold`: keep the cursor in the
+    /// title's window (hidden) and report how far it was moved.
+    fn mouse(&mut self, _hold: bool) -> keymap::Mouse {
+        keymap::Mouse::default()
     }
 }
 
@@ -362,6 +348,8 @@ pub struct Hub {
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
     state: Mutex<State>,
+    /// Keyboard and mouse to the stand-in pad, and the key menu.
+    keymap: Mutex<keymap::Keymap>,
     /// A device callback returned.
     returned: Condvar,
 }
@@ -399,6 +387,7 @@ impl Hub {
                 pending: Vec::new(),
                 running: Vec::new(),
             }),
+            keymap: Mutex::new(keymap::Keymap::default()),
             returned: Condvar::new(),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
@@ -414,6 +403,7 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source, one_pad());
+        *lock(&hub.keymap) = keymap::Keymap::load();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -430,12 +420,16 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let hold = lock(&self.keymap).wants_mouse();
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse(hold))
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        // While the key menu is open the title sees no key and a still pad.
+        let (stand_in, seen) = lock(&self.keymap).step(&keys, &mouse);
+        let keys = if seen { keys } else { Vec::new() };
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, stand_in);
         self.deliver(events);
     }
 
@@ -481,11 +475,12 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        stand_in: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +489,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1131,8 +1126,10 @@ mod host {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
         XInputSetState,
     };
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, GCLP_HCURSOR, GetCursorPos, GetForegroundWindow, GetWindowInfo,
+        GetWindowThreadProcessId, SetClassLongPtrW, SetCursorPos, WINDOWINFO,
     };
 
     use super::*;
@@ -1177,6 +1174,21 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The window the cursor is held in, and its class's cursor before.
+        held: Option<(usize, usize)>,
+    }
+
+    impl Host {
+        /// Lets the cursor go: free to leave, shown again.
+        fn let_go(&mut self) {
+            if let Some((window, cursor)) = self.held.take() {
+                // SAFETY: plain calls; a window gone since just fails.
+                unsafe {
+                    ClipCursor(std::ptr::null());
+                    SetClassLongPtrW(window as HWND, GCLP_HCURSOR, cursor as isize);
+                }
+            }
+        }
     }
 
     impl Source for Host {
@@ -1235,6 +1247,56 @@ mod host {
                 .collect()
         }
 
+        fn mouse(&mut self, hold: bool) -> super::keymap::Mouse {
+            use super::keymap::Mouse;
+            let Some(window) = ours() else {
+                self.let_go();
+                return Mouse::default();
+            };
+            let buttons = [0x01_u8, 0x02, 0x04, 0x05, 0x06]
+                .into_iter()
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect();
+            let mut out = Mouse { buttons, ..Mouse::default() };
+            if !hold {
+                self.let_go();
+                return out;
+            }
+            // SAFETY: room for the answer, its size filled in.
+            let client: RECT = unsafe {
+                let mut info: WINDOWINFO = std::mem::zeroed();
+                info.cbSize = size_of::<WINDOWINFO>() as u32;
+                if GetWindowInfo(window as HWND, &mut info) == 0 {
+                    return out;
+                }
+                info.rcClient
+            };
+            if client.right - client.left < 64 || client.bottom - client.top < 64 {
+                return out;
+            }
+            let (x, y) = ((client.left + client.right) / 2, (client.top + client.bottom) / 2);
+            if self.held.is_some_and(|(w, _)| w == window) {
+                let mut at = POINT { x, y };
+                // SAFETY: room for the answer.
+                if unsafe { GetCursorPos(&mut at) } != 0 {
+                    (out.dx, out.dy, out.held) = (at.x - x, at.y - y, true);
+                }
+            } else {
+                self.let_go();
+                // No cursor over the window: the class's goes (back on letting go).
+                // SAFETY: our own window.
+                let cursor = unsafe { SetClassLongPtrW(window as HWND, GCLP_HCURSOR, 0) };
+                self.held = Some((window, cursor));
+            }
+            // SAFETY: plain calls (again each time: others may change the clip).
+            unsafe {
+                ClipCursor(&client);
+                SetCursorPos(x, y);
+            }
+            out
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1285,6 +1347,17 @@ mod host {
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
             .collect()
+    }
+
+    /// The foreground window when it is one of ours.
+    fn ours() -> Option<usize> {
+        let mut process = 0;
+        // SAFETY: plain queries; a null window gives process 0.
+        unsafe {
+            let window = GetForegroundWindow();
+            GetWindowThreadProcessId(window, &mut process);
+            (process == GetCurrentProcessId()).then_some(window as usize)
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1548,7 +1621,8 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        // W by its place (Z on an AZERTY keyboard): forward.
+        let keys = vec![key(keymap::at(b'W')), key(0x0D), key(b'L'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
