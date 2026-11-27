@@ -125,11 +125,24 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         b':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
         b' ' => [0; 7],
+        b'>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
+        b'<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
+        b'=' => [0, 0, 0b11111, 0, 0b11111, 0, 0],
+        b'+' => [0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0],
+        b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        b')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        b',' => [0, 0, 0, 0, 0b01100, 0b00100, 0b01000],
+        b'_' => [0, 0, 0, 0, 0, 0, 0b11111],
+        b'!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100],
+        b'?' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
+        b'[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
+        b']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
 }
 
 /// The box's size in pixels.
+#[cfg_attr(not(test), allow(dead_code))]
 const fn size(scale: u32) -> (u32, u32) {
     (BASE_W * scale, BASE_H * scale)
 }
@@ -647,6 +660,8 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 struct Buffers {
     format: DXGI_FORMAT,
     scale: u32,
+    /// The box in pixels (scaled).
+    size: (u32, u32),
     pitch: u32,
     uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
@@ -662,8 +677,8 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+    fn new(host: &Host, format: DXGI_FORMAT, scale: u32, (w, h): (u32, u32)) -> Option<Buffers> {
+        let (width, height) = (w * scale, h * scale);
         let pitch = (width * bpp(format)? as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -688,11 +703,21 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
+        Some(Buffers {
+            format,
+            scale,
+            size: (width, height),
+            pitch,
+            uploads,
+            card: card?,
+            turn: 0,
+            fresh: false,
+            uploaded: false,
+        })
     }
 
-    fn write(&mut self, snap: &Snapshot) {
-        let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
+    fn write(&mut self, canvas: &Canvas) {
+        let picture = canvas.pack(self.scale, self.format, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -716,6 +741,12 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The menu over the picture (`crate::menu`): the version painted last.
+    menu_seen: u64,
+    menu_lines: Option<crate::menu::Lines>,
+    menu_changed: bool,
+    menu_buffers: Option<Buffers>,
+    menu_failed: bool,
 }
 
 impl Panel {
@@ -735,6 +766,11 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            menu_seen: 0,
+            menu_lines: None,
+            menu_changed: false,
+            menu_buffers: None,
+            menu_failed: false,
         }
     }
 
@@ -840,8 +876,9 @@ impl Panel {
         self.cost = now.elapsed();
     }
 
-    /// Records the copy of the box onto `back`, a buffer of the swap chain of
-    /// that size and format in the state to be copied into.
+    /// Records the copy of the box (and of the menu, when there is one)
+    /// onto `back`, a buffer of the swap chain of that size and format in the
+    /// state to be copied into.
     pub(super) fn draw(
         &mut self,
         host: &Host,
@@ -851,80 +888,145 @@ impl Panel {
         format: DXGI_FORMAT,
     ) {
         self.last_size = (width, height);
-        if !shown().load(Ordering::Relaxed) || self.failed {
+        let version = crate::menu::version();
+        if version != self.menu_seen {
+            self.menu_seen = version;
+            self.menu_lines = crate::menu::lines();
+            self.menu_changed = true;
+        }
+        let hud = shown().load(Ordering::Relaxed) && !self.failed && self.snap.is_some();
+        let menu = self.menu_lines.is_some() && !self.menu_failed;
+        if !hud && !menu {
             return;
         }
-        let Some(snap) = self.snap.as_ref() else {
-            return;
-        };
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
-            self.failed = self.buffers.is_none();
-            self.changed = true;
-        }
-        let Some(buffers) = &mut self.buffers else { return };
-        if std::mem::take(&mut self.changed) {
-            buffers.write(snap);
-        }
-        let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                if buffers.uploaded {
-                    list.ResourceBarrier(&[transition(
-                        &buffers.card,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                }
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                buffers.uploaded = true;
+        if hud {
+            if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+                // (What the card may still read stays: a picture's size changes once or twice in a run.)
+                std::mem::forget(self.buffers.take());
+                self.buffers = Buffers::new(host, format, scale, (BASE_W, BASE_H));
+                self.failed = self.buffers.is_none();
+                self.changed = true;
             }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+            if let (Some(buffers), Some(snap)) = (&mut self.buffers, self.snap.as_ref()) {
+                if std::mem::take(&mut self.changed) {
+                    buffers.write(&paint_hud(snap));
+                }
+                blit(list, buffers, back, (width, height), (0, 0));
+            }
+        }
+        if menu {
+            if self.menu_buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+                std::mem::forget(self.menu_buffers.take());
+                self.menu_buffers = Buffers::new(host, format, scale, (MENU_W, MENU_H));
+                self.menu_failed = self.menu_buffers.is_none();
+                self.menu_changed = true;
+            }
+            if let (Some(buffers), Some(lines)) = (&mut self.menu_buffers, self.menu_lines.as_ref()) {
+                if std::mem::take(&mut self.menu_changed) {
+                    buffers.write(&paint_menu(lines));
+                }
+                let (w, h) = buffers.size;
+                let at = (width.saturating_sub(w) / 2, height.saturating_sub(h) / 2);
+                blit(list, buffers, back, (width, height), at);
+            }
         }
         self.cost += began.elapsed();
+    }
+}
+
+/// The menu box, in logical pixels.
+const MENU_W: u32 = 620;
+const MENU_H: u32 = 660;
+const MENU_LINE: u32 = 18;
+/// Characters that fit on a line of the menu.
+const MENU_CHARS: usize = 49;
+
+fn paint_menu(lines: &crate::menu::Lines) -> Canvas {
+    use crate::menu::Tone;
+    let mut c = Canvas::new(MENU_W, MENU_H, BG);
+    c.border(0, 0, MENU_W, MENU_H, BORDER);
+    c.border(1, 1, MENU_W - 2, MENU_H - 2, BORDER);
+    let mut y = 14;
+    for (text, tone) in lines {
+        if y + MENU_LINE > MENU_H - 6 {
+            break;
+        }
+        let text = trunc(text, MENU_CHARS);
+        let color = match tone {
+            Tone::Title => LABEL,
+            Tone::Normal => WHITE,
+            Tone::Selected => {
+                c.rect(8, y - 3, MENU_W - 16, MENU_LINE, BAR_BG);
+                YELLOW
+            }
+            Tone::Note => MUTED,
+        };
+        c.text(14, y, 2, color, &text);
+        y += MENU_LINE;
+    }
+    c
+}
+
+/// Copies `buffers`' box onto `back` (`size`) at `at`, the part that fits.
+fn blit(list: &HostList, buffers: &mut Buffers, back: &ID3D12Resource, (width, height): (u32, u32), (x, y): (u32, u32)) {
+    if x >= width || y >= height {
+        return;
+    }
+    let (w, h) = buffers.size;
+    let list = &list.list;
+    // SAFETY: an open list and live resources; the box lies within both.
+    unsafe {
+        if std::mem::take(&mut buffers.fresh) {
+            if buffers.uploaded {
+                list.ResourceBarrier(&[transition(
+                    &buffers.card,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
+            list.ResourceBarrier(&[transition(
+                &buffers.card,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            buffers.uploaded = true;
+        }
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&buffers.card),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: buffers.format,
+                        Width: w,
+                        Height: h,
+                        Depth: 1,
+                        RowPitch: buffers.pitch,
+                    },
+                },
+            },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(back),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let part = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: w.min(width - x),
+            bottom: h.min(height - y),
+            back: 1,
+        };
+        list.CopyTextureRegion(&to, x, y, 0, &from, Some(&part));
     }
 }
 
